@@ -323,6 +323,79 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             self.assertEqual(locks._get_conn(readonly=False), "rw_conn")
             rw_mock.assert_called_once_with()
 
+        with patch.object(locks, "_db_connect_runtime_ro_direct", return_value="runtime_ro_conn") as ro_mock:
+            self.assertEqual(locks._get_history_conn(), "runtime_ro_conn")
+            ro_mock.assert_called_once_with()
+
+    def test_job_history_reads_use_runtime_db_when_liveness_db_is_split(self) -> None:
+        os.environ["SQLITE_LIVENESS_DB_ENABLED"] = "1"
+        storage, locks, api_handlers = _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.locks",
+            "engine.api.api_handlers",
+        )
+        storage.init_db()
+
+        job_name = "job_history_runtime_db_probe"
+        event_name = "history_probe_written"
+        detail = "split-liveness-db-regression"
+        locks.write_job_history(job_name, event_name, detail, exit_code=7, ts_ms=1_900_000_000_123)
+
+        main_con = sqlite3.connect(os.environ["DB_PATH"])
+        try:
+            row = main_con.execute(
+                "SELECT COUNT(*) FROM job_history WHERE job_name=? AND event=?",
+                (job_name, event_name),
+            ).fetchone()
+        finally:
+            main_con.close()
+        self.assertEqual(int((row or [0])[0] or 0), 1)
+
+        liveness_path = Path(str(storage._SQLITE_LIVENESS_DB_PATH))
+        self.assertTrue(liveness_path.exists())
+        liveness_con = sqlite3.connect(str(liveness_path))
+        try:
+            row = liveness_con.execute(
+                """
+                SELECT COUNT(*)
+                FROM sqlite_master
+                WHERE type='table' AND name='job_history'
+                """
+            ).fetchone()
+        finally:
+            liveness_con.close()
+        self.assertEqual(int((row or [0])[0] or 0), 0)
+
+        history = locks.read_job_history(job_name, limit=5)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["event"], event_name)
+        self.assertEqual(history[0]["detail"], detail)
+        self.assertEqual(history[0]["exit_code"], 7)
+
+        class _Jobs:
+            def get_job_history(self, *, name: str, limit: int = 200):
+                rows = locks.read_job_history(name, limit=limit)
+                return {"ok": True, "job": str(name), "rows": rows}
+
+            def get_job_log(self, *, name: str, tail: int = 200):
+                return {"ok": True, "job": str(name), "tail": int(tail), "lines": ["still works"]}
+
+        history_response = api_handlers.api_get_job_history(
+            {"name": job_name, "limit": "5"},
+            ctx={"JOBS": _Jobs()},
+        )
+        self.assertTrue(bool(history_response.get("ok")), history_response)
+        self.assertEqual(history_response.get("job"), job_name)
+        self.assertEqual((history_response.get("rows") or [])[0]["event"], event_name)
+
+        log_response = api_handlers.api_get_job_log(
+            {"name": job_name, "tail": "25"},
+            ctx={"JOBS": _Jobs()},
+        )
+        self.assertTrue(bool(log_response.get("ok")), log_response)
+        self.assertEqual(log_response.get("job"), job_name)
+        self.assertEqual(log_response.get("lines"), ["still works"])
+
     def test_touch_lock_uses_write_connection_and_advances_expiry(self) -> None:
         storage, locks = _reload_modules(
             "engine.runtime.storage",

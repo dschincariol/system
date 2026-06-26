@@ -11,14 +11,14 @@
 :root.theme-tech{
 
   /* Core surfaces */
-  --bg-main: #1c2431;
-  --bg-secondary: #16202b;
-  --bg-tertiary: #121a24;
+  --bg-main: var(--surface-page);
+  --bg-secondary: var(--surface-card);
+  --bg-tertiary: var(--surface-panel-muted);
 
   /* Panels */
-  --panel-main: #1f2a38;
-  --panel-elevated: #243142;
-  --panel-deep: #18222e;
+  --panel-main: var(--surface-card-raised);
+  --panel-elevated: var(--surface-card-hover);
+  --panel-deep: var(--surface-card);
 
   /* Dashboard unified surface system */
   --dash-surface-bg: linear-gradient(180deg, var(--panel-elevated), var(--panel-deep));
@@ -36,25 +36,18 @@
   --metric-gauge-border: rgba(255,255,255,0.12);
 
   /* Text */
-  --text-primary: #e8f0fa;
+  --text-primary: var(--text);
   --text-secondary: rgba(232,240,250,0.72);
 
-  /* Structure */
-  --border-soft: rgba(255,255,255,0.08);
-  --border-strong: rgba(255,255,255,0.16);
-
-  --shadow-deep: 0 18px 50px rgba(0,0,0,0.55);
-  --shadow-panel: 0 18px 50px rgba(0,0,0,0.65);
-
   /* Accent (controlled use only) */
-  --accent: #3ff6d2;
+  --accent: var(--accent-2);
 
   /* Status */
-  --ok: var(--status-ok, #009E73);
-  --warn: var(--status-warn, #E69F00);
-  --bad: var(--status-crit, #D55E00);
+  --ok: var(--status-ok);
+  --warn: var(--status-warn);
+  --bad: var(--status-crit);
 
-  --radius: 14px;
+  --radius: var(--radius-2xl);
 
   /* ============================================================
      DASHBOARD TOKEN BRIDGE (CRITICAL)
@@ -67,7 +60,7 @@
   --dash-tile-hover: rgba(56,189,248,.06);
   --dash-row-stripe: rgba(255,255,255,.02);
   --dash-head-text: rgba(232,240,250,0.75);
-  --dash-tile-radius: 16px;
+  --dash-tile-radius: var(--radius-2xl);
 }
 
 /* ============================================================
@@ -129,7 +122,7 @@ body.theme-tech .systemStatusLabel{
 
 .theme-tech .systemStatusValue,
 body.theme-tech .systemStatusValue{
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size:13px;
   font-weight:800;
   color: var(--text-primary);
@@ -140,9 +133,9 @@ body.theme-tech .systemStatusValue{
 
 .theme-tech .status_ok,
 body.theme-tech .status_ok{
-  border-color: var(--status-ok, #009E73);
+  border-color: var(--status-ok);
   border-style: solid;
-  box-shadow: inset 0 0 0 1px var(--status-ok-bg, rgba(0,158,115,0.14));
+  box-shadow: inset 0 0 0 1px var(--status-ok-bg);
 }
 
 .theme-tech .status_ok .systemStatusValue,
@@ -152,9 +145,9 @@ body.theme-tech .status_ok .systemStatusValue{
 
 .theme-tech .status_warning,
 body.theme-tech .status_warning{
-  border-color: var(--status-warn, #E69F00);
+  border-color: var(--status-warn);
   border-style: dashed;
-  box-shadow: inset 0 0 0 1px var(--status-warn-bg, rgba(230,159,0,0.15));
+  box-shadow: inset 0 0 0 1px var(--status-warn-bg);
 }
 
 .theme-tech .status_warning .systemStatusValue,
@@ -164,9 +157,9 @@ body.theme-tech .status_warning .systemStatusValue{
 
 .theme-tech .status_error,
 body.theme-tech .status_error{
-  border-color: var(--status-crit, #D55E00);
+  border-color: var(--status-crit);
   border-style: double;
-  box-shadow: inset 0 0 0 1px var(--status-crit-bg, rgba(213,94,0,0.16));
+  box-shadow: inset 0 0 0 1px var(--status-crit-bg);
 }
 
 .theme-tech .status_error .systemStatusValue,
@@ -192,7 +185,7 @@ body.theme-tech .status_error .systemStatusValue{
    TOP NAV (CONTROL HUD)
 ============================================================ */
 .theme-tech .top-nav{
-  background: linear-gradient(180deg, #1a2430, #141c26);
+  background: linear-gradient(180deg, var(--surface-card), var(--surface-panel-muted));
   border-bottom: 1px solid var(--border-soft);
   box-shadow: 0 18px 50px rgba(0,0,0,0.55);
   backdrop-filter: blur(10px);
@@ -213,7 +206,7 @@ body.theme-tech .status_error .systemStatusValue{
    SIDEBAR
 ============================================================ */
 .theme-tech .sidebar{
-  background: linear-gradient(180deg, #1a2430, #151d27);
+  background: linear-gradient(180deg, var(--surface-card), var(--surface-panel-muted));
   border-right: 1px solid var(--border-soft);
   box-shadow: 4px 0 40px rgba(0,0,0,0.55);
 }
@@ -349,18 +342,18 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .theme-tech .hud-status.ok{
-  border-color: var(--status-ok, #009E73);
+  border-color: var(--status-ok);
   color: var(--ok);
 }
 
 .theme-tech .hud-status.warn{
-  border-color: var(--status-warn, #E69F00);
+  border-color: var(--status-warn);
   border-style: dashed;
   color: var(--warn);
 }
 
 .theme-tech .hud-status.err{
-  border-color: var(--status-crit, #D55E00);
+  border-color: var(--status-crit);
   border-style: double;
   color: var(--bad);
 }
@@ -371,11 +364,7 @@ body.theme-tech .status_error .systemStatusValue{
 
 /* Stronger border system */
 .theme-tech {
-  --border-soft: rgba(255,255,255,0.12);
-  --border-strong: rgba(255,255,255,0.18);
-  --shadow-panel:
-    0 22px 65px rgba(0,0,0,0.70),
-    inset 0 1px 0 rgba(255,255,255,0.05);
+  --shadow-panel: var(--shadow-deep);
 }
 
 /* ============================================================
@@ -503,18 +492,18 @@ body.theme-tech .status_error .systemStatusValue{
 ============================================================ */
 
 .theme-tech #page-dashboard tr.event-critical td {
-  background: var(--status-crit-bg, rgba(213,94,0,.16)) !important;
-  border-left: 5px double var(--status-crit, #D55E00);
+  background: var(--status-crit-bg) !important;
+  border-left: 5px double var(--status-crit);
 }
 
 .theme-tech #page-dashboard tr.event-warn td {
-  background: var(--status-warn-bg, rgba(230,159,0,.15)) !important;
-  border-left: 4px dashed var(--status-warn, #E69F00);
+  background: var(--status-warn-bg) !important;
+  border-left: 4px dashed var(--status-warn);
 }
 
 .theme-tech #page-dashboard tr.event-info td {
-  background: var(--status-info-bg, rgba(86,180,233,.14)) !important;
-  border-left: 3px solid var(--status-info, #56B4E9);
+  background: var(--status-info-bg) !important;
+  border-left: 3px solid var(--status-info);
 }
 
 .theme-tech #page-dashboard tr.event-critical:hover td {
@@ -536,13 +525,13 @@ body.theme-tech .status_error .systemStatusValue{
 .sop-editor {
   width: 100%;
   min-height: 420px;
-  font-family: "JetBrains Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 14px;
   line-height: 1.6;
   padding: 16px;
-  background: #0f172a;
-  color: #e2e8f0;
-  border: 1px solid #334155;
+  background: var(--surface-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
   border-radius: 12px;
   resize: vertical;
   box-shadow: 0 0 0 1px rgba(59,130,246,0.2),
@@ -553,7 +542,7 @@ body.theme-tech .status_error .systemStatusValue{
   margin-bottom: 20px;
   padding: 18px;
   border-radius: 16px;
-  background: linear-gradient(145deg,#111827,#0b1220);
+  background: linear-gradient(145deg,var(--surface-input),var(--surface-panel));
   border: 1px solid rgba(59,130,246,0.25);
   box-shadow: 0 10px 30px rgba(0,0,0,0.4);
 }
@@ -561,11 +550,11 @@ body.theme-tech .status_error .systemStatusValue{
 .sop-body {
   max-height: 260px;
   overflow-y: auto;
-  background: #0b1220;
+  background: var(--surface-panel);
   padding: 14px;
   border-radius: 10px;
   font-size: 13px;
-  border: 1px solid #1e293b;
+  border: 1px solid var(--border-default);
 }
 
 .page-header h1 {
@@ -583,7 +572,7 @@ body.theme-tech .status_error .systemStatusValue{
   right: 0;
   width: 760px;
   height: 100%;
-  background: #0f172a;
+  background: var(--surface-input);
   z-index: 1000;
   overflow-y: auto;
   box-shadow: -10px 0 40px rgba(0,0,0,0.6);
@@ -607,18 +596,18 @@ body.theme-tech .status_error .systemStatusValue{
 ============================================================ */
 
 .theme-tech #page-dashboard .alert-panel.alert-critical{
-  border: 3px double var(--status-crit, #D55E00);
+  border: 3px double var(--status-crit);
   box-shadow:
-    0 0 0 1px var(--status-crit-bg, rgba(213,94,0,.16)),
+    0 0 0 1px var(--status-crit-bg),
     0 24px 70px rgba(0,0,0,.75),
-    0 0 40px var(--status-crit-bg, rgba(213,94,0,.16));
+    0 0 40px var(--status-crit-bg);
 }
 
 .theme-tech #page-dashboard .alert-panel.alert-critical::before{
   background: linear-gradient(
     to bottom,
-    var(--status-crit, #D55E00),
-    var(--status-crit-bg, rgba(213,94,0,.16))
+    var(--status-crit),
+    var(--status-crit-bg)
   );
 }
 
@@ -644,8 +633,8 @@ body.theme-tech .status_error .systemStatusValue{
   left:0;
   right:0;
   z-index:9999;
-  background:linear-gradient(90deg,#b00020,#7f0015);
-  color:white;
+  background:linear-gradient(90deg, var(--status-crit), color-mix(in srgb, var(--status-crit) 70%, var(--surface-panel)));
+  color:var(--surface-contrast);
   font-weight:800;
   text-align:center;
   padding:12px 16px;
@@ -723,14 +712,14 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .plc-status-badge.online{
-  border-color:var(--status-ok, #009E73);
-  background:var(--status-ok-bg, rgba(0,158,115,.14));
+  border-color:var(--status-ok);
+  background:var(--status-ok-bg);
 }
 
 .plc-status-badge.offline{
-  border-color:var(--status-crit, #D55E00);
+  border-color:var(--status-crit);
   border-style:double;
-  background:var(--status-crit-bg, rgba(213,94,0,.16));
+  background:var(--status-crit-bg);
 }
 
 /* Section label (Inputs / Sensors / Relays) */
@@ -779,8 +768,8 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .plc-relay-chip.on{
-  background:var(--status-ok-bg, rgba(0,158,115,.14));
-  border-color:var(--status-ok, #009E73);
+  background:var(--status-ok-bg);
+  border-color:var(--status-ok);
 }
 
 .plc-relay-chip.off{
@@ -844,18 +833,18 @@ body.theme-tech .status_error .systemStatusValue{
 /* Status words pop (ONLINE / OFFLINE / IDLE etc) */
 #plcOperationalGrid.plc-control-grid .ok,
 #plcOperationalGrid.plc-control-grid .online {
-  color: var(--status-ok, #009E73);
+  color: var(--status-ok);
   font-weight: 800;
 }
 
 #plcOperationalGrid.plc-control-grid .warn {
-  color: var(--status-warn, #E69F00);
+  color: var(--status-warn);
   font-weight: 800;
 }
 
 #plcOperationalGrid.plc-control-grid .bad,
 #plcOperationalGrid.plc-control-grid .offline {
-  color: var(--status-crit, #D55E00);
+  color: var(--status-crit);
   font-weight: 800;
 }
 
@@ -968,9 +957,9 @@ body.theme-tech .status_error .systemStatusValue{
   border-radius: 999px;
   font-size: 11px;
   font-weight: 800;
-  border: 1px solid var(--status-ok, #009E73);
-  background: var(--status-ok-bg, rgba(0,158,115,.14));
-  color: var(--status-ok, #009E73);
+  border: 1px solid var(--status-ok);
+  background: var(--status-ok-bg);
+  color: var(--status-ok);
   width: fit-content;
 }
 
@@ -1038,7 +1027,7 @@ body.theme-tech .status_error .systemStatusValue{
 ============================================================ */
 
 .plc-operational-card {
-  background: linear-gradient(180deg,#1f2a38,#18222e);
+  background: linear-gradient(180deg,var(--surface-card-raised),var(--surface-card));
   border: 1px solid rgba(148,163,184,.18);
   border-radius: 16px;
   padding: 16px;
@@ -1105,9 +1094,9 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .plc-relay-on {
-  background: var(--status-ok-bg, rgba(0,158,115,.14));
-  border-color: var(--status-ok, #009E73);
-  color: var(--status-ok, #009E73);
+  background: var(--status-ok-bg);
+  border-color: var(--status-ok);
+  color: var(--status-ok);
 }
 
 .plc-relay-off {
@@ -1213,4 +1202,24 @@ body.theme-tech .status_error .systemStatusValue{
     padding-right: env(safe-area-inset-right);
   }
 
+}
+
+/* ============================================================
+   DASHBOARD MISSION BAR COMPATIBILITY
+============================================================ */
+
+body.theme-tech #system-status-header {
+  position: static !important;
+}
+
+body.theme-tech .missionSurface::before,
+body.theme-tech .missionGuidancePanel::before,
+body.theme-tech .missionEvidencePanel::before {
+  display: none !important;
+}
+
+body.theme-tech .missionSurface:hover,
+body.theme-tech .missionGuidancePanel:hover,
+body.theme-tech .missionEvidencePanel:hover {
+  transform: none !important;
 }

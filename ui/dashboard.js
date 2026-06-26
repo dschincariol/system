@@ -23,6 +23,8 @@ import {
   formatPercent,
   formatSigned,
   freshnessTone,
+  guidanceListHtml,
+  kpiTileHtml,
   numOrNull,
   pickTimestamp,
   safeJoin,
@@ -30,8 +32,18 @@ import {
   statusPillClasses,
   statusToken
 } from "./utils.js";
+import {
+  renderState,
+  renderTechnicalDetails,
+  stateBlockHtml,
+  summarizeOperatorError
+} from "./state_presenter.js";
 
-import { fetchJSON, fetchWithTimeout as _fetchWithTimeout } from "./api_client.js";
+import {
+  businessDegradedReason,
+  fetchJSON,
+  fetchWithTimeout as _fetchWithTimeout
+} from "./api_client.js";
 import {
   applyStalenessState,
   setPanelState,
@@ -202,10 +214,17 @@ import {
   renderReadinessEvidencePanel
 } from "./readiness_evidence.js";
 import {
+  DASHBOARD_SCREEN_ALIASES as ROUTER_DASHBOARD_SCREEN_ALIASES,
+  DASHBOARD_SCREEN_DEFINITIONS,
+  DASHBOARD_SCREEN_KEYS,
+  DASHBOARD_SCREEN_LABELS as ROUTER_DASHBOARD_SCREEN_LABELS,
   applyDashboardPersonaView,
   getDefaultDashboardScreen,
   getActiveDashboardPersona,
+  getDashboardPersonaLabel,
+  isDashboardPanelAllowed,
   isDashboardScreenAllowed,
+  writeDashboardPersona,
   wireDashboardPersonaControls
 } from "./view_router.js";
 import { initCommandPalette } from "./command_palette.mjs";
@@ -245,11 +264,21 @@ import {
   applyProChartsVisibility
 } from "./pro_chart_prefs.js";
 import {
+  clearSelectedSymbolContext,
+  applyOperationalContextToUrl,
+  clearOperationalContext,
   getSelectedSymbolContext,
+  getOperationalContext,
+  hasOperationalContext,
   initSelectedSymbolContextFromUrl,
+  initOperationalContext,
   normalizeSelectedSymbol,
+  operationalContextSummary,
+  readSavedOperationalWorkspace,
   subscribeSelectedSymbolContext,
-  updateSelectedSymbolContext
+  updateSelectedSymbolContext,
+  updateOperationalContext,
+  writeSavedOperationalWorkspace
 } from "./symbol_context.mjs";
 
 /* ui/dashboard.js — Market Impact Dashboard controller */
@@ -284,21 +313,9 @@ function getSnapshotBundleState() {
 // Used by loadHealth() for localStorage parsing (safe default)
 const _EXEC_CONF_STATE_KEY = "exec_conf_state_v1";
 const DASHBOARD_SCREEN_KEY = "dashboard.screen.v1";
-const DASHBOARD_SCREEN_LABELS = Object.freeze({
-  overview: "Overview",
-  operate: "Operate",
-  explain: "Explain",
-  analyze: "Analyze",
-  data: "Data Health",
-  positions: "Positions",
-  execution: "Execution",
-});
-const DASHBOARD_SCREEN_ALIASES = Object.freeze({
-  health: "data",
-  exposure: "positions",
-  orders: "execution",
-});
-const DASHBOARD_SCREENS = new Set(Object.keys(DASHBOARD_SCREEN_LABELS));
+const DASHBOARD_SCREEN_LABELS = ROUTER_DASHBOARD_SCREEN_LABELS;
+const DASHBOARD_SCREEN_ALIASES = ROUTER_DASHBOARD_SCREEN_ALIASES;
+const DASHBOARD_SCREENS = new Set(DASHBOARD_SCREEN_KEYS);
 let ACTIVE_DASHBOARD_SCREEN = "overview";
 let DASHBOARD_BOOTED = false;
 let _activeScreenRefreshSeq = 0;
@@ -942,6 +959,7 @@ function renderTopLevelHealthScore() {
       executionDegraded: _isExecutionDegraded(),
     });
     renderHealthScoreSummary(scorecard);
+    renderMissionHealthMini(scorecard);
   } catch {}
 }
 
@@ -1650,6 +1668,9 @@ let _launchContext = {
   symbol: "",
   decisionId: "",
   advisoryId: "",
+  alertId: "",
+  sourceKey: "",
+  jobId: "",
 };
 let _symbolContextRefreshTimer = null;
 
@@ -1812,7 +1833,11 @@ function renderDashboardTableView({
       renderEmptyTableBody(
         bodyId,
         colspan || columns.filter((column) => column && column.hidden !== true).length || columns.length,
-        view.totalRows > 0 ? (filteredEmptyText || "No rows match the current filter.") : emptyText
+        view.totalRows > 0 ? (filteredEmptyText || "No rows match the current filter.") : emptyText,
+        {
+          emptyKind: view.totalRows > 0 ? "filtered" : "active",
+          action: view.totalRows > 0 ? "Clear or broaden the table filter." : "Wait for the next runtime update or refresh the panel.",
+        }
       );
     } else {
       body.innerHTML = view.visibleRows.map(rowToHtml).join("");
@@ -1991,6 +2016,31 @@ function _getSelectedSymbolOptional() {
   return getSelectedSymbolContext().symbol || "";
 }
 
+function _dashboardOperationalContext(overrides = {}) {
+  const existing = getOperationalContext();
+  return {
+    ...existing,
+    symbol: _getSelectedSymbolOptional() || _launchContext.symbol || existing.symbol,
+    source_key: _launchContext.sourceKey || existing.source_key,
+    job_id: _launchContext.jobId || existing.job_id,
+    decision_id: _launchContext.decisionId || existing.decision_id,
+    alert_id: _launchContext.alertId || existing.alert_id,
+    advisory_id: _launchContext.advisoryId || existing.advisory_id,
+    surface: "dashboard",
+    source: "dashboard",
+    ...overrides,
+  };
+}
+
+function _syncDashboardOperationalContext(overrides = {}, options = {}) {
+  const next = updateOperationalContext(_dashboardOperationalContext(overrides), {
+    persistStorage: options.persistStorage !== false,
+    persistUrl: options.persistUrl === true,
+  });
+  renderDashboardOperationalContext(next);
+  return next;
+}
+
 function _isSelectedSymbol(symbol) {
   const selected = _getSelectedSymbolOptional();
   return !!selected && normalizeSelectedSymbol(symbol) === selected;
@@ -2030,7 +2080,12 @@ function _buildTerminalUrl({ symbol = "", tf = "", type = "", source = "dashboar
   if (screen) url.searchParams.set("screen", String(screen));
   if (decisionId) url.searchParams.set("decision_id", String(decisionId));
   if (advisoryId) url.searchParams.set("advisory_id", String(advisoryId));
-  return url.toString();
+  return applyOperationalContextToUrl(url.toString(), _dashboardOperationalContext({
+    symbol: sym,
+    decision_id: decisionId || getOperationalContext().decision_id,
+    advisory_id: advisoryId || getOperationalContext().advisory_id,
+    source,
+  }));
 }
 
 function _buildOperatorUrl({ symbol = "", source = "dashboard", screen = ACTIVE_DASHBOARD_SCREEN, decisionId = "", advisoryId = "", focus = "" } = {}) {
@@ -2042,7 +2097,22 @@ function _buildOperatorUrl({ symbol = "", source = "dashboard", screen = ACTIVE_
   if (focus) url.searchParams.set("focus", String(focus));
   if (decisionId) url.searchParams.set("decision_id", String(decisionId));
   if (advisoryId) url.searchParams.set("advisory_id", String(advisoryId));
-  return url.toString();
+  return applyOperationalContextToUrl(url.toString(), _dashboardOperationalContext({
+    symbol: sym,
+    decision_id: decisionId || getOperationalContext().decision_id,
+    advisory_id: advisoryId || getOperationalContext().advisory_id,
+    source,
+  }));
+}
+
+function _buildDataSourcesUrl({ sourceKey = "", source = "dashboard", screen = ACTIVE_DASHBOARD_SCREEN } = {}) {
+  const context = _dashboardOperationalContext({
+    source_key: sourceKey || getOperationalContext().source_key || _launchContext.sourceKey,
+    source,
+  });
+  const url = new URL("/ui/data_sources.html", window.location.origin);
+  if (screen) url.searchParams.set("screen", String(screen));
+  return applyOperationalContextToUrl(url.toString(), context);
 }
 
 function _openContextUrl(url) {
@@ -2057,6 +2127,7 @@ function updateSurfaceLinks() {
   const terminalLink = document.getElementById("appTerminalLink");
   const operatorLink = document.getElementById("appOperatorLink");
   const operatorConsoleLink = document.getElementById("operatorConsoleLink");
+  const dataSourcesLink = document.getElementById("appDataSourcesLink");
   if (terminalLink) {
     terminalLink.href = _buildTerminalUrl({ source: "dashboard_nav" });
   }
@@ -2066,6 +2137,117 @@ function updateSurfaceLinks() {
   if (operatorConsoleLink) {
     operatorConsoleLink.href = _buildOperatorUrl({ source: "operate_card" });
   }
+  if (dataSourcesLink) {
+    dataSourcesLink.href = _buildDataSourcesUrl({ source: "dashboard_nav" });
+  }
+  renderDashboardOperationalContext();
+}
+
+function renderDashboardOperationalContext(context = getOperationalContext()) {
+  const pill = document.getElementById("activeContextPill");
+  const clearBtn = document.getElementById("btnClearContext");
+  if (pill) {
+    const summary = operationalContextSummary(context);
+    const hasContext = hasOperationalContext(context);
+    pill.textContent = summary;
+    pill.title = hasContext
+      ? `Active cross-surface context: ${summary}`
+      : "No active cross-surface context";
+    pill.className = buildPillClassName(pill, hasContext ? "info" : "dim");
+  }
+  if (clearBtn) {
+    clearBtn.disabled = !hasOperationalContext(context);
+  }
+}
+
+function saveDashboardWorkspace() {
+  const workspace = writeSavedOperationalWorkspace({
+    surface: "dashboard",
+    dashboard: {
+      screen: ACTIVE_DASHBOARD_SCREEN,
+      persona: getActiveDashboardPersona(),
+    },
+    context: _dashboardOperationalContext({
+      job_id: selectedJob || _launchContext.jobId || getOperationalContext().job_id,
+      source: "workspace_save",
+    }),
+  });
+  if (!workspace) {
+    toast("Workspace could not be saved in this browser", "warn", 3000);
+    return;
+  }
+  toast(`Workspace saved: ${operationalContextSummary(workspace.context)}`, "ok", 2600);
+}
+
+function restoreDashboardWorkspace() {
+  const workspace = readSavedOperationalWorkspace();
+  if (!workspace) {
+    toast("No saved workspace found", "warn", 2600);
+    return;
+  }
+
+  const persona = writeDashboardPersona(workspace.dashboard.persona || getActiveDashboardPersona());
+  const requestedScreen = normalizeDashboardScreen(workspace.dashboard.screen || "overview");
+  const nextScreen = isDashboardScreenAllowed(persona, requestedScreen)
+    ? requestedScreen
+    : normalizeDashboardScreen(getDefaultDashboardScreen(persona));
+  const ctx = updateOperationalContext({
+    ...workspace.context,
+    source: "workspace_restore",
+    surface: "dashboard",
+  }, {
+    persistStorage: true,
+    persistUrl: true,
+  });
+  _launchContext = {
+    ..._launchContext,
+    symbol: ctx.symbol,
+    sourceKey: ctx.source_key,
+    jobId: ctx.job_id,
+    decisionId: ctx.decision_id,
+    alertId: ctx.alert_id,
+    advisoryId: ctx.advisory_id,
+  };
+  if (ctx.symbol) {
+    updateSelectedSymbolContext({
+      symbol: ctx.symbol,
+      source: "workspace_restore",
+      persistUrl: true,
+    });
+  }
+  if (ctx.job_id) {
+    setSelectedJob(ctx.job_id);
+  }
+  applyDashboardScreen(nextScreen, { syncHash: true, hashMode: "replace" });
+  applyDashboardPersonaView({ root: document, screen: ACTIVE_DASHBOARD_SCREEN });
+  renderDashboardOperationalContext(ctx);
+  updateSurfaceLinks();
+  toast(`Workspace restored: ${operationalContextSummary(ctx)}`, "ok", 2600);
+}
+
+function clearDashboardContext() {
+  const ctx = clearOperationalContext({
+    persistStorage: true,
+    persistUrl: true,
+    source: "dashboard_clear",
+    surface: "dashboard",
+  });
+  clearSelectedSymbolContext({
+    persistUrl: false,
+    source: "dashboard_clear",
+  });
+  _launchContext = {
+    ..._launchContext,
+    symbol: "",
+    sourceKey: "",
+    jobId: "",
+    decisionId: "",
+    alertId: "",
+    advisoryId: "",
+  };
+  renderDashboardOperationalContext(ctx);
+  updateSurfaceLinks();
+  toast("Cross-surface context cleared", "ok", 2200);
 }
 
 function syncDashboardSymbolInput(ctx = getSelectedSymbolContext()) {
@@ -2088,11 +2270,19 @@ function syncDashboardSymbolInput(ctx = getSelectedSymbolContext()) {
 function updateSymbolContextFromInput(source = "global_symbol") {
   const globalInput = document.getElementById("globalSymbol");
   if (!globalInput) return getSelectedSymbolContext();
-  return updateSelectedSymbolContext({
+  const ctx = updateSelectedSymbolContext({
     symbol: globalInput.value,
     source,
     persistUrl: true,
   });
+  _syncDashboardOperationalContext({
+    symbol: ctx.symbol,
+    source,
+  }, {
+    persistStorage: true,
+    persistUrl: false,
+  });
+  return ctx;
 }
 
 function scheduleSymbolAwarePanelRefresh() {
@@ -2216,21 +2406,56 @@ async function loadOperatorSidecarStatus() {
 function applyDashboardLaunchParams() {
   try {
     const params = new URLSearchParams(window.location.search || "");
+    const operationalContext = initOperationalContext({
+      source: "dashboard_url",
+      surface: "dashboard",
+      persistStorage: true,
+    });
     const urlSymbolContext = initSelectedSymbolContextFromUrl({
       source: "url",
       persistUrl: false,
     });
+    const sourceKey = operationalContext.source_key || String(params.get("source_key") || "").trim();
+    const jobId = operationalContext.job_id || String(params.get("job_id") || "").trim();
+    const screen = String(params.get("screen") || "").trim().toLowerCase()
+      || (sourceKey ? "data" : "")
+      || (jobId ? "operate" : "");
     _launchContext = {
-      screen: String(params.get("screen") || "").trim().toLowerCase(),
-      symbol: urlSymbolContext.symbol || String(params.get("symbol") || "").trim().toUpperCase(),
-      decisionId: String(params.get("decision_id") || "").trim(),
-      advisoryId: String(params.get("advisory_id") || "").trim(),
+      screen,
+      symbol: urlSymbolContext.symbol || operationalContext.symbol || String(params.get("symbol") || "").trim().toUpperCase(),
+      decisionId: operationalContext.decision_id || String(params.get("decision_id") || "").trim(),
+      advisoryId: operationalContext.advisory_id || String(params.get("advisory_id") || "").trim(),
+      alertId: operationalContext.alert_id || String(params.get("alert_id") || "").trim(),
+      sourceKey,
+      jobId,
     };
 
     const globalSymbolInput = document.getElementById("globalSymbol");
     if (globalSymbolInput && _launchContext.symbol) {
       globalSymbolInput.value = _launchContext.symbol;
     }
+    if (_launchContext.symbol) {
+      updateSelectedSymbolContext({
+        symbol: _launchContext.symbol,
+        source: "dashboard_url",
+        persistUrl: false,
+      });
+    }
+    if (_launchContext.jobId) {
+      setSelectedJob(_launchContext.jobId);
+    }
+    _syncDashboardOperationalContext({
+      symbol: _launchContext.symbol,
+      source_key: _launchContext.sourceKey,
+      job_id: _launchContext.jobId,
+      decision_id: _launchContext.decisionId,
+      alert_id: _launchContext.alertId,
+      advisory_id: _launchContext.advisoryId,
+      source: "dashboard_url",
+    }, {
+      persistStorage: true,
+      persistUrl: false,
+    });
   } catch {}
 }
 
@@ -2834,7 +3059,7 @@ async function loadGovernanceEvidence() {
     const payload = await fetchJSON("/api/governance/evidence?limit=25", { allowBusinessFalse: true });
     const summary = renderGovernanceEvidenceCenter(bodyEl, payload || {});
     metaEl.textContent = `${summary.label} • ${summary.meta}`;
-    if (rawEl) rawEl.textContent = JSON.stringify(payload || {}, null, 2);
+    if (rawEl) renderTechnicalDetails(rawEl, payload || {}, { summary: "Technical details" });
     updateDashboardLiveState(
       { governanceEvidence: payload },
       { sourceTs: summary.latestTsMs || extractCollectionRealtimeTs(payload) || Date.now() }
@@ -2854,8 +3079,16 @@ async function loadGovernanceEvidence() {
     };
     const summary = summarizeGovernanceEvidence(fallback);
     metaEl.textContent = "unavailable";
-    bodyEl.innerHTML = `<div class="metric-meta">Governance evidence unavailable: ${escapeHTML(describeUiError(e))}</div>`;
-    if (rawEl) rawEl.textContent = JSON.stringify({ error: e && e.message ? e.message : String(e) }, null, 2);
+    renderState(bodyEl, {
+      state: "error",
+      title: "Governance evidence unavailable",
+      message: summarizeOperatorError(e, "Governance evidence could not be loaded."),
+      why: "Promotion and rollback decisions need current governance evidence before operators can trust them.",
+      action: "Refresh the dashboard; if it repeats, inspect governance route health and technical details.",
+      details: e,
+      compact: true,
+    });
+    if (rawEl) renderTechnicalDetails(rawEl, e, { summary: "Technical details" });
     updateDashboardLiveState({}, { errorKey: "governanceEvidence", error: e });
     setPanelState("governanceEvidenceCard", {
       state: "error",
@@ -3892,20 +4125,32 @@ function renderNotes(containerId, notes, emptyText = "No active issues reported.
     .join("");
 }
 
-function renderStructuredSummary(target, rows, { emptyText = "No structured details available.", rawTarget = null, rawPayload = null } = {}) {
+function renderStructuredSummary(target, rows, {
+  emptyText = "No structured details available.",
+  emptyKind = "active",
+  state = "empty",
+  stateTitle = "",
+  stateWhy = "",
+  stateAction = "",
+  rawTarget = null,
+  rawPayload = null,
+  rawLabel = "Technical details",
+} = {}) {
   const el = typeof target === "string" ? document.getElementById(target) : target;
   const rawEl = typeof rawTarget === "string" ? document.getElementById(rawTarget) : rawTarget;
   if (!el) return;
 
   const safeRows = asArray(rows).filter((row) => row && (row.label || row.value !== undefined || row.meta));
   if (!safeRows.length) {
-    el.innerHTML = `
-      <div class="structuredSummaryRow">
-        <div class="structuredSummaryLabel">Status</div>
-        <div class="structuredSummaryValue">Unavailable</div>
-        <div class="structuredSummaryMeta">${escapeHTML(String(emptyText || "No structured details available."))}</div>
-      </div>
-    `;
+    el.innerHTML = stateBlockHtml({
+      state,
+      emptyKind,
+      title: stateTitle,
+      message: emptyText || "No structured details available.",
+      why: stateWhy || "The panel cannot produce a useful structured summary without backend records.",
+      action: stateAction || "Refresh the panel or inspect technical details if the condition persists.",
+      compact: true,
+    });
   } else {
     el.innerHTML = safeRows.map((row) => `
       <div class="structuredSummaryRow">
@@ -3917,9 +4162,7 @@ function renderStructuredSummary(target, rows, { emptyText = "No structured deta
   }
 
   if (rawEl) {
-    rawEl.textContent = rawPayload == null
-      ? "(no raw payload)"
-      : JSON.stringify(rawPayload, null, 2);
+    renderTechnicalDetails(rawEl, rawPayload == null ? "(no raw payload)" : rawPayload, { summary: rawLabel });
   }
 }
 
@@ -3963,6 +4206,7 @@ function updateDashboardLiveState(patch = {}, meta = {}) {
     _dashboardLiveState.errors[errorKey] = describeUiError(meta.error || meta.message || "request_failed");
   }
 
+  renderDashboardOpsKpis();
   renderRecommendedActionCard();
 }
 
@@ -4106,6 +4350,324 @@ function computeRecommendedAction() {
   };
 }
 
+function renderDashboardOpsKpis() {
+  const target = document.getElementById("dashboardOpsKpis");
+  if (!target) return;
+
+  const health = _dashboardLiveState.health || _lastHealth || window.__LAST_HEALTH__ || null;
+  const readiness = _dashboardLiveState.readiness || window.__LAST_READINESS__ || null;
+  const systemState = _dashboardLiveState.systemState || window.__LAST_SYSTEM_STATE__ || null;
+  const executionBarrier = _dashboardLiveState.executionBarrier || window.__LAST_EXECUTION_BARRIER__ || null;
+  const systemStatus = window.__LAST_SYSTEM_STATUS_HEADER__ || {};
+  const alerts = Array.isArray(_dashboardLiveState.alerts) && _dashboardLiveState.alerts.length
+    ? _dashboardLiveState.alerts
+    : (Array.isArray(_lastAlerts) ? _lastAlerts : null);
+  const failures = normalizeFailureItems(_dashboardLiveState.failures.length ? _dashboardLiveState.failures : (window.__LAST_REFRESH_FAILURES__ || []));
+  const scorecard = computeHealthScore({
+    alerts,
+    health,
+    readiness,
+    systemState,
+    systemStatus,
+    executionBarrier,
+    executionDegraded: _isExecutionDegraded(),
+  });
+
+  const readinessObj = asObject(readiness && readiness.readiness ? readiness.readiness : readiness);
+  const readinessReady = readinessObj.ready === true || readinessObj.ok === true;
+  const readinessBlocked = readinessObj.ready === false || readinessObj.ok === false;
+  const readinessIssues = [
+    ...asArray(readinessObj.blockers),
+    ...asArray(readinessObj.reasons),
+  ].filter(Boolean);
+  const readinessTone = readinessReady ? "ok" : readinessBlocked ? "blocked" : "unavailable";
+
+  const barrierAllowed = executionBarrier && executionBarrier.allowed === true;
+  const barrierBlocked = executionBarrier && executionBarrier.allowed === false;
+  const barrierTone = barrierAllowed ? "ok" : barrierBlocked ? "blocked" : "unavailable";
+  const barrierReason = String(executionBarrier && (executionBarrier.reason || executionBarrier.mode || executionBarrier.status) || "").trim();
+
+  const healthObj = normalizeOperatorHealthPayload(health) || asObject(health);
+  const priceAgeMs = pickFiniteNumber(
+    systemStatus.market_data_latency_ms,
+    healthObj.prices && healthObj.prices.age_ms,
+    healthObj.ingestion && healthObj.ingestion.price_age_ms
+  );
+  const providers = pickFiniteNumber(systemStatus.healthy_providers);
+  const liveMarketDataOk = systemStatus.live_market_data_ok === true;
+  const liveMarketDataFailed = Object.prototype.hasOwnProperty.call(systemStatus, "live_market_data_ok")
+    && systemStatus.live_market_data_ok !== true;
+  const pricesOk = healthObj.prices && healthObj.prices.ok === true;
+  const dataTone = liveMarketDataOk
+    ? "ok"
+    : liveMarketDataFailed
+      ? "crit"
+      : pricesOk
+        ? "warn"
+        : "unavailable";
+  const dataValue = liveMarketDataOk
+    ? "Live"
+    : liveMarketDataFailed
+      ? "Not live"
+      : pricesOk
+        ? "Partial"
+        : "Unknown";
+  const dataMeta = [
+    providers == null ? "" : `${Math.max(0, Math.round(providers))} provider${Math.round(providers) === 1 ? "" : "s"}`,
+    priceAgeMs == null ? "" : `${formatAgeMs(priceAgeMs)} age`,
+  ].filter(Boolean).join(" · ") || "market-data evidence pending";
+
+  const activeAlerts = Array.isArray(alerts) ? alerts.filter((row) => row && row.resolved !== true) : [];
+  const criticalAlerts = activeAlerts.filter((row) => normalizeSeverity(row && row.severity) === "CRIT").length;
+  const alertCount = Array.isArray(alerts)
+    ? activeAlerts.length
+    : pickFiniteNumber(systemStatus.alert_count);
+  const alertTone = alertCount == null
+    ? "unavailable"
+    : criticalAlerts > 0
+      ? "crit"
+      : alertCount > 0
+        ? "warn"
+        : "ok";
+
+  target.innerHTML = [
+    kpiTileHtml({
+      label: "Runtime",
+      value: scorecard.score === null ? "Waiting" : `${scorecard.score}/100`,
+      meta: `${scorecard.coverageText || "0/4 factors"} · ${scorecard.badgeLabel || "waiting"}`,
+      tone: failures.length ? "warn" : (scorecard.badgeClassName || "unavailable"),
+    }),
+    kpiTileHtml({
+      label: "Readiness",
+      value: readinessReady ? "Ready" : readinessBlocked ? "Blocked" : "Unknown",
+      meta: readinessIssues.length ? `${readinessIssues.length} blocker/reason item${readinessIssues.length === 1 ? "" : "s"}` : "no blockers reported",
+      tone: readinessTone,
+    }),
+    kpiTileHtml({
+      label: "Execution",
+      value: barrierAllowed ? "Allowed" : barrierBlocked ? "Blocked" : "Unknown",
+      meta: barrierReason || "barrier evidence pending",
+      tone: barrierTone,
+    }),
+    kpiTileHtml({
+      label: "Data",
+      value: dataValue,
+      meta: dataMeta,
+      tone: dataTone,
+    }),
+    kpiTileHtml({
+      label: "Alerts",
+      value: alertCount == null ? "Unknown" : String(Math.max(0, Math.round(alertCount))),
+      meta: criticalAlerts ? `${criticalAlerts} critical active` : "active unresolved alerts",
+      tone: alertTone,
+    }),
+  ].join("");
+}
+
+function normalizeMissionBool(value) {
+  if (typeof value === "boolean") return value;
+  if (value === 1 || value === "1" || value === "true" || value === "TRUE") return true;
+  if (value === 0 || value === "0" || value === "false" || value === "FALSE") return false;
+  return null;
+}
+
+function nestedReadinessPayload(readiness) {
+  const root = asObject(readiness);
+  return Object.keys(asObject(root.readiness)).length ? asObject(root.readiness) : root;
+}
+
+function compactMissionText(value, fallback = "unavailable", maxLen = 120) {
+  const text = String(value || "").replace(/\s+/g, " ").trim() || fallback;
+  return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+}
+
+function setMissionPill(id, tone, text) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const nextText = String(text || "—");
+  el.className = buildPillClassName(el, tone);
+  el.textContent = nextText;
+  el.setAttribute("aria-label", statusAriaLabel(tone, nextText));
+}
+
+function setMissionText(id, text) {
+  const el = document.getElementById(id);
+  if (el) setTextContent(el, text);
+}
+
+function currentMissionHealthScorecard() {
+  const alerts = Array.isArray(_dashboardLiveState.alerts) && _dashboardLiveState.alerts.length
+    ? _dashboardLiveState.alerts
+    : (Array.isArray(_lastAlerts) ? _lastAlerts : null);
+  return computeHealthScore({
+    alerts,
+    health: _dashboardLiveState.health || _lastHealth || window.__LAST_HEALTH__ || null,
+    readiness: _dashboardLiveState.readiness || window.__LAST_READINESS__ || null,
+    systemState: _dashboardLiveState.systemState || window.__LAST_SYSTEM_STATE__ || null,
+    systemStatus: window.__LAST_SYSTEM_STATUS_HEADER__ || null,
+    executionBarrier: _dashboardLiveState.executionBarrier || window.__LAST_EXECUTION_BARRIER__ || null,
+    executionDegraded: _isExecutionDegraded(),
+  });
+}
+
+function renderMissionHealthMini(scorecard = currentMissionHealthScorecard()) {
+  const valueEl = document.getElementById("missionHealthValue");
+  const badgeEl = document.getElementById("missionHealthBadge");
+  const coverageEl = document.getElementById("missionHealthCoverage");
+  if (!valueEl || !badgeEl || !coverageEl) return;
+
+  const safe = scorecard || computeHealthScore({});
+  valueEl.textContent = safe.score === null ? "—" : `${safe.score}`;
+  valueEl.setAttribute(
+    "aria-label",
+    safe.score === null ? "Health score unavailable" : `Health score ${safe.score} out of 100`
+  );
+  setMissionPill("missionHealthBadge", safe.badgeClassName || "unavailable", safe.badgeLabel || "waiting");
+  setMissionPill(
+    "missionHealthCoverage",
+    safe.coverageClassName || "unavailable",
+    safe.coverageText || "0/4 factors"
+  );
+  coverageEl.title = safe.partialCoverage
+    ? "Health score is normalized over available factors only; missing factors are coverage gaps."
+    : "All health score factors are available.";
+}
+
+function latestMissionChange() {
+  const decision = asArray(_dashboardLiveState.decisions)[0] || null;
+  if (decision) {
+    const symbol = String(decision.symbol || decision.asset || decision.instrument || "").trim().toUpperCase();
+    const action = String(decision.action || decision.side || decision.decision || decision.status || "decision").trim();
+    const ts = pickTimestamp(
+      decision.ts_ms,
+      decision.decision_ts_ms,
+      decision.created_ts_ms,
+      decision.updated_ts_ms,
+      _dashboardLiveState.timestamps.decisions
+    );
+    return {
+      title: compactMissionText([symbol, action ? action.toUpperCase() : ""].filter(Boolean).join(" · "), "Latest decision"),
+      meta: ts ? `decision ${formatAgeMs(ageMsFromTimestamp(ts))} ago` : "decision timestamp unavailable",
+    };
+  }
+
+  const advisory = asArray(_dashboardLiveState.advisories)[0] || null;
+  if (advisory) {
+    const symbol = String(advisory.symbol || advisory.asset || "").trim().toUpperCase();
+    const title = String(advisory.recommendation || advisory.side || advisory.status || "execution advisory").trim();
+    const ts = pickTimestamp(advisory.ts_ms, advisory.updated_ts_ms, _dashboardLiveState.timestamps.advisories);
+    return {
+      title: compactMissionText([symbol, title].filter(Boolean).join(" · "), "Execution advisory"),
+      meta: ts ? `advisory ${formatAgeMs(ageMsFromTimestamp(ts))} ago` : "advisory timestamp unavailable",
+    };
+  }
+
+  const failures = normalizeFailureItems(_dashboardLiveState.failures.length ? _dashboardLiveState.failures : (window.__LAST_REFRESH_FAILURES__ || []));
+  if (failures.length) {
+    return {
+      title: "Source route degraded",
+      meta: compactMissionText(`${failures[0].label}: ${failures[0].message}`, "route failure", 110),
+    };
+  }
+
+  return {
+    title: "No recent decision change",
+    meta: "Waiting for decisions or execution advisories.",
+  };
+}
+
+function renderMissionControlHeader(rec = null) {
+  if (!document.getElementById("missionTradePill")) return;
+
+  const recommendation = rec || computeRecommendedAction();
+  const health = _dashboardLiveState.health || _lastHealth || window.__LAST_HEALTH__ || null;
+  const readiness = nestedReadinessPayload(_dashboardLiveState.readiness || window.__LAST_READINESS__ || null);
+  const executionBarrier = _dashboardLiveState.executionBarrier || window.__LAST_EXECUTION_BARRIER__ || null;
+  const barrierAllowed = normalizeMissionBool(asObject(executionBarrier).allowed);
+  const readinessReady = normalizeMissionBool(readiness.ready);
+  const readinessOk = normalizeMissionBool(readiness.ok);
+  const healthOk = normalizeMissionBool(asObject(health).ok);
+  const routeFailures = normalizeFailureItems(_dashboardLiveState.failures.length ? _dashboardLiveState.failures : (window.__LAST_REFRESH_FAILURES__ || []));
+
+  let tradeTone = "unavailable";
+  let tradeLabel = "unknown";
+  let tradeDetail = "Execution barrier and readiness evidence are not fully loaded.";
+  if (barrierAllowed === false || readinessReady === false || readinessOk === false) {
+    tradeTone = "blocked";
+    tradeLabel = "no";
+    tradeDetail = barrierAllowed === false
+      ? compactMissionText(asObject(executionBarrier).reason || "Execution barrier is blocking trading.")
+      : "Readiness gates are not satisfied.";
+  } else if (barrierAllowed === true && readinessReady !== false && readinessOk !== false && !routeFailures.length) {
+    tradeTone = healthOk === false ? "warn" : "ok";
+    tradeLabel = healthOk === false ? "guarded" : "yes";
+    tradeDetail = healthOk === false
+      ? "Health is degraded; execution is not blocked, but visibility is reduced."
+      : "Execution barrier and readiness are clear in the latest loaded state.";
+  } else if (routeFailures.length) {
+    tradeTone = "warn";
+    tradeLabel = "guarded";
+    tradeDetail = compactMissionText(`${routeFailures[0].label}: ${routeFailures[0].message}`);
+  }
+
+  let shouldTone = "dim";
+  let shouldLabel = "hold";
+  if (recommendation.action === "DO NOTHING") {
+    shouldTone = "blocked";
+    shouldLabel = "no";
+  } else if (recommendation.action === "BUY" || recommendation.action === "SELL") {
+    shouldTone = recommendation.blocking === "clear" ? "warn" : "crit";
+    shouldLabel = recommendation.blocking === "clear" ? `review ${recommendation.action.toLowerCase()}` : "blocked";
+  } else if (recommendation.blocking === "clear" && recommendation.state === "fresh") {
+    shouldTone = "ok";
+    shouldLabel = "hold";
+  } else if (recommendation.state === "error" || recommendation.blocking === "guarded" || recommendation.blocking === "blocked") {
+    shouldTone = "warn";
+    shouldLabel = "wait";
+  }
+
+  const change = latestMissionChange();
+  const nextText = recommendation.action === "DO NOTHING"
+    ? "Do not add risk; inspect blockers first."
+    : compactMissionText(asArray(buildRecommendedGuidance(recommendation))[0], recommendation.reason, 120);
+  const updatedText = recommendation.updatedTs
+    ? `guidance ${formatAgeMs(recommendation.ageMs)} ago`
+    : "guidance timestamp unavailable";
+
+  setMissionPill("missionTradePill", tradeTone, tradeLabel);
+  setMissionText("missionTradeDetail", tradeDetail);
+  setMissionPill("missionShouldPill", shouldTone, shouldLabel);
+  setMissionText("missionShouldDetail", compactMissionText(recommendation.target || recommendation.reason, "Guidance pending."));
+  setMissionText("missionChangeText", change.title);
+  setMissionText("missionChangeMeta", change.meta);
+  setMissionText("missionNextText", nextText);
+  setMissionText("missionNextMeta", updatedText);
+}
+
+function buildRecommendedGuidance(rec) {
+  const steps = [];
+  const push = (value) => {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (text && !steps.includes(text)) steps.push(text);
+  };
+
+  if (rec.state === "error" || rec.action === "DO NOTHING" || rec.blocking !== "clear") {
+    push("Do not add risk while the displayed blocker is active.");
+    push(rec.reason);
+    push("Use Readiness Evidence and Execution Barrier before resuming action.");
+  } else if (rec.action === "BUY" || rec.action === "SELL") {
+    push(`Review the latest decision context for ${rec.target}.`);
+    push("Confirm execution barrier and readiness remain clear.");
+    push(`Act only through guarded execution workflows for ${rec.action}.`);
+  } else {
+    push("Hold current posture until a fresh decision or advisory arrives.");
+    push(rec.reason);
+    push("Refresh if timestamps become stale or backend state is unavailable.");
+  }
+
+  return steps.slice(0, 4);
+}
+
 function renderRecommendedActionCard() {
   const primaryEl = document.getElementById("recommendedActionPrimary");
   const targetEl = document.getElementById("recommendedActionTarget");
@@ -4114,6 +4676,7 @@ function renderRecommendedActionCard() {
   const blockingEl = document.getElementById("recommendedActionBlocking");
   const updatedEl = document.getElementById("recommendedActionUpdated");
   const notesEl = document.getElementById("recommendedActionNotes");
+  const stepsEl = document.getElementById("recommendedActionSteps");
   const statePill = document.getElementById("recommendedActionStatePill");
 
   if (!primaryEl || !targetEl || !reasonEl || !confidenceEl || !blockingEl || !updatedEl || !notesEl || !statePill) {
@@ -4121,6 +4684,7 @@ function renderRecommendedActionCard() {
   }
 
   const rec = computeRecommendedAction();
+  const cardEl = document.getElementById("recommendedActionCard");
   primaryEl.textContent = rec.action;
   primaryEl.className = `recommendedActionTitle ${rec.action === "BUY" ? "pnl-positive" : rec.action === "SELL" ? "pnl-negative" : ""}`.trim();
   targetEl.textContent = rec.target;
@@ -4140,17 +4704,31 @@ function renderRecommendedActionCard() {
     ? `updated ${formatAgeMs(rec.ageMs)} ago`
     : "updated unavailable";
 
+  if (stepsEl) {
+    stepsEl.outerHTML = guidanceListHtml(buildRecommendedGuidance(rec), {
+      id: "recommendedActionSteps",
+      emptyText: "Hold current posture until runtime guidance is available.",
+    });
+  }
   renderNotes("recommendedActionNotes", rec.notes, "Decision support is waiting for a fresh decision, advisory, or runtime update.");
   setPanelState("recommendedActionCard", {
     state: rec.state,
     reason: `${rec.target} ${rec.updatedTs ? `• backend ${formatAgeMs(rec.ageMs)} old` : "• no backend timestamp"}`,
   });
 
+  if (cardEl) {
+    cardEl.dataset.state = rec.state === "error"
+      ? "error"
+      : (rec.action === "DO NOTHING" || rec.blocking === "blocked" || rec.blocking === "guarded" ? "blocked" : rec.state);
+  }
+
   statePill.className = buildPillClassName(
     statePill,
     rec.state === "error" ? "crit" : rec.state === "stale" ? "warn" : rec.state === "empty" ? "dim" : "ok"
   );
   statePill.textContent = rec.state;
+  renderMissionControlHeader(rec);
+  return rec;
 }
 
 function updateProChartsPanelState() {
@@ -4185,10 +4763,38 @@ if (typeof window !== "undefined") {
   window.__updateDashboardProChartState__ = updateProChartsPanelState;
 }
 
-function renderEmptyTableBody(bodyId, colspan, message) {
+function renderEmptyTableBody(bodyId, colspan, message, options = {}) {
   const body = document.getElementById(bodyId);
   if (!body) return;
-  body.innerHTML = `<tr class="table-row"><td colspan="${intOr(colspan, 1)}" class="metric-meta">${escapeHTML(message)}</td></tr>`;
+  body.innerHTML = `
+    <tr class="table-row">
+      <td colspan="${intOr(colspan, 1)}" class="metric-meta">
+        ${stateBlockHtml({
+          state: options.state || "empty",
+          emptyKind: options.emptyKind || "active",
+          message: message || "No rows returned.",
+          why: options.why || "The table is reachable, but there are no rows to display.",
+          action: options.action || "Refresh after the next runtime update.",
+          compact: true,
+        })}
+      </td>
+    </tr>
+  `;
+}
+
+function rowsFromReadPayload(payload, keys = ["data", "rows"]) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  for (const key of keys) {
+    if (Array.isArray(payload[key])) return payload[key];
+  }
+  return [];
+}
+
+function reasonFromReadPayload(payload, fallback = "No data yet.") {
+  if (!payload || typeof payload !== "object") return String(fallback);
+  const meta = payload.meta && typeof payload.meta === "object" ? payload.meta : {};
+  return String(payload.reason || meta.reason || payload.error || fallback);
 }
 
 function renderAlertsUnavailable(message) {
@@ -4327,6 +4933,14 @@ function setSelectedJob(name) {
   selectedJob = name;
   const el = document.getElementById("selectedJob");
   if (el) el.textContent = name;
+  _launchContext.jobId = String(name || "").trim();
+  _syncDashboardOperationalContext({
+    job_id: _launchContext.jobId,
+    source: "dashboard_job",
+  }, {
+    persistStorage: true,
+    persistUrl: false,
+  });
   syncLogViewerSourceLabel();
   renderJobCatalog();
   if (getLogViewerSource() === "selected_job") {
@@ -4752,8 +5366,98 @@ function flashCommandPaletteTarget(target) {
   }, 1500);
 }
 
+function elementDatasetValue(el, key) {
+  if (!el || !el.dataset) return "";
+  return String(el.dataset[key] || "").trim();
+}
+
+function commandPaletteActivateNavigationTarget(target = {}) {
+  const el = target.element || null;
+  const action = String(target.action || elementDatasetValue(el, "commandAction") || "").trim().toLowerCase();
+  if (action === "click" && el && typeof el.click === "function") {
+    el.click();
+    flashCommandPaletteTarget(el);
+    return;
+  }
+
+  const href = String(
+    target.href ||
+    (el && (el.href || (typeof el.getAttribute === "function" ? el.getAttribute("href") : ""))) ||
+    ""
+  ).trim();
+  if (href) {
+    window.location.href = href;
+    return;
+  }
+
+  if (el && typeof el.click === "function") {
+    el.click();
+    flashCommandPaletteTarget(el);
+  }
+}
+
+function dataSourcesCommandUrl(sourceKey = "") {
+  const link = document.getElementById("appDataSourcesLink");
+  const raw = String(
+    (link && (link.href || (typeof link.getAttribute === "function" ? link.getAttribute("href") : ""))) ||
+    "/ui/data_sources.html"
+  ).trim();
+  const url = new URL(raw || "/ui/data_sources.html", window.location.origin);
+  const key = String(sourceKey || "").trim();
+  if (key) url.searchParams.set("source_key", key);
+  url.searchParams.set("source", "command_palette");
+  return url.toString();
+}
+
+function commandPaletteOpenDataSource(sourceKey = "") {
+  window.location.href = dataSourcesCommandUrl(sourceKey);
+}
+
+function findElementByDataValue(attrName, value) {
+  const expected = String(value || "").trim();
+  if (!expected) return null;
+  return Array.from(document.querySelectorAll(`[${attrName}]`)).find((el) => (
+    String(el.getAttribute(attrName) || "").trim() === expected
+  )) || null;
+}
+
+async function commandPaletteOpenAlert(alertRef) {
+  const alertId = String(
+    alertRef && typeof alertRef === "object"
+      ? (alertRef.id || alertRef.alert_id || "")
+      : alertRef || ""
+  ).trim();
+  if (!alertId) return;
+
+  applyDashboardScreen("overview", { syncHash: true, hashMode: "push" });
+  if (ACTIVE_DASHBOARD_SCREEN !== "overview") {
+    toast("Alerts are hidden by the current dashboard persona", "warn", 3200);
+    return;
+  }
+
+  try {
+    await loadAlerts();
+  } catch {}
+
+  window.requestAnimationFrame(() => {
+    const target =
+      findElementByDataValue("data-alert-id", alertId) ||
+      document.getElementById("alertsCard");
+    if (target && typeof target.click === "function" && target.getAttribute("data-alert-id")) {
+      target.click();
+      return;
+    }
+    flashCommandPaletteTarget(target || "alertsCard");
+  });
+}
+
 function commandPaletteNavigateToScreen(screen) {
+  const requested = normalizeDashboardScreen(screen);
   applyDashboardScreen(screen, { syncHash: true, hashMode: "push" });
+  if (ACTIVE_DASHBOARD_SCREEN !== requested) {
+    toast("That screen is hidden by the current dashboard persona", "warn", 3200);
+    return;
+  }
   try {
     window.scrollTo({ top: 0, behavior: "smooth" });
   } catch {}
@@ -4906,7 +5610,7 @@ async function loadSizePolicyUI() {
     if (!p) {
       pill.textContent = "policy: none";
       pill.className = buildPillClassName(pill, "crit");
-      body.innerHTML = `<tr class="table-row"><td colspan="6" class="metric-meta">No policy yet. Train to enable.</td></tr>`;
+      body.innerHTML = `<tr class="table-row"><td colspan="6" class="metric-meta">${escapeHTML(reasonFromReadPayload(j, "No policy yet. Train to enable."))}</td></tr>`;
       return;
     }
 
@@ -4941,12 +5645,7 @@ async function loadStrategyStatus() {
   const table = document.getElementById('strategyStatusTable');
 
   try {
-    const r = await fetch('/api/strategy/status', { cache: 'no-store' });
-    const raw = await r.text();
-    let j = null;
-    try {
-      j = raw ? JSON.parse(raw) : null;
-    } catch {}
+    const j = await fetchJSON('/api/strategy/status', { allowBusinessFalse: true });
 
     if (panel) panel.textContent = j && j.ok ? 'active' : 'idle';
 
@@ -5573,6 +6272,12 @@ async function loadPositionsExposureScreen() {
   }
   if (riskPortfolio && riskPortfolio.ready === false) {
     exposureNotes.push(`portfolio risk snapshot not ready (${String(riskPortfolio.status || "unknown")})`);
+  }
+  if (portfolio && portfolio.ok === false) {
+    exposureNotes.push(`portfolio snapshot degraded: ${businessDegradedReason(portfolio) || "backend returned ok=false"}`);
+  }
+  if (riskPortfolio && riskPortfolio.ok === false) {
+    exposureNotes.push(`portfolio risk degraded: ${businessDegradedReason(riskPortfolio) || String(riskPortfolio.status || "backend returned ok=false")}`);
   }
   if (portfolioRes.status !== "fulfilled") {
     exposureNotes.push("portfolio snapshot unavailable");
@@ -7096,7 +7801,14 @@ async function loadHealth(preloaded) {
   const pricesOk = !!(safeHealth.prices && safeHealth.prices.ok);
   const labelsOk = !!(safeHealth.labels && safeHealth.labels.ok);
   const modelOk  = !!(safeHealth.model && safeHealth.model.ok);
-  const providersOk = intOr(ingestion.healthy_providers, 0) > 0;
+  const ingestionHasLiveFlag = Object.prototype.hasOwnProperty.call(ingestion, "live_market_data_ok");
+  const pricesHaveLiveFlag = !!safeHealth.prices && Object.prototype.hasOwnProperty.call(safeHealth.prices, "live_market_data_ok");
+  const liveMarketDataOk = ingestionHasLiveFlag
+    ? ingestion.live_market_data_ok === true
+    : (pricesHaveLiveFlag
+      ? safeHealth.prices.live_market_data_ok === true
+      : pricesOk && intOr(ingestion.healthy_providers, 0) > 0);
+  const providersOk = liveMarketDataOk;
   const ingestionRunning = !!(ingestion.running || ingestion.job_visible);
   const healthSnapshotTs = pickTimestamp(
     safeHealth.ts_ms,
@@ -7109,10 +7821,13 @@ async function loadHealth(preloaded) {
   if (Object.keys(ingestion).length) {
     const child = ingestion.active_child || "—";
     const providers = `${ingestion.healthy_providers || 0}`;
+    const rawProviders = Number.isFinite(Number(ingestion.raw_healthy_providers)) ? Number(ingestion.raw_healthy_providers) : null;
     const rows = `${ingestion.fresh_rows || 0}`;
     const ageMs = Number(ingestion.price_age_ms || 0);
     const ageLabel = Number.isFinite(ageMs) && ageMs > 0 ? formatAgeMs(ageMs) : "—";
-    pricesLabel = `ingestion ${ingestion.status || (ingestionRunning ? "RUNNING" : "STOPPED")} · child ${child} · providers ${providers} · rows ${rows} · age ${ageLabel}`;
+    const liveStatus = String(ingestion.live_feed_status || "").trim();
+    const missing = Array.isArray(ingestion.missing_credential_env_vars) ? ingestion.missing_credential_env_vars.filter(Boolean) : [];
+    pricesLabel = `ingestion ${ingestion.status || (ingestionRunning ? "RUNNING" : "STOPPED")} · child ${child} · live providers ${providers}${rawProviders != null ? `/${rawProviders} raw` : ""} · rows ${rows} · age ${ageLabel}${liveStatus ? ` · ${liveStatus}` : ""}${missing.length ? ` · missing ${missing.join(", ")}` : ""}`;
     pricesTone = pricesOk && providersOk
       ? freshnessTone(ageMs, 60_000, 300_000)
       : (ingestionRunning ? "warn" : "bad");
@@ -7202,7 +7917,7 @@ async function loadHealth(preloaded) {
           healthRouteFailed ? "health snapshot stale" : "",
           !pricesOk ? "prices not fresh" : "",
           !labelsOk ? "labels not ready" : "",
-          !providersOk ? "providers unavailable" : "",
+          !providersOk ? "live market data unavailable" : "",
           !ingestionRunning ? "ingestion not running" : "",
           readinessBlocked ? "readiness blocked" : "",
           barrierBlocked ? "execution blocked" : "",
@@ -7257,6 +7972,7 @@ async function loadExecutionOverlays() {
       },
     ], {
       emptyText: "Execution overlays returned no structured sections.",
+      emptyKind: "active",
       rawTarget: raw,
       rawPayload: j,
     });
@@ -7269,9 +7985,13 @@ async function loadExecutionOverlays() {
     });
   } catch (e) {
     renderStructuredSummary(summaryEl, [], {
-      emptyText: e && e.message ? e.message : String(e),
+      state: "error",
+      stateTitle: "Execution overlays unavailable",
+      emptyText: summarizeOperatorError(e, "Execution overlays could not be loaded."),
+      stateWhy: "Execution overlay context is unavailable, so execution-analysis panels may be incomplete.",
+      stateAction: "Refresh the dashboard; if it repeats, inspect backend execution analytics and the technical details.",
       rawTarget: raw,
-      rawPayload: { error: e && e.message ? e.message : String(e) },
+      rawPayload: e,
     });
     updateDashboardLiveState({}, { errorKey: "executionOverlays", error: e });
     setPanelState("execOverlaysPanel", {
@@ -7283,11 +8003,16 @@ async function loadExecutionOverlays() {
 
 async function loadStrategyMetrics() {
   try {
-    const rows = await fetchJSON("/api/strategy/metrics");
+    const payload = await fetchJSON("/api/strategy/metrics");
+    const rows = rowsFromReadPayload(payload, ["data", "rows", "strategies"]);
     const tbody = document.querySelector("#strategyMetrics tbody");
     if (!tbody) return;
 
     tbody.innerHTML = "";
+    if (!rows.length) {
+      tbody.innerHTML = `<tr class="table-row"><td colspan="6" class="metric-meta">${escapeHTML(reasonFromReadPayload(payload, "No strategy metrics yet."))}</td></tr>`;
+      return;
+    }
     for (const r of rows || []) {
       const tr = document.createElement("tr");
       tr.innerHTML = `
@@ -7352,14 +8077,17 @@ async function loadPromotionAudit() {
   if (!tbody) return;
 
   let rows = [];
+  let payload = null;
   try {
-    rows = await fetchJSON("/api/promotion/audit?limit=200");
-    if (!Array.isArray(rows)) rows = [];
+    payload = await fetchJSON("/api/promotion/audit?limit=200");
+    rows = rowsFromReadPayload(payload, ["data", "rows", "audit"]);
   } catch {
     rows = [];
   }
 
-  tbody.innerHTML = renderPromotionAuditRows(rows);
+  tbody.innerHTML = rows.length
+    ? renderPromotionAuditRows(rows)
+    : `<tr class="table-row"><td colspan="8" class="metric-meta">${escapeHTML(reasonFromReadPayload(payload, "No promotion audit rows returned."))}</td></tr>`;
 }
 
 
@@ -7368,14 +8096,19 @@ async function loadCausalScores() {
   if (!tbody) return;
 
   let rows = [];
+  let payload = null;
   try {
-    rows = await fetchJSON("/api/causal/scores?limit=200");
-    if (!Array.isArray(rows)) rows = [];
+    payload = await fetchJSON("/api/causal/scores?limit=200");
+    rows = rowsFromReadPayload(payload, ["data", "rows"]);
   } catch {
     rows = [];
   }
 
   tbody.innerHTML = "";
+  if (!rows.length) {
+    tbody.innerHTML = `<tr class="table-row"><td colspan="7" class="metric-meta">${escapeHTML(reasonFromReadPayload(payload, "No causal scores yet."))}</td></tr>`;
+    return;
+  }
   for (const r of rows) {
     const score = r.score === null || r.score === undefined ? "" : Number(r.score).toFixed(3);
     const grangerP = r.granger_p === null || r.granger_p === undefined ? "" : Number(r.granger_p).toExponential(2);
@@ -7411,7 +8144,7 @@ async function refreshCalibCurves() {
     out = null;
   }
 
-if (pre) pre.textContent = out ? JSON.stringify(out, null, 2) : "(no calib data)";
+if (pre) renderTechnicalDetails(pre, out || "(no calibration payload)", { summary: "Technical details" });
 
 if (canvas) {
   drawCalibration(
@@ -7569,7 +8302,7 @@ function renderPromotionGate(payload) {
 
   const gate = normalizePromotionGatePayload(payload);
   window.__LAST_PROMOTION_GATE__ = gate.raw;
-  if (rawEl) rawEl.textContent = JSON.stringify(gate.raw || payload || {}, null, 2);
+  if (rawEl) renderTechnicalDetails(rawEl, gate.raw || payload || {}, { summary: "Technical details" });
 
   const statusLabel = gate.status.enabled === false
     ? "OFF"
@@ -7719,9 +8452,13 @@ async function loadPromotionGate() {
     renderPromotionGate(payload && payload.gate ? payload.gate : payload);
   } catch (e) {
     renderStructuredSummary(summaryEl, [], {
-      emptyText: `Promotion gate unavailable: ${e.message}`,
+      state: "error",
+      stateTitle: "Promotion gate unavailable",
+      emptyText: summarizeOperatorError(e, "Promotion gate could not be loaded."),
+      stateWhy: "Model promotion controls need current gate evidence before an operator can trust the decision.",
+      stateAction: "Refresh the dashboard; if it repeats, inspect governance route health and technical details.",
       rawTarget: "promotionGateRaw",
-      rawPayload: { error: e && e.message ? e.message : String(e) },
+      rawPayload: e,
     });
     renderPromotionComparisonBars("promotionGateBars", { ok: false, comparison_metrics: [] });
     const metaEl = document.getElementById("promotionGateMeta");
@@ -7804,7 +8541,14 @@ async function loadModelDiagnostics() {
     }
     el.textContent = out || "(no diagnostics yet)";
   } catch (e) {
-    el.textContent = `[error] ${e.message}`;
+    renderState(el, {
+      state: "error",
+      title: "Model diagnostics unavailable",
+      message: summarizeOperatorError(e, "Model diagnostics could not be loaded."),
+      why: "Model diagnostics support investigation but should not block safety controls.",
+      action: "Refresh the panel or inspect model diagnostics route health.",
+      details: e,
+    });
   }
 }
 
@@ -7821,7 +8565,16 @@ async function loadRelevanceStats() {
       meta.textContent = "disabled";
       meta.className = buildPillClassName(meta, "neutral");
       body.innerHTML = "";
-      diffBox.textContent = res && res.error ? res.error : "not available";
+      renderState(diffBox, {
+        state: "empty",
+        emptyKind: "active",
+        title: "Relevance stats unavailable",
+        message: summarizeOperatorError(res || "not available", "Relevance stats are not available."),
+        why: "The route responded, but did not return a usable stats payload.",
+        action: "Refresh after model diagnostics update.",
+        details: res || null,
+        compact: true,
+      });
       return;
     }
 
@@ -7829,6 +8582,15 @@ async function loadRelevanceStats() {
     meta.className = buildPillClassName(meta, res.cached ? "neutral" : "ok");
 
     const rows = _parseRelevanceStats(res.stats);
+    if (!rows.length) {
+      const reason = reasonFromReadPayload(res, "No relevance stats yet.");
+      meta.textContent = res.ready === false ? "not ready" : "empty";
+      meta.className = buildPillClassName(meta, "neutral");
+      body.innerHTML = `<tr class="table-row"><td colspan="5" class="metric-meta">${escapeHTML(reason)}</td></tr>`;
+      diffBox.textContent = reason;
+      localStorage.setItem(_RELEVANCE_SNAPSHOT_KEY, JSON.stringify(res.stats || {}));
+      return;
+    }
 
     // dominance thresholds (relative, not magic numbers)
     const maxRel = Math.max(...rows.map(r => r.relevance || 0), 0);
@@ -7871,7 +8633,15 @@ async function loadRelevanceStats() {
     meta.textContent = "error";
     meta.className = buildPillClassName(meta, "crit");
     body.innerHTML = "";
-    diffBox.textContent = e.message;
+    renderState(diffBox, {
+      state: "error",
+      title: "Relevance stats failed",
+      message: summarizeOperatorError(e, "Relevance stats could not be loaded."),
+      why: "Feature relevance comparison is unavailable for this refresh.",
+      action: "Refresh the panel or inspect relevance route health.",
+      details: e,
+      compact: true,
+    });
   }
 }
 
@@ -7926,7 +8696,15 @@ async function loadConfidenceMass() {
       wrap.appendChild(row);
     }
   } catch (e) {
-    wrap.textContent = `[error] ${e.message}`;
+    renderState(wrap, {
+      state: "error",
+      title: "Confidence mass unavailable",
+      message: summarizeOperatorError(e, "Confidence mass could not be loaded."),
+      why: "Confidence distribution diagnostics are unavailable for this refresh.",
+      action: "Refresh after model metrics update.",
+      details: e,
+      compact: true,
+    });
   }
 }
 
@@ -7954,7 +8732,15 @@ async function loadJobHistory() {
     }
     el.textContent = out || "(no history yet)";
   } catch (e) {
-    el.textContent = `[error] ${e.message}`;
+    renderState(el, {
+      state: "error",
+      title: "Job history unavailable",
+      message: summarizeOperatorError(e, "Job history could not be loaded."),
+      why: "Recent job outcomes are not visible in this panel.",
+      action: "Refresh the panel or inspect job history route health.",
+      details: e,
+      compact: true,
+    });
   }
 }
 
@@ -8013,7 +8799,15 @@ async function loadConfidenceTrends() {
 
     el.textContent = out || "(no alerts yet)";
   } catch (e) {
-    el.textContent = `[error] ${e.message}`;
+    renderState(el, {
+      state: "error",
+      title: "Confidence trends unavailable",
+      message: summarizeOperatorError(e, "Confidence trends could not be loaded."),
+      why: "Alert confidence trend diagnostics are unavailable for this refresh.",
+      action: "Refresh after alerts update.",
+      details: e,
+      compact: true,
+    });
   }
 }
 
@@ -8234,11 +9028,18 @@ async function loadSupervisorStatus() {
 
     pill.className = buildPillClassName(pill, j.enabled ? "ok" : "neutral");
     pill.textContent = j.enabled ? "supervisor: ON" : "supervisor: OFF";
-    raw.textContent = JSON.stringify(j, null, 2);
+    renderTechnicalDetails(raw, j, { summary: "Technical details" });
   } catch (e) {
     pill.className = buildPillClassName(pill, "crit");
     pill.textContent = "supervisor: error";
-    raw.textContent = e.message || String(e);
+    renderState(raw, {
+      state: "error",
+      title: "Supervisor status unavailable",
+      message: summarizeOperatorError(e, "Supervisor status could not be loaded."),
+      why: "Supervisor state controls whether runtime jobs are managed and observable.",
+      action: "Refresh the dashboard; if it repeats, inspect supervisor service health.",
+      details: e,
+    });
   }
 }
 
@@ -8307,7 +9108,14 @@ async function loadStructuredReadiness() {
     }
 
   } catch (e) {
-    el.textContent = `[readiness error] ${e.message || e}`;
+    renderState(el, {
+      state: "error",
+      title: "System state unavailable",
+      message: summarizeOperatorError(e, "System-state snapshot could not be loaded."),
+      why: "Readiness, kill-switch, and execution posture cannot be trusted without this snapshot.",
+      action: "Refresh the dashboard; if it repeats, inspect dashboard and runtime health.",
+      details: e,
+    });
     setPanelState("systemStateCard", {
       state: "error",
       reason: `System-state snapshot unavailable: ${describeUiError(e)}`,
@@ -8616,6 +9424,10 @@ async function loadSystemStatusHeader(preloaded = {}) {
     ingestion && ingestion.healthy_providers,
     ingestion && ingestion.summary && ingestion.summary.healthy_providers
   );
+  const liveMarketDataOk = pick(
+    ingestion && ingestion.live_market_data_ok,
+    ingestion && ingestion.summary && ingestion.summary.live_market_data_ok
+  ) === true;
 
   const freshRows = pickNumber(
     ingestion && ingestion.fresh_rows,
@@ -8637,7 +9449,7 @@ async function loadSystemStatusHeader(preloaded = {}) {
     );
     if (explicit) return explicit;
     if (ingestion && ingestion.ok === false) return "DISCONNECTED";
-    if ((healthyProviders || 0) > 0 && (freshRows || 0) > 0) return "CONNECTED";
+    if (liveMarketDataOk && (healthyProviders || 0) > 0 && (freshRows || 0) > 0) return "CONNECTED";
     if ((ingestion && ingestion.running) || (ingestion && ingestion.job_visible)) return "DEGRADED";
     return "DISCONNECTED";
   })();
@@ -8690,6 +9502,7 @@ async function loadSystemStatusHeader(preloaded = {}) {
     trading_mode: tradingMode,
     execution_enabled: executionEnabled,
     market_data_latency_ms: priceAgeMs,
+    live_market_data_ok: liveMarketDataOk,
     broker_connectivity: brokerConnectivity,
     alert_count: alertCount,
     healthy_providers: healthyProviders,
@@ -8732,7 +9545,7 @@ async function loadExecutionBarrier() {
 
     pill.className = buildPillClassName(pill, j.allowed ? "ok" : "crit");
     pill.textContent = j.allowed ? "execution: ALLOWED" : "execution: BLOCKED";
-    raw.textContent = JSON.stringify(j, null, 2);
+    renderTechnicalDetails(raw, j, { summary: "Technical details" });
 
     root.style.setProperty("--exec-blocked", j.allowed ? "0" : "1");
     updateDecisionHeader();
@@ -8745,7 +9558,14 @@ async function loadExecutionBarrier() {
     updateDashboardLiveState({ executionBarrier: window.__LAST_EXECUTION_BARRIER__ }, { sourceTs: Date.now() });
     pill.className = buildPillClassName(pill, "crit");
     pill.textContent = "execution: error";
-    raw.textContent = e.message || String(e);
+    renderState(raw, {
+      state: "error",
+      title: "Execution barrier unavailable",
+      message: summarizeOperatorError(e, "Execution barrier could not be loaded."),
+      why: "The dashboard fails closed when execution safety posture is unreadable.",
+      action: "Keep execution disabled and inspect barrier route health before resuming.",
+      details: e,
+    });
     root.style.setProperty("--exec-blocked", "1"); // fail closed
     updateDecisionHeader();
   }
@@ -9582,20 +10402,32 @@ setStage("UI WIRED");
     },
   });
   wireDashboardScreens();
-  initCommandPalette({
+  const commandPalette = initCommandPalette({
     document,
     fetchJSON,
+    screenDefinitions: DASHBOARD_SCREEN_DEFINITIONS,
     screenLabels: DASHBOARD_SCREEN_LABELS,
+    getPersonaLabel: () => getDashboardPersonaLabel(getActiveDashboardPersona()),
     getActiveScreen: () => ACTIVE_DASHBOARD_SCREEN,
+    isScreenAllowed: (screen) => isDashboardScreenAllowed(getActiveDashboardPersona(), screen),
+    isPanelAllowed: (screen, panelId) => isDashboardPanelAllowed(getActiveDashboardPersona(), screen, panelId),
     navigateToScreen: commandPaletteNavigateToScreen,
     navigateToPanel: commandPaletteNavigateToPanel,
+    activateNavigationTarget: commandPaletteActivateNavigationTarget,
     focusSymbol: commandPaletteFocusSymbol,
     focusModel: commandPaletteFocusModel,
     openDecision: (decisionId) => openDecisionModal(decisionId),
+    openAlert: commandPaletteOpenAlert,
+    openDataSource: commandPaletteOpenDataSource,
     selectJob: commandPaletteSelectJob,
     runJobAction: jobAction,
     toast,
   });
+  const commandPaletteBtn = document.getElementById("btnCommandPaletteToggle");
+  if (commandPaletteBtn && commandPalette && !commandPaletteBtn._boundCommandPaletteToggle) {
+    commandPaletteBtn._boundCommandPaletteToggle = true;
+    commandPaletteBtn.addEventListener("click", () => commandPalette.open());
+  }
   DASHBOARD_BOOTED = true;
 
   const globalSymbolInput = document.getElementById("globalSymbol");
@@ -9604,6 +10436,27 @@ setStage("UI WIRED");
     globalSymbolInput.addEventListener("input", () => updateSurfaceLinks());
     globalSymbolInput.addEventListener("change", () => updateSurfaceLinks());
   }
+
+  const saveWorkspaceBtn = document.getElementById("btnSaveWorkspace");
+  if (saveWorkspaceBtn && !saveWorkspaceBtn._boundWorkspaceSave) {
+    saveWorkspaceBtn._boundWorkspaceSave = true;
+    saveWorkspaceBtn.addEventListener("click", saveDashboardWorkspace);
+  }
+
+  const restoreWorkspaceBtn = document.getElementById("btnRestoreWorkspace");
+  if (restoreWorkspaceBtn && !restoreWorkspaceBtn._boundWorkspaceRestore) {
+    restoreWorkspaceBtn._boundWorkspaceRestore = true;
+    restoreWorkspaceBtn.addEventListener("click", restoreDashboardWorkspace);
+  }
+
+  const clearContextBtn = document.getElementById("btnClearContext");
+  if (clearContextBtn && !clearContextBtn._boundContextClear) {
+    clearContextBtn._boundContextClear = true;
+    clearContextBtn.addEventListener("click", clearDashboardContext);
+  }
+
+  renderDashboardOperationalContext();
+  updateSurfaceLinks();
 
   applyReadOnlyBanner();
   if (!_connectionStateUnsubscribe) {

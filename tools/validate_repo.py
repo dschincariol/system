@@ -477,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
         ("ruff-static-release-gate", [python, "-m", "ruff", "check", "engine/", "routes/", "services/", "tests/"]),
         ("docs", [python, "tools/validate_docs.py"]),
         ("ui-asset-refs", [python, "tools/check_local_asset_refs.py"]),
+        ("dashboard-route-contract", [python, "tools/check_dashboard_ui_contract.py", "--route-handlers-only"]),
         ("dependency-lock", [python, "tools/validate_dependency_lock.py", "--strict"]),
         ("noop-guard", [python, "tools/noop_guard.py"]),
         ("storage-route-audit", [python, "tools/storage_route_audit.py"]),

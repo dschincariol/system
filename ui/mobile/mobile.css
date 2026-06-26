@@ -1,29 +1,14 @@
+@import "../base.css";
+
 :root {
-  --bg: #101113;
-  --surface: #181a1d;
-  --surface-2: #202329;
-  --border: #343841;
-  --text: #f0f2f4;
-  --muted: #a9b0bb;
-  --dim: #78818f;
-  --status-neutral: #A7B0BC;
-  --status-info: #56B4E9;
-  --status-ok: #009E73;
-  --status-warn: #E69F00;
-  --status-high: #CC79A7;
-  --status-crit: #D55E00;
-  --status-blocked: #73B7E6;
-  --status-unavailable: #8B949E;
-  --status-ok-bg: rgba(0, 158, 115, 0.14);
-  --status-warn-bg: rgba(230, 159, 0, 0.15);
-  --status-crit-bg: rgba(213, 94, 0, 0.16);
-  --status-blocked-bg: rgba(115, 183, 230, 0.16);
-  --status-unavailable-bg: rgba(139, 148, 158, 0.13);
-  --ok: var(--status-ok);
-  --warn: var(--status-warn);
-  --danger: var(--status-crit);
-  --info: var(--status-info);
-  --shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  --bg: var(--surface-page);
+  --surface: var(--surface-card);
+  --surface-2: var(--surface-card-raised);
+  --border: var(--border-default);
+  --text: var(--text-primary);
+  --muted: var(--text-secondary);
+  --dim: var(--text-dim);
+  --shadow: var(--shadow-elevated);
   color-scheme: dark;
 }
 
@@ -40,7 +25,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-sans);
   letter-spacing: 0;
 }
 
@@ -357,14 +342,14 @@ input {
 .emergencyPanel {
   border-color: var(--status-crit);
   border-style: double;
-  background: #1c1718;
+  background: var(--status-crit-bg);
 }
 
 .consequencePreview {
   padding: 11px;
   border: 3px double var(--status-crit);
   border-radius: 6px;
-  color: #ffd4d4;
+  color: var(--status-crit);
   background: var(--status-crit-bg);
   font-size: 13px;
   line-height: 1.45;
@@ -381,7 +366,7 @@ input {
   min-height: 44px;
   padding: 10px 11px;
   color: var(--text);
-  background: #111315;
+  background: var(--surface-input);
   border: 1px solid var(--border);
   border-radius: 6px;
   outline: none;
@@ -398,8 +383,8 @@ input {
   min-height: 58px;
   margin-top: 12px;
   overflow: hidden;
-  color: #fff;
-  background: #6b2b08;
+  color: var(--surface-contrast);
+  background: color-mix(in srgb, var(--status-crit) 54%, var(--surface-panel));
   border: 3px double var(--status-crit);
   border-radius: 8px;
   font-weight: 900;
@@ -410,7 +395,7 @@ input {
 .holdButton:disabled {
   cursor: not-allowed;
   color: var(--dim);
-  background: #24272d;
+  background: var(--surface-chip);
   border-color: var(--border);
 }
 

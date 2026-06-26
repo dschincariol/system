@@ -12,8 +12,13 @@ import sys
 import time
 from typing import Any, Dict
 
+from engine.api.auth_config import (
+    dashboard_api_token_from_env,
+    safe_dev_localhost_fallback_enabled,
+    strict_mutation_auth_reasons,
+)
 from engine.api.http_parsing import qs as _qs
-from engine.api.auth_config import safe_dev_localhost_fallback_enabled
+from engine.runtime.platform import WILDCARD_BIND_HOST, is_loopback_host, resolve_network_mode
 from services.data_source_manager import get_manager
 
 
@@ -66,6 +71,7 @@ def _body_client_ip(body) -> str:
 def _data_source_refusal_status(payload: Dict[str, Any]) -> int:
     classification = str(payload.get("classification") or "").strip().lower()
     error = str(payload.get("error") or payload.get("message") or "").strip().lower()
+    error_code = error.split(":", 1)[0]
     status_code = None
     evidence = payload.get("evidence")
     if isinstance(evidence, dict):
@@ -90,8 +96,16 @@ def _data_source_refusal_status(payload: Dict[str, Any]) -> int:
         if status_code and 400 <= status_code < 500:
             return 422
         return 503
-    if error in {"source_not_found"}:
+    if error_code == "source_not_found":
         return 404
+    if error_code in {"source_exists"}:
+        return 409
+    if (
+        error_code.startswith("builtin_")
+        or error_code.endswith("_not_allowed")
+        or error_code.endswith("_locked")
+    ):
+        return 403
     if error.startswith("missing_") or error.startswith("invalid_") or error.startswith("masked_"):
         return 400
     return 422
@@ -126,6 +140,54 @@ def _with_refusal_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     meta.setdefault("reason_code", reason_code)
     out["meta"] = meta
     return out
+
+
+def _handled_refusal(error: str) -> Dict[str, Any]:
+    return _with_refusal_status({"ok": False, "error": str(error or "data_source_refused")})
+
+
+def _dashboard_token_configured() -> bool:
+    try:
+        return bool(dashboard_api_token_from_env())
+    except Exception:
+        return False
+
+
+def _configured_remote_bind_reasons() -> list[str]:
+    reasons: list[str] = []
+    host = str(os.environ.get("DASHBOARD_HOST") or "").strip()
+    if host:
+        try:
+            if not is_loopback_host(host):
+                reasons.append(f"dashboard_host={host}")
+        except Exception:
+            reasons.append(f"dashboard_host={host}")
+    elif resolve_network_mode() == "lan":
+        reasons.append(f"trading_network_mode=lan:{WILDCARD_BIND_HOST}")
+    return reasons
+
+
+def _data_sources_auth_posture() -> Dict[str, Any]:
+    strict_reasons = [str(item) for item in strict_mutation_auth_reasons()]
+    remote_bind_reasons = _configured_remote_bind_reasons()
+    token_configured = _dashboard_token_configured()
+    safe_dev_fallback = bool(safe_dev_localhost_fallback_enabled())
+    read_token_required = bool(strict_reasons or remote_bind_reasons)
+    return {
+        "dashboard_token_configured": token_configured,
+        "mutation_token_required": bool(token_configured or not safe_dev_fallback),
+        "mutation_safe_dev_localhost_fallback_enabled": safe_dev_fallback,
+        "mutation_auth_model": "dashboard_token_or_explicit_safe_dev_loopback_fallback",
+        "actor_required": True,
+        "sensitive_read_token_required": read_token_required,
+        "read_open_on_loopback": not read_token_required,
+        "read_token_required_on_loopback": read_token_required,
+        "read_token_required_on_lan": True,
+        "read_fail_closed_on_remote_bind": True,
+        "network_mode": resolve_network_mode(),
+        "strict_reasons": strict_reasons,
+        "remote_bind_reasons": remote_bind_reasons,
+    }
 
 
 def _with_operator_status(source: Dict[str, Any]) -> Dict[str, Any]:
@@ -177,11 +239,7 @@ def api_get_data_sources(parsed, _body=None, ctx=None):
         "provider_accounts": manager.list_provider_accounts(),
         "provider_account_templates": manager.list_provider_account_templates(),
         "runtime": runtime,
-        "auth": {
-            "token_required": bool(str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip())
-            or not safe_dev_localhost_fallback_enabled(),
-            "actor_required": True,
-        },
+        "auth": _data_sources_auth_posture(),
         "desired_ingestion_jobs": desired_jobs,
     }
 
@@ -246,12 +304,12 @@ def api_post_data_source_create(parsed, body=None, ctx=None):
         machine-readable ``error`` string.
     """
     if not isinstance(body, dict):
-        return {"ok": False, "error": "invalid_body"}
+        return _handled_refusal("invalid_body")
     manager = get_manager()
     try:
         source = manager.create_source(body)
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _handled_refusal(str(exc))
     lifecycle = manager.manage_lifecycle(reason=f"api_create:{source.get('source_key')}", jobs_manager=_jobs_from(ctx))
     return {"ok": True, "source": source, "lifecycle": lifecycle}
 
@@ -277,12 +335,12 @@ def api_post_data_source_update(parsed, body=None, ctx=None):
         machine-readable ``error`` string.
     """
     if not isinstance(body, dict):
-        return {"ok": False, "error": "invalid_body"}
+        return _handled_refusal("invalid_body")
     manager = get_manager()
     try:
         source = manager.update_source(body)
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _handled_refusal(str(exc))
     lifecycle = manager.manage_lifecycle(reason=f"api_update:{source.get('source_key')}", jobs_manager=_jobs_from(ctx))
     return {"ok": True, "source": source, "lifecycle": lifecycle}
 
@@ -311,7 +369,7 @@ def api_post_data_source_delete(parsed, body=None, ctx=None):
     manager = get_manager()
     source_key = _body_source_key(parsed, body)
     if not source_key:
-        return {"ok": False, "error": "missing_source_key"}
+        return _handled_refusal("missing_source_key")
     try:
         deleted = manager.delete_source(
             source_key,
@@ -319,7 +377,7 @@ def api_post_data_source_delete(parsed, body=None, ctx=None):
             client_ip=_body_client_ip(body),
         )
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _handled_refusal(str(exc))
     lifecycle = manager.manage_lifecycle(reason=f"api_delete:{source_key}", jobs_manager=_jobs_from(ctx))
     return {"ok": True, "deleted": deleted, "lifecycle": lifecycle}
 
@@ -347,7 +405,7 @@ def api_post_data_source_enable(parsed, body=None, ctx=None):
     manager = get_manager()
     source_key = _body_source_key(parsed, body)
     if not source_key:
-        return {"ok": False, "error": "missing_source_key"}
+        return _handled_refusal("missing_source_key")
     try:
         source = manager.set_enabled(
             source_key,
@@ -356,7 +414,7 @@ def api_post_data_source_enable(parsed, body=None, ctx=None):
             client_ip=_body_client_ip(body),
         )
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _handled_refusal(str(exc))
     lifecycle = manager.manage_lifecycle(reason=f"api_enable:{source_key}", jobs_manager=_jobs_from(ctx))
     return {"ok": True, "source": source, "lifecycle": lifecycle}
 
@@ -384,7 +442,7 @@ def api_post_data_source_disable(parsed, body=None, ctx=None):
     manager = get_manager()
     source_key = _body_source_key(parsed, body)
     if not source_key:
-        return {"ok": False, "error": "missing_source_key"}
+        return _handled_refusal("missing_source_key")
     try:
         source = manager.set_enabled(
             source_key,
@@ -393,7 +451,7 @@ def api_post_data_source_disable(parsed, body=None, ctx=None):
             client_ip=_body_client_ip(body),
         )
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _handled_refusal(str(exc))
     lifecycle = manager.manage_lifecycle(reason=f"api_disable:{source_key}", jobs_manager=_jobs_from(ctx))
     return {"ok": True, "source": source, "lifecycle": lifecycle}
 
@@ -446,7 +504,7 @@ def api_post_data_source_populate_now(parsed, body=None, _ctx=None):
             client_ip=_body_client_ip(body),
         )
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _handled_refusal(str(exc))
 
 
 def api_post_data_source_test_save(parsed, body=None, ctx=None):
@@ -483,12 +541,12 @@ def api_post_data_source_test_save(parsed, body=None, ctx=None):
 def api_post_data_source_account_update(parsed, body=None, ctx=None):
     """Update a shared provider-account credential set and reconcile runtime."""
     if not isinstance(body, dict):
-        return {"ok": False, "error": "invalid_body"}
+        return _handled_refusal("invalid_body")
     manager = get_manager()
     try:
         account = manager.update_provider_account(body)
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _handled_refusal(str(exc))
     lifecycle = manager.manage_lifecycle(
         reason=f"api_provider_account_update:{account.get('account_key')}",
         jobs_manager=_jobs_from(ctx),

@@ -1,5 +1,6 @@
 "use strict";
 
+import { apiFetch } from "./api_client.js";
 import { requestConfirmation } from "./confirmation_modal.mjs";
 
 /*
@@ -288,7 +289,7 @@ async function runBrokerRiskAction(policy) {
     target: `broker:${normalized}`,
   });
   if (!confirmation || !confirmation.ok) return;
-  await fetch("/api/operator/broker_risk", {
+  await apiFetch("/api/operator/broker_risk", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

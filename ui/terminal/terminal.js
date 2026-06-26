@@ -11,10 +11,19 @@ import {
   stopLiveMarketChart,
   applyTerminalOverlays
 } from "./pro_charting.js";
+import { apiFetch } from "../api_client.js";
 import { setProChartsState } from "../pro_chart_prefs.js";
 import {
+  applyOperationalContextToUrl,
+  clearSelectedSymbolContext,
+  clearOperationalContext,
+  getOperationalContext,
+  hasOperationalContext,
   initSelectedSymbolContextFromUrl,
-  updateSelectedSymbolContext
+  initOperationalContext,
+  operationalContextSummary,
+  updateSelectedSymbolContext,
+  updateOperationalContext,
 } from "../symbol_context.mjs";
 import {
   formatFxPrice,
@@ -51,7 +60,7 @@ async function _fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(new Error(`fetch_timeout:${url}`)), FETCH_TIMEOUT_MS);
   try {
-    return await fetch(url, {
+    return await apiFetch(url, {
       ...options,
       signal: controller.signal,
     });
@@ -163,6 +172,48 @@ function fmtBps(value) {
   return `${n.toFixed(Math.abs(n) >= 100 ? 0 : 1)} bps`;
 }
 
+function renderTerminalContext(context = getOperationalContext()) {
+  if (!el.contextBar) return;
+  const hasContext = hasOperationalContext(context);
+  el.contextBar.innerHTML = `
+    <span class="termContextPill ${hasContext ? "is-active" : ""}">${esc(operationalContextSummary(context))}</span>
+    <span class="termContextNote">${hasContext ? "carried from launch URL or saved browser context" : "no launch context pinned"}</span>
+  `;
+  if (el.clearContextBtn) el.clearContextBtn.disabled = !hasContext;
+}
+
+function updateDashboardReturnLink(context = getOperationalContext()) {
+  const dashLink = document.getElementById("dashboardReturnLink");
+  if (!dashLink) return;
+  const url = new URL("/ui/dashboard.html", window.location.origin);
+  if (LAUNCH_CONTEXT.screen) url.searchParams.set("screen", LAUNCH_CONTEXT.screen);
+  dashLink.href = applyOperationalContextToUrl(url.toString(), context);
+}
+
+function clearTerminalContext() {
+  const context = clearOperationalContext({
+    source: "terminal_clear",
+    surface: "terminal",
+    persistStorage: true,
+    persistUrl: true,
+  });
+  clearSelectedSymbolContext({
+    source: "terminal_clear",
+    persistUrl: false,
+  });
+  LAUNCH_CONTEXT = {
+    screen: "",
+    symbol: "",
+    decision_id: "",
+    alert_id: "",
+    source_key: "",
+    job_id: "",
+    advisory_id: "",
+  };
+  renderTerminalContext(context);
+  updateDashboardReturnLink(context);
+}
+
 function reasonText(row) {
   if (!row || typeof row !== "object") return "";
   return String(
@@ -236,6 +287,8 @@ function initEls() {
   el.fillsMeta = document.getElementById("fillsMeta");
   el.terminalTcaSummary = document.getElementById("terminalTcaSummary");
   el.statusBanner = document.getElementById("terminalStatusBanner");
+  el.contextBar = document.getElementById("terminalContextBar");
+  el.clearContextBtn = document.getElementById("terminalClearContextBtn");
   el.safetyStatus = document.getElementById("tradingSafetyStatus");
   el.terminalArmChk = document.getElementById("terminalArmChk");
   el.ordQty = document.getElementById("ordQty");
@@ -255,6 +308,16 @@ let STATE = {
   tableStatusFilters: { orders: "all", fills: "all" },
 };
 
+let LAUNCH_CONTEXT = {
+  screen: "",
+  symbol: "",
+  decision_id: "",
+  alert_id: "",
+  source_key: "",
+  job_id: "",
+  advisory_id: "",
+};
+
 const saved = lsGet();
 if (saved && typeof saved === "object") {
   STATE = {
@@ -269,6 +332,11 @@ if (saved && typeof saved === "object") {
 function applyLaunchParams() {
   try {
     const params = new URLSearchParams(window.location.search || "");
+    const operationalContext = initOperationalContext({
+      source: "terminal_url",
+      surface: "terminal",
+      persistStorage: true,
+    });
     const urlSymbolContext = initSelectedSymbolContextFromUrl({
       source: "terminal_url",
       persistUrl: false,
@@ -279,25 +347,41 @@ function applyLaunchParams() {
     const returnScreen = String(params.get("screen") || "").trim().toLowerCase();
     const decisionId = String(params.get("decision_id") || "").trim();
     const advisoryId = String(params.get("advisory_id") || "").trim();
+    const alertId = String(params.get("alert_id") || "").trim();
+    const sourceKey = String(params.get("source_key") || "").trim();
+    const jobId = String(params.get("job_id") || "").trim();
 
-    if (urlSymbolContext.symbol || symbol) STATE.symbol = urlSymbolContext.symbol || symbol;
+    LAUNCH_CONTEXT = {
+      screen: returnScreen,
+      symbol: urlSymbolContext.symbol || operationalContext.symbol || symbol,
+      decision_id: operationalContext.decision_id || decisionId,
+      alert_id: operationalContext.alert_id || alertId,
+      source_key: operationalContext.source_key || sourceKey,
+      job_id: operationalContext.job_id || jobId,
+      advisory_id: operationalContext.advisory_id || advisoryId,
+    };
+
+    if (LAUNCH_CONTEXT.symbol) STATE.symbol = LAUNCH_CONTEXT.symbol;
     if (tf) STATE.tf = tf;
     if (type) STATE.type = type;
     updateSelectedSymbolContext({
       symbol: STATE.symbol,
-      source: symbol ? "terminal_url" : "terminal_state",
+      source: LAUNCH_CONTEXT.symbol ? "terminal_url" : "terminal_state",
+      persistUrl: false,
+    });
+    const context = updateOperationalContext({
+      ...operationalContext,
+      ...LAUNCH_CONTEXT,
+      source: "terminal_url",
+      surface: "terminal",
+      symbol: STATE.symbol,
+    }, {
+      persistStorage: true,
       persistUrl: false,
     });
 
-    const dashLink = document.getElementById("dashboardReturnLink");
-    if (dashLink) {
-      const url = new URL("/ui/dashboard.html", window.location.origin);
-      if (symbol) url.searchParams.set("symbol", symbol);
-      if (returnScreen) url.searchParams.set("screen", returnScreen);
-      if (decisionId) url.searchParams.set("decision_id", decisionId);
-      if (advisoryId) url.searchParams.set("advisory_id", advisoryId);
-      dashLink.href = url.toString();
-    }
+    renderTerminalContext(context);
+    updateDashboardReturnLink(context);
   } catch {}
 }
 
@@ -329,6 +413,18 @@ function setSymbol(sym, source = "terminal_input") {
     source,
     persistUrl: true,
   });
+  const context = updateOperationalContext({
+    ...getOperationalContext(),
+    symbol: s,
+    source,
+    surface: "terminal",
+  }, {
+    persistStorage: true,
+    persistUrl: true,
+  });
+  LAUNCH_CONTEXT.symbol = s;
+  renderTerminalContext(context);
+  updateDashboardReturnLink(context);
   persist();
   void bootChart();
 }
@@ -1249,6 +1345,7 @@ function wire() {
   el.fillsFilter.addEventListener("input", () => setTerminalTableQuery("fills", el.fillsFilter.value));
   if (el.ordStatusFilter) el.ordStatusFilter.addEventListener("change", () => setTerminalStatusFilter("orders", el.ordStatusFilter.value));
   if (el.fillsStatusFilter) el.fillsStatusFilter.addEventListener("change", () => setTerminalStatusFilter("fills", el.fillsStatusFilter.value));
+  if (el.clearContextBtn) el.clearContextBtn.addEventListener("click", clearTerminalContext);
 
   document.addEventListener("click", (event) => {
     const target = event && event.target;

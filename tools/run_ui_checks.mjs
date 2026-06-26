@@ -15,6 +15,7 @@ const NODE_TESTS = [
   "tests/test_command_palette_helpers.mjs",
   "tests/test_job_catalog_ui.mjs",
   "tests/test_symbol_context.mjs",
+  "tests/test_operational_context.mjs",
   "tests/test_mobile_ops_helpers.mjs",
   "tests/test_replay_ui_helpers.mjs",
   "tests/test_terminal_decision_overlays.mjs",

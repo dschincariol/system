@@ -17,7 +17,6 @@ from collections.abc import Iterator
 from typing import Any
 
 import psycopg
-from psycopg.pq import TransactionStatus
 from psycopg_pool import ConnectionPool, PoolTimeout
 
 from engine.runtime.ingestion_tuning import (
@@ -26,6 +25,7 @@ from engine.runtime.ingestion_tuning import (
     pg_pool_default_for_role,
     tuned_int,
 )
+from engine.runtime.pg_connection_hygiene import rollback_if_in_transaction
 from engine.runtime.platform import default_pg_dsn, dsn_with_pg_password
 
 
@@ -399,11 +399,18 @@ def quote_ident(value: str) -> str:
 
 
 def _rollback_if_in_transaction(conn: psycopg.Connection[Any]) -> None:
-    try:
-        if conn.info.transaction_status != TransactionStatus.IDLE:
-            conn.rollback()
-    except Exception:
-        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+    rollback_if_in_transaction(
+        conn,
+        logger=logging.getLogger(__name__),
+        context="storage_pool",
+    )
+
+
+def _check_connection(conn: psycopg.Connection[Any]) -> None:
+    _rollback_if_in_transaction(conn)
+    check_connection = getattr(ConnectionPool, "check_connection", None)
+    if callable(check_connection):
+        check_connection(conn)
 
 
 def _configured_search_path_schema(conn: psycopg.Connection[Any]) -> str:
@@ -433,9 +440,9 @@ def note_connection_session_state_sql(conn: Any, sql: str) -> None:
 
 
 def _configure_connection(conn: psycopg.Connection[Any]) -> None:
+    _rollback_if_in_transaction(conn)
     if _POOL_TRANSACTION_MODE:
         return
-    _rollback_if_in_transaction(conn)
     target_schema = schema_name()
     if _configured_search_path_schema(conn) == target_schema:
         return
@@ -478,6 +485,8 @@ def get_pool(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = 
             "prepare_threshold": int(os.environ.get("TS_PG_PREPARE_THRESHOLD", "5") or 5),
         },
         configure=_configure_connection,
+        check=_check_connection,
+        reset=_rollback_if_in_transaction,
         open=False,
     )
     try:
@@ -543,7 +552,7 @@ def acquire(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = F
         )
         if conn is not None:
             try:
-                get_pool().putconn(conn)
+                release(conn)
             except Exception:
                 logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
         raise
@@ -609,6 +618,15 @@ def release(conn) -> None:
     except ValueError:
         try:
             conn.close()
+        except Exception:
+            logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+        try:
+            pool.putconn(conn)
         except Exception:
             logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
 

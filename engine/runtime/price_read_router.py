@@ -10,6 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.pg_connection_hygiene import (
+    rollback_if_in_transaction,
+    transaction_status_name,
+)
 from engine.runtime.price_migration_validation import get_price_migration_validation_snapshot
 from engine.runtime.price_timescale_schema import (
     price_timescale_time_after_ms_predicate,
@@ -164,6 +168,25 @@ def _warn_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
     )
 
 
+def _check_timescale_price_read_connection(con: Any) -> None:
+    rollback_if_in_transaction(
+        con,
+        logger=LOG,
+        context="price_read_pool_check",
+    )
+    check_connection = getattr(ConnectionPool, "check_connection", None)
+    if callable(check_connection):
+        check_connection(con)
+
+
+def _reset_timescale_price_read_connection(con: Any) -> None:
+    rollback_if_in_transaction(
+        con,
+        logger=LOG,
+        context="price_read_pool_reset",
+    )
+
+
 def _sqlite_table_exists(con: Any, name: str) -> bool:
     row = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
@@ -224,6 +247,14 @@ def _sqlite_volume_expr(columns: Dict[str, str]) -> str:
     return f"CAST({_quote_ident(volume_col)} AS REAL)" if volume_col else "NULL"
 
 
+def _is_postgres_storage_connection(con: Any) -> bool:
+    module_name = str(getattr(type(con), "__module__", "") or "")
+    if module_name.endswith("storage_pg"):
+        return True
+    raw = getattr(con, "raw", None)
+    return bool(raw is not None and hasattr(raw, "pgconn"))
+
+
 def _timescale_table_columns(cur: Any, schema_name: str, table_name: str) -> Dict[str, str]:
     cache_key = (_CONFIG_KEY, str(schema_name), str(table_name))
     cached = _TIMESCALE_TABLE_COLUMNS_CACHE.get(cache_key)
@@ -264,6 +295,24 @@ def _timescale_order_expr(timestamp_column: str) -> str:
     if str(timestamp_column).strip().lower() == "time":
         return price_timescale_time_ref()
     return _quote_ident(timestamp_column)
+
+
+def _compat_ts_ms_expr(timestamp_column: str, *, postgres: bool) -> str:
+    if not postgres:
+        return _sqlite_ts_ms_expr(timestamp_column)
+    return _timescale_ts_ms_expr_for_column(timestamp_column)
+
+
+def _compat_since_predicate(timestamp_column: str, *, postgres: bool, placeholder: str = "?") -> str:
+    if not postgres:
+        return f"{_sqlite_ts_ms_expr(timestamp_column)} > {str(placeholder)}"
+    return _timescale_since_predicate(timestamp_column, placeholder=placeholder)
+
+
+def _compat_order_expr(timestamp_column: str, *, postgres: bool) -> str:
+    if not postgres:
+        return _sqlite_ts_ms_expr(timestamp_column)
+    return _timescale_order_expr(timestamp_column)
 
 
 def _timescale_last_expr(columns: Dict[str, str]) -> str:
@@ -383,6 +432,8 @@ def _get_timescale_price_read_pool(config: PostgresPriceStorageConfig) -> Any:
                 "connect_timeout": int(max(1, round(float(config.connect_timeout_s)))),
                 "application_name": _pool_application_name(config),
             },
+            check=_check_timescale_price_read_connection,
+            reset=_reset_timescale_price_read_connection,
             open=False,
         )
         try:
@@ -419,16 +470,35 @@ def _timescale_connection():
     con = pool.getconn(timeout=float(config.connect_timeout_s))
     discard = False
     try:
+        rollback_if_in_transaction(
+            con,
+            logger=LOG,
+            context="price_read_acquire",
+        )
         _prepare_timescale_connection(con, config)
         yield con, str(config.schema_name or "public")
-    except Exception:
+    except Exception as exc:
         discard = True
+        _warn_nonfatal(
+            "PRICE_READ_ROUTER_TIMESCALE_CONNECTION_FAILED",
+            exc,
+            transaction_status=transaction_status_name(con),
+        )
         try:
             con.rollback()
         except Exception as exc:
             _warn_nonfatal("PRICE_READ_ROUTER_ROLLBACK_FAILED", exc)
         raise
     finally:
+        if not discard:
+            try:
+                rollback_if_in_transaction(
+                    con,
+                    logger=LOG,
+                    context="price_read_release",
+                )
+            except Exception:
+                discard = True
         if discard:
             try:
                 con.close()
@@ -648,6 +718,7 @@ def _fetch_timescale_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) ->
 def _fetch_sqlite_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> List[Tuple[int, Optional[float], Optional[float]]]:
     con = connect_ro()
     try:
+        postgres = _is_postgres_storage_connection(con)
         rows = []
         for table_name in ("price_quotes", "price_quotes_raw", "price_ticks", "prices"):
             if not _sqlite_table_exists(con, table_name):
@@ -658,7 +729,9 @@ def _fetch_sqlite_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> Li
             symbol_col = _pick_column(columns, "symbol")
             if not (timestamp_col and last_expr and symbol_col):
                 continue
-            ts_ms_expr = _sqlite_ts_ms_expr(timestamp_col)
+            ts_ms_expr = _compat_ts_ms_expr(timestamp_col, postgres=postgres)
+            since_predicate = _compat_since_predicate(timestamp_col, postgres=postgres, placeholder="?")
+            order_expr = _compat_order_expr(timestamp_col, postgres=postgres)
             volume_expr = _sqlite_volume_expr(columns)
             rows = con.execute(
                 f"""
@@ -667,8 +740,8 @@ def _fetch_sqlite_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> Li
                   SELECT {ts_ms_expr} AS ts_ms, {last_expr} AS last, {volume_expr} AS volume
                   FROM {_quote_ident(table_name)}
                   WHERE {_quote_ident(symbol_col)}=?
-                    AND {ts_ms_expr} > ?
-                  ORDER BY {ts_ms_expr} DESC
+                    AND {since_predicate}
+                  ORDER BY {order_expr} DESC
                   LIMIT ?
                 ) newest_rows
                 ORDER BY ts_ms ASC

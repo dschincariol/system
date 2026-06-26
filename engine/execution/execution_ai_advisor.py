@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.storage import connect, connect_ro, init_db, run_write_txn
+from engine.runtime.storage import _table_exists, connect, connect_ro, init_db, run_write_txn
 
 LOG = get_logger("engine.execution.execution_ai_advisor")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -37,6 +37,10 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
         _WARNED_NONFATAL_KEYS.add(once_key)
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    if isinstance(value, str) and not value.strip():
+        return float(default)
     try:
         out = float(value)
         if out != out:
@@ -48,6 +52,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return int(default)
+    if isinstance(value, str) and not value.strip():
+        return int(default)
     try:
         return int(value)
     except Exception as e:
@@ -72,6 +80,17 @@ def _json_loads(text: Any, default: Any) -> Any:
         return default
 
 
+def _is_missing_optional_table_error(error: BaseException, table_name: str) -> bool:
+    text = str(error or "").strip().lower()
+    table = str(table_name or "").strip().lower()
+    return bool(table) and (
+        f"no such table: {table}" in text
+        or f'relation "{table}" does not exist' in text
+        or f"relation {table} does not exist" in text
+        or "undefinedtable" in type(error).__name__.lower()
+    )
+
+
 def _historical_execution_snapshot(symbol: str, broker: str, lookback_n: int = 120) -> Dict[str, Any]:
     sym = str(symbol or "").strip().upper()
     br = str(broker or "").strip().lower()
@@ -86,7 +105,21 @@ def _historical_execution_snapshot(symbol: str, broker: str, lookback_n: int = 1
 
     con = connect_ro()
     try:
-        if br and br != "unknown":
+        analytics_available = False
+        try:
+            analytics_available = bool(_table_exists(con, "execution_analytics"))
+        except Exception as e:
+            if not _is_missing_optional_table_error(e, "execution_analytics"):
+                _warn_nonfatal(
+                    "EXECUTION_AI_ADVISOR_ANALYTICS_AVAILABILITY_FAILED",
+                    e,
+                    once_key="historical_execution_analytics_availability",
+                    symbol=str(sym),
+                    broker=str(br),
+                )
+            analytics_available = False
+
+        if analytics_available and br and br != "unknown":
             try:
                 row = con.execute(
                     """
@@ -123,13 +156,14 @@ def _historical_execution_snapshot(symbol: str, broker: str, lookback_n: int = 1
                         "source": "execution_analytics",
                     }
             except Exception as e:
-                _warn_nonfatal(
-                    "EXECUTION_AI_ADVISOR_ANALYTICS_QUERY_FAILED",
-                    e,
-                    once_key="historical_execution_analytics_query",
-                    symbol=str(sym),
-                    broker=str(br),
-                )
+                if not _is_missing_optional_table_error(e, "execution_analytics"):
+                    _warn_nonfatal(
+                        "EXECUTION_AI_ADVISOR_ANALYTICS_QUERY_FAILED",
+                        e,
+                        once_key="historical_execution_analytics_query",
+                        symbol=str(sym),
+                        broker=str(br),
+                    )
 
         try:
             rows = con.execute(

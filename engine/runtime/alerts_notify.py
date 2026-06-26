@@ -1022,7 +1022,13 @@ def send_notification_test(
             requested_ts_ms=ts_ms,
             detail={"reason": "unsupported_channel"},
         )
-        return {"ok": False, "channel": channel_name, "error": error, "status": snapshot}
+        return {
+            "ok": False,
+            "channel": channel_name,
+            "error": error,
+            "status": snapshot,
+            "meta": {"status": 400},
+        }
 
     if not bool(snapshot.get("supports_test")):
         validation_errors = list(snapshot.get("validation_errors") or [])
@@ -1038,7 +1044,13 @@ def send_notification_test(
             detail={"reason": "test_not_supported", "validation_errors": validation_errors},
         )
         latest = _load_latest_notification_tests().get(channel_name)
-        return {"ok": False, "channel": channel_name, "error": error, "status": _channel_status(channel_name, latest)}
+        return {
+            "ok": False,
+            "channel": channel_name,
+            "error": error,
+            "status": _channel_status(channel_name, latest),
+            "meta": {"status": 422},
+        }
 
     cfg = _notification_config()
     try:

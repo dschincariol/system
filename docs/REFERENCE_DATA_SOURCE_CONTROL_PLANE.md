@@ -333,8 +333,14 @@ Each public source row also includes:
   Shared provider-account status and masked credential state.
 - `provider_account_templates`
   Backend-owned account schemas and used-by references.
-- `auth.token_required`
-  Whether clients must send `X-API-Token`
+- `auth.mutation_token_required`
+  Whether mutating `/api/data_sources/*` requests must send `X-API-Token`. This is the mutation posture only; it does not imply loopback GET reads require the token.
+- `auth.sensitive_read_token_required`
+  Whether sensitive GET reads are currently token-gated by strict production/live mode or by a non-loopback dashboard bind.
+- `auth.read_open_on_loopback`
+  Whether loopback GET reads are intentionally open in the current local/safe posture.
+- `auth.read_token_required_on_lan`
+  Always `true`; LAN/remote-bind deployments fail closed for sensitive reads.
 - `auth.actor_required`
   Whether a human-attribution actor should be supplied on mutations
 
@@ -402,9 +408,9 @@ Connection tests resolve credentials through the same effective path used by ing
 4. Existing external `<ENV>_FILE`, `<ENV>_SECRET`, secret-provider, and compatible plain env values are read by `engine.data._credentials.get_data_credential()`. A configured file path that is missing, empty, unreadable, or not a regular file returns no credential and is surfaced as missing credential metadata.
 5. The credential cache is cleared before and after the test so rotations are visible immediately.
 
-Missing-credential test responses include `evidence.missing_env_vars` with exact env var names and `evidence.missing_credentials[]` with the catalog docs, signup URL, plan note, source field, and provider-account options operators can use to obtain or store the credential.
+Missing-credential test responses include `evidence.missing_env_vars`, `evidence.missing_credential_env_vars`, and top-level `missing_credential_env_vars` with exact env var names, plus `evidence.missing_credentials[]` with the catalog docs, signup URL, plan note, source field, and provider-account options operators can use to obtain or store the credential.
 
-Connection-test responses classify outcomes as `success`, `missing_credentials`, `wrong_credentials`, `provider_unreachable`, `rate_limited`, `entitlement_missing`, `empty_payload`, `malformed_payload`, `policy_blocked`, `degraded_fallback`, `partial_success`, or `unsupported`. HTTP 429 and 503 responses immediately return degraded results with `evidence.stop_testing=true`, sanitized endpoint evidence, retry-after guidance when available, and no further fallback probes for composite providers.
+Connection-test responses classify outcomes as `success`, `simulated_not_live`, `missing_credentials`, `wrong_credentials`, `provider_unreachable`, `rate_limited`, `entitlement_missing`, `empty_payload`, `malformed_payload`, `policy_blocked`, `degraded_fallback`, `partial_success`, or `unsupported`. Market-data and options-source tests also include `live_market_data_ok`, `live_feed_status`, and `live_feed_reason`. A simulated provider payload is a degraded `simulated_not_live` result even when it can generate rows. HTTP 429 and 503 responses immediately return degraded results with `evidence.stop_testing=true`, sanitized endpoint evidence, retry-after guidance when available, and no further fallback probes for composite providers.
 
 Implemented checks include:
 
@@ -429,10 +435,10 @@ Implemented checks include:
 - weather forecast and NWS alert endpoints; NWS active alerts validate `FeatureCollection` schema and honor 429/503 cooldown
 - IBKR read-only authenticated historical-data request through TWS/Gateway, including market-data type selection
 - Alpaca read-only account and positions GET probes; the data-source test and Populate Now path never call order, cancel, replace, or flatten paths
-- Simulated local prices, which require no external credentials, perform no broker or provider network calls, and return deterministic payload evidence marked `simulated=true`
+- Simulated local prices, which require no external credentials, perform no broker or provider network calls, and return deterministic payload evidence marked `simulated=true`, `live_market_data_ok=false`, and `live_feed_status=simulated`
 - custom RSS/Atom feed payload validation plus per-feed runtime status so one failed publisher does not hide successful RSS sources
 
-Optional public-service live smoke is available through `python tools/public_feed_live_smoke.py`. It exits without network access unless `PUBLIC_FEED_LIVE_SMOKE=1` is set explicitly; normal CI and `validate_repo.py` use mocked tests and do not contact public services by default.
+Optional public-service live smoke is available through `python tools/public_feed_live_smoke.py`. It exits without network access unless `PUBLIC_FEED_LIVE_SMOKE=1` is set explicitly; normal CI and `validate_repo.py` use mocked tests and do not contact public services by default. Use that opt-in smoke when a public/keyless provider needs external-service evidence; do not treat simulated fallback rows as that evidence.
 
 If a source type does not have a meaningful active connectivity probe, the registry returns an explicit unsupported result that is not counted as a passing connection test.
 
@@ -450,9 +456,9 @@ Safe and simulated runtime modes have a deterministic local market-data path thr
 
 `SIMULATED_MARKET_DATA_ENABLED=1` enables the provider explicitly. When the stack is in safe/sim/paper execution with a simulated broker, runtime bootstrap and ingestion child selection also allow the simulated feed so acceptance tests can produce fresh rows without real broker, exchange, or paid-provider credentials. `SIMULATED_MARKET_DATA_SYMBOLS` controls the symbols; otherwise the simulator uses a small deterministic equity universe.
 
-Missing credentials for real providers remain explicit `missing_credentials` failures. Transient provider errors and rate limits are classified separately in `poll_prices` job status, and the simulated provider may be appended as a fallback only when safe/sim mode permits it. No production provider success is inferred from simulated rows.
+Missing credentials for real providers remain explicit `missing_credentials` failures. Transient provider errors and rate limits are classified separately in `poll_prices` job status, and the simulated provider may be appended as a fallback only when safe/sim mode permits it. No production provider success is inferred from simulated rows. `pipeline_health_summary()`, `/api/ingestion/status`, `/api/operator/provider_telemetry`, and `/api/feeds` expose raw/simulated evidence separately from live provider success.
 
-Freshness is observable in the database and API. `GET /api/feeds` includes `price_freshness.status`, `stale`, `age_s`, `max_age_s`, `source`, and `simulated` based on the latest `prices` row. Runtime health exposes the same stale/fresh distinction through the `prices` check, so dashboards can render fresh simulated data differently from stale or missing production data.
+Freshness is observable in the database and API. `GET /api/feeds` includes `price_freshness.status`, `stale`, `age_s`, `max_age_s`, `source`, `simulated`, `live_market_data_ok`, `live_feed_status`, and `missing_credential_env_vars` based on the latest `prices` row and manager-computed credential state. Runtime health exposes the same stale/fresh distinction through the `prices` check, so dashboards can render fresh simulated data differently from live, stale, or missing production data.
 
 ## Populate Now Contract
 

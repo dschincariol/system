@@ -201,8 +201,31 @@ def test_expected_schema_version_tracks_latest_migration_module():
 
     assert ids
     assert ids[-1] == expected_schema_version()
-    assert 72 in ids
-    assert expected_schema_version() >= 72
+    assert 78 in ids
+    assert expected_schema_version() >= 78
+
+
+def test_alert_lifecycle_orphan_cleanup_migration_contract():
+    import importlib
+
+    migration = importlib.import_module("engine.runtime.schema.migrations.0078_alert_lifecycle_orphan_cleanup")
+    statements = []
+
+    class FakeConnection:
+        def execute(self, sql, params=None):
+            assert params is None
+            statements.append(str(sql))
+
+    migration.up(FakeConnection())
+
+    sql = "\n".join(statements)
+    assert migration.id == 78
+    assert migration.description
+    assert callable(migration.up)
+    for table in ("alert_lifecycle_events", "alert_acks", "alert_resolutions", "alert_shelves"):
+        assert f"DELETE FROM {table}" in sql
+    assert "NOT EXISTS" in sql
+    assert "FROM alerts a WHERE a.id" in sql
 
 
 def test_model_scoring_indexes_migration_covers_unresolved_query_contract():

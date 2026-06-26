@@ -12,32 +12,26 @@
   <meta charset="utf-8"/>
   <title>Trading Engine Operator</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet" href="/ui/base.css"/>
   <style>
     /* This page is a thin local operator console. Authoritative runtime state
        still comes from the operator/dashboard APIs, not from UI-only client state. */
     :root{
-      --bg:#eef1f6;
-      --card:#ffffff;
-      --text:#0f172a;
-      --muted:#64748b;
-      --primary:#2563eb;
-      --primary2:#1d4ed8;
-      --danger:#dc2626;
-      --warn:#f59e0b;
-      --ok:#16a34a;
-      --line:rgba(2,6,23,.10);
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-      --shadow: 0 10px 24px rgba(2,6,23,.10);
-      --radius: 14px;
+      --mono: var(--font-mono);
+      --sans: var(--font-sans);
     }
+
+    *{ box-sizing:border-box; }
 
     body{
       margin:0;
       padding:24px;
       font-family: var(--sans);
-      background: var(--bg);
+      background:linear-gradient(180deg, var(--surface-chip) 0%, var(--bg) 44%, var(--surface-page-deep) 100%);
       color: var(--text);
+      letter-spacing:0;
+      min-height:100vh;
+      font-variant-numeric:tabular-nums lining-nums;
     }
 
     .topbar{
@@ -46,12 +40,17 @@
       justify-content:space-between;
       gap:16px;
       flex-wrap:wrap;
+      padding:16px 18px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:var(--radius);
+      background:linear-gradient(180deg, rgba(32,35,41,.98), rgba(18,21,27,.98));
+      box-shadow:var(--shadow-soft);
     }
 
     h1{
       margin:0;
       font-size:22px;
-      letter-spacing:.2px;
+      letter-spacing:0;
     }
 
     .sub{
@@ -85,6 +84,7 @@
       box-shadow:var(--shadow);
       padding:18px;
       min-width:0;
+      border:1px solid rgba(255,255,255,.10);
     }
 
     .row{
@@ -107,6 +107,7 @@
     .sectionTitle{
       font-weight:900;
       font-size:15px;
+      letter-spacing:0;
     }
 
     .sectionSub{
@@ -116,47 +117,93 @@
     }
 
     button{
-      border:0;
-      border-radius:10px;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:8px;
       padding:10px 14px;
       font-weight:700;
       cursor:pointer;
-      background:var(--primary);
-      color:white;
-    }
-
-    button:hover{ background:var(--primary2); }
-    button:disabled,
-    input:disabled,
-    textarea:disabled{
-      opacity:.55;
-      cursor:not-allowed;
-    }
-
-    button.secondary{ background:#64748b; }
-    button.secondary:hover{ background:#475569; }
-
-    button.danger{ background:var(--danger); }
-    button.danger:hover{ filter:brightness(.95); }
-
-    button.ghost{
-      background:transparent;
-      color:var(--primary);
-      border:1px solid rgba(37,99,235,.25);
-    }
-    button.ghost:hover{ background:rgba(37,99,235,.08); }
-
-    button.mode{
-      background:#f1f5f9;
-      color:#0f172a;
-      border:1px solid rgba(2,6,23,.10);
+      background:linear-gradient(180deg, rgba(86,180,233,.20), rgba(86,180,233,.10));
+      color:var(--text);
+      box-shadow:var(--shadow-soft);
+      font:inherit;
       font-weight:800;
     }
+
+    button:hover{
+      border-color:rgba(86,180,233,.48);
+      background:linear-gradient(180deg, rgba(86,180,233,.26), rgba(86,180,233,.14));
+    }
+
+    button:focus-visible,
+    a:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    select:focus-visible,
+    summary:focus-visible{
+      outline:0;
+      box-shadow:var(--focus);
+      border-color:rgba(86,180,233,.64);
+    }
+
+    button:disabled,
+    input:disabled,
+    textarea:disabled,
+    select:disabled{
+      opacity:.55;
+      cursor:not-allowed;
+      box-shadow:none;
+    }
+
+    button.secondary{
+      background:linear-gradient(180deg, rgba(167,176,188,.16), rgba(167,176,188,.08));
+      color:var(--text);
+    }
+    button.secondary:hover{
+      border-color:rgba(167,176,188,.38);
+      background:linear-gradient(180deg, rgba(167,176,188,.22), rgba(167,176,188,.12));
+    }
+
+    button.danger{
+      color:var(--status-crit);
+      background:linear-gradient(180deg, rgba(213,94,0,.34), rgba(127,29,29,.36));
+      border-color:var(--danger);
+      border-style:double;
+      font-weight:900;
+    }
+    button.danger:hover{
+      filter:brightness(1.08);
+      border-color:var(--status-crit);
+    }
+
+    button.ghost,
+    a.ghost{
+      background:transparent;
+      color:var(--primary);
+      border:1px solid rgba(86,180,233,.28);
+      box-shadow:none;
+      text-decoration:none;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      border-radius:8px;
+      padding:10px 14px;
+      font-weight:800;
+    }
+    button.ghost:hover,
+    a.ghost:hover{ background:rgba(86,180,233,.08); }
+
+    button.mode{
+      background:rgba(255,255,255,.035);
+      color:var(--muted);
+      border:1px solid rgba(255,255,255,.10);
+      font-weight:800;
+      box-shadow:none;
+    }
     button.mode.active{
-      border-color: rgba(37,99,235,.55);
-      box-shadow: 0 0 0 3px rgba(37,99,235,.14);
-      background: rgba(37,99,235,.08);
-      color:#0f172a;
+      border-color: rgba(86,180,233,.58);
+      box-shadow: inset 0 0 0 1px rgba(86,180,233,.18);
+      background: rgba(86,180,233,.12);
+      color:var(--text);
     }
 
     .pill{
@@ -165,22 +212,34 @@
       gap:8px;
       padding:7px 10px;
       border-radius:999px;
-      background:#f1f5f9;
+      background:rgba(255,255,255,.045);
+      border:1px solid rgba(255,255,255,.10);
       color:var(--muted);
       font-size:12px;
       font-weight:800;
+      font-variant-numeric:tabular-nums lining-nums;
     }
 
     .dot{
       width:10px;
       height:10px;
       border-radius:999px;
-      background:#94a3b8;
+      background:var(--status-neutral);
       flex:0 0 auto;
+      box-shadow:0 0 0 3px rgba(167,176,188,.10);
     }
-    .dot.ok{ background:var(--ok); }
-    .dot.warn{ background:var(--warn); }
-    .dot.fail{ background:var(--danger); }
+    .dot.ok{
+      background:var(--ok);
+      box-shadow:0 0 0 3px var(--status-ok-bg);
+    }
+    .dot.warn{
+      background:var(--warn);
+      box-shadow:0 0 0 3px var(--status-warn-bg);
+    }
+    .dot.fail{
+      background:var(--danger);
+      box-shadow:0 0 0 3px var(--status-crit-bg);
+    }
 
     .hr{
       height:1px;
@@ -197,37 +256,47 @@
       color:var(--primary);
       font-weight:900;
       text-decoration:none;
+      overflow-wrap:anywhere;
     }
     a.link:hover{ text-decoration:underline; }
 
     textarea{
       width:100%;
       height:220px;
-      border-radius:12px;
-      border:1px solid rgba(2,6,23,.12);
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.12);
       padding:12px;
       font-family:var(--mono);
       font-size:12px;
       box-sizing:border-box;
-      background:#fbfdff;
+      background:var(--surface-panel);
+      color:var(--text);
       resize:vertical;
     }
 
-    input{
+    input,
+    select{
       width:100%;
-      border-radius:12px;
-      border:1px solid rgba(2,6,23,.12);
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.12);
       padding:10px 12px;
       box-sizing:border-box;
       font-size:13px;
-      background:#fbfdff;
+      background:var(--surface-panel);
+      color:var(--text);
+    }
+
+    select{
+      width:auto;
+      min-height:38px;
     }
 
     pre{
-      background:#0b1220;
-      color:#e5e7eb;
+      background:var(--surface-panel);
+      color:var(--text-on-dark);
       padding:12px;
-      border-radius:12px;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.10);
       overflow-y:auto;
       overflow-x:hidden;
       font-family:var(--mono);
@@ -243,11 +312,11 @@
     .issues{ margin-top:10px; }
 
     .issue{
-      border-radius:12px;
+      border-radius:8px;
       padding:10px 12px;
       margin-top:8px;
-      border:1px solid rgba(2,6,23,.12);
-      background:#ffffff;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.035);
       display:flex;
       gap:10px;
       align-items:flex-start;
@@ -258,22 +327,34 @@
       font-weight:900;
       padding:4px 8px;
       border-radius:999px;
-      color:white;
       line-height:1;
       margin-top:1px;
       min-width:48px;
       text-align:center;
+      border:1px solid currentColor;
     }
-    .badge.err{ background:var(--danger); }
-    .badge.warn{ background:var(--warn); }
-    .badge.info{ background:#64748b; }
+    .badge.err{
+      background:var(--status-crit-bg);
+      color:var(--danger);
+      border-style:double;
+    }
+    .badge.warn{
+      background:var(--status-warn-bg);
+      color:var(--warn);
+      border-style:dashed;
+    }
+    .badge.info{
+      background:var(--status-info-bg);
+      color:var(--primary);
+    }
 
     .issueText{ font-size:13px; }
 
     .bar{
       width:100%;
       height:10px;
-      background:#e2e8f0;
+      background:var(--surface-panel);
+      border:1px solid rgba(255,255,255,.10);
       border-radius:999px;
       overflow:hidden;
     }
@@ -290,9 +371,9 @@
       gap:10px;
       align-items:flex-start;
       padding:10px 12px;
-      border-radius:12px;
-      border:1px solid rgba(2,6,23,.12);
-      background:#ffffff;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.035);
       margin-top:8px;
     }
 
@@ -305,6 +386,227 @@
       white-space:pre-wrap;
     }
 
+    .operatorStatePanel{
+      min-height:340px;
+      max-height:340px;
+      overflow:auto;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(11,15,20,.72);
+      padding:12px;
+      box-sizing:border-box;
+      white-space:pre-wrap;
+      word-break:break-word;
+    }
+
+    .operatorStatePanel.logPanel{
+      font-family:var(--mono);
+      font-size:12px;
+      line-height:1.35;
+      background:var(--surface-panel);
+      color:var(--text-on-dark);
+    }
+
+    .opState{
+      display:flex;
+      gap:10px;
+      align-items:flex-start;
+      min-height:120px;
+      padding:12px;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.035);
+      white-space:normal;
+      border-left:4px solid var(--status-neutral);
+    }
+
+    .uiState{
+      display:flex;
+      gap:10px;
+      align-items:flex-start;
+      min-height:120px;
+      padding:12px;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.035);
+      white-space:normal;
+      border-left:4px solid var(--status-neutral);
+    }
+
+    .opState.loading{
+      border-left-color:var(--warn);
+    }
+
+    .uiState--loading{
+      border-left-color:var(--warn);
+    }
+
+    .opState.degraded{
+      border-left-color:var(--warn);
+      background:var(--status-warn-bg);
+    }
+
+    .uiState--degraded{
+      border-left-color:var(--warn);
+      background:var(--status-warn-bg);
+    }
+
+    .opState.error{
+      border-left-color:var(--danger);
+      background:var(--status-crit-bg);
+    }
+
+    .uiState--error{
+      border-left-color:var(--danger);
+      background:var(--status-crit-bg);
+    }
+
+    .opState.ok{
+      border-left-color:var(--ok);
+      background:var(--status-ok-bg);
+    }
+
+    .uiState--ok{
+      border-left-color:var(--ok);
+      background:var(--status-ok-bg);
+    }
+
+    .opState.compact{
+      min-height:0;
+      padding:10px 12px;
+    }
+
+    .uiState--compact{
+      min-height:0;
+      padding:10px 12px;
+    }
+
+    .opStateIcon{
+      flex:0 0 28px;
+      width:28px;
+      height:28px;
+      border-radius:999px;
+      display:grid;
+      place-items:center;
+      font-family:var(--mono);
+      font-weight:900;
+      font-size:10px;
+      border:1px solid rgba(167,176,188,.28);
+      background:var(--status-neutral-bg);
+      color:var(--status-neutral);
+    }
+
+    .uiStateIcon{
+      flex:0 0 28px;
+      width:28px;
+      height:28px;
+      border-radius:999px;
+      display:grid;
+      place-items:center;
+      font-family:var(--mono);
+      font-weight:900;
+      font-size:10px;
+      border:1px solid rgba(167,176,188,.28);
+      background:var(--status-neutral-bg);
+      color:var(--status-neutral);
+    }
+
+    .opState.degraded .opStateIcon,
+    .opState.loading .opStateIcon{
+      border-color:var(--warn);
+      background:var(--status-warn-bg);
+      color:var(--warn);
+    }
+
+    .uiState--degraded .uiStateIcon,
+    .uiState--loading .uiStateIcon{
+      border-color:var(--warn);
+      background:var(--status-warn-bg);
+      color:var(--warn);
+    }
+
+    .opState.error .opStateIcon{
+      border-color:var(--danger);
+      background:var(--status-crit-bg);
+      color:var(--danger);
+    }
+
+    .uiState--error .uiStateIcon{
+      border-color:var(--danger);
+      background:var(--status-crit-bg);
+      color:var(--danger);
+    }
+
+    .opState.ok .opStateIcon{
+      border-color:var(--ok);
+      background:var(--status-ok-bg);
+      color:var(--ok);
+    }
+
+    .uiState--ok .uiStateIcon{
+      border-color:var(--ok);
+      background:var(--status-ok-bg);
+      color:var(--ok);
+    }
+
+    .opStateBody{
+      min-width:0;
+      flex:1 1 auto;
+    }
+
+    .uiStateBody{
+      min-width:0;
+      flex:1 1 auto;
+    }
+
+    .opStateTitle{
+      font-size:13px;
+      font-weight:900;
+      color:var(--text);
+    }
+
+    .uiStateTitle{
+      font-size:13px;
+      font-weight:900;
+      color:var(--text);
+    }
+
+    .opStateMsg,
+    .opStateMeta,
+    .uiStateMessage,
+    .uiStateMeta{
+      margin-top:4px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.45;
+      overflow-wrap:anywhere;
+    }
+
+    .opTech,
+    .uiStateDetails{
+      margin-top:8px;
+    }
+
+    .opTech summary,
+    .uiStateDetails summary{
+      cursor:pointer;
+      color:var(--muted);
+      user-select:none;
+      font-size:12px;
+      font-weight:800;
+      border-radius:6px;
+      display:inline-flex;
+      padding:4px 0;
+    }
+
+    .opTech pre,
+    .uiStateRaw{
+      height:auto;
+      max-height:260px;
+      margin-top:8px;
+      background:var(--surface-panel);
+    }
+
     .metricsGrid{
       display:grid;
       grid-template-columns:repeat(2, minmax(0, 1fr));
@@ -313,10 +615,10 @@
     }
 
     .metricCard{
-      border:1px solid rgba(2,6,23,.08);
-      border-radius:12px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:8px;
       padding:12px;
-      background:#f8fafc;
+      background:rgba(255,255,255,.035);
       min-width:0;
     }
 
@@ -333,10 +635,13 @@
       white-space:nowrap;
       overflow:hidden;
       text-overflow:ellipsis;
+      font-family:var(--mono);
+      font-variant-numeric:tabular-nums lining-nums;
     }
 
     .statusBanner{
       border-left:6px solid var(--primary);
+      box-shadow:var(--shadow-soft);
     }
 
     .miniGrid{
@@ -347,10 +652,10 @@
     }
 
     .miniCard{
-      border:1px solid rgba(2,6,23,.08);
-      border-radius:12px;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:8px;
       padding:12px;
-      background:#ffffff;
+      background:rgba(255,255,255,.035);
       min-width:0;
     }
 
@@ -366,6 +671,8 @@
       white-space:nowrap;
       overflow:hidden;
       text-overflow:ellipsis;
+      font-family:var(--mono);
+      font-variant-numeric:tabular-nums lining-nums;
     }
 
     .panelList{
@@ -380,10 +687,17 @@
       align-items:center;
       gap:10px;
       padding:10px 12px;
-      border:1px solid rgba(2,6,23,.08);
-      border-radius:12px;
-      background:#ffffff;
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:8px;
+      background:rgba(255,255,255,.035);
       font-weight:700;
+      min-width:0;
+    }
+
+    .panelItem > span:last-child{
+      margin-left:auto;
+      text-align:right;
+      overflow-wrap:anywhere;
     }
 
     .configGrid{
@@ -396,12 +710,43 @@
       .configGrid{ grid-template-columns:1fr; }
     }
 
+    @media(max-width:760px){
+      body{
+        padding:12px;
+      }
+
+      .topbar{
+        align-items:flex-start;
+      }
+
+      .topbar > .row,
+      .titleRow > .row,
+      #statusPanel > .row{
+        width:100%;
+      }
+
+      .metricsGrid,
+      .miniGrid{
+        grid-template-columns:1fr;
+      }
+
+      button,
+      button.ghost,
+      a.ghost{
+        min-height:42px;
+      }
+
+      select{
+        width:100%;
+      }
+    }
+
     .hidden{
       display:none !important;
     }
   </style>
 </head>
-<body>
+<body class="operatorConsole theme-operator">
 
   <!--
     OPERATOR CONSOLE
@@ -721,7 +1066,7 @@
           </div>
           <button class="ghost" onclick="viewHealth()">Refresh</button>
         </div>
-        <pre id="healthView">(loading…)</pre>
+        <div id="healthView" class="operatorStatePanel"></div>
       </div>
 
       <div class="card" id="marketCard" style="display:none;">
@@ -732,7 +1077,7 @@
           </div>
           <button class="ghost" onclick="viewMarket()">Refresh</button>
         </div>
-        <pre id="marketView">(loading…)</pre>
+        <div id="marketView" class="operatorStatePanel"></div>
       </div>
 
       <div class="card" id="strategyCard" style="display:none;">
@@ -743,7 +1088,7 @@
           </div>
           <button class="ghost" onclick="viewStrategy()">Refresh</button>
         </div>
-        <pre id="strategyView">(loading…)</pre>
+        <div id="strategyView" class="operatorStatePanel"></div>
       </div>
 
       <div class="card">
@@ -754,7 +1099,7 @@
           </div>
           <button class="ghost" onclick="renderTradingMonitor()">Refresh</button>
         </div>
-        <pre id="tradingMonitor">(loading…)</pre>
+        <div id="tradingMonitor" class="operatorStatePanel"></div>
       </div>
 
       <div class="card">
@@ -766,7 +1111,7 @@
     <button class="ghost" onclick="renderTradeBlotter()">Refresh</button>
   </div>
 
-  <pre id="tradeBlotter">(loading…)</pre>
+  <div id="tradeBlotter" class="operatorStatePanel"></div>
 </div>
 
       <div class="card">
@@ -822,7 +1167,7 @@
             <button class="ghost" onclick="copyLogs()">Copy</button>
           </div>
         </div>
-        <pre id="logs">(loading…)</pre>
+        <div id="logs" class="operatorStatePanel logPanel">(loading...)</div>
       </div>
 
     </div>
@@ -861,6 +1206,12 @@ import {
   formatAgeSeconds,
   safeArray
 } from "/ui/runtime_diagnostics.js";
+import {
+  stateBlockHtml,
+  sanitizePrimaryText,
+  formatTechnicalDetails,
+  technicalDetailsHtml
+} from "/ui/state_presenter.js";
 
 const OPERATOR_BRIDGE_PREFIX = (() => {
   const path = String(location.pathname || "");
@@ -935,7 +1286,96 @@ function operatorBridgeUrl(url){
   return raw;
 }
 
+function operatorWsProtocolToken(token){
+  const text = String(token || "").trim();
+  if(!text) return "";
+  try{
+    const bytes = new TextEncoder().encode(text);
+    let binary = "";
+    bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+    return `operator-token.${btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "")}`;
+  }catch{
+    return "";
+  }
+}
+
+let _operatorWsTicket = null;
+
+async function operatorTelemetryWsTicketProtocol(){
+  if(!OPERATOR_BRIDGE_PREFIX) return "";
+  const now = Date.now();
+  if(_operatorWsTicket && _operatorWsTicket.protocol && _operatorWsTicket.expiresAtMs > now + 5000){
+    return _operatorWsTicket.protocol;
+  }
+  try{
+    const res = await fetch(`${OPERATOR_BRIDGE_PREFIX}/ws_ticket`, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        ...operatorAuthHeaders("GET")
+      },
+      credentials: "same-origin",
+      cache: "no-store"
+    });
+    const data = await res.json().catch(() => null);
+    if(!res.ok || !data || data.ok !== true || !data.ticket) return "";
+    _operatorWsTicket = {
+      protocol: `operator-ticket.${String(data.ticket).trim()}`,
+      expiresAtMs: Number(data.expires_at_ms || 0)
+    };
+    return _operatorWsTicket.protocol;
+  }catch{
+    return "";
+  }
+}
+
+function operatorTelemetryWsHost(){
+  const explicitHost = String(window.OPERATOR_WS_HOST || "").trim();
+  if(explicitHost) return explicitHost;
+  const port = String(window.OPERATOR_WS_PORT || "4001").trim();
+  let host = String(location.hostname || "").trim() || "127.0.0.1";
+  if(host.includes(":") && !host.startsWith("[")) host = `[${host}]`;
+  return port ? `${host}:${port}` : String(location.host || host);
+}
+
 function operatorTelemetryWsUrl(){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const direct = OPERATOR_BRIDGE_PREFIX
+    ? new URL(`${proto}://${operatorTelemetryWsHost()}`)
+    : new URL(`${proto}://${location.host}`);
+  // The Python dashboard bridge is HTTP-only; telemetry connects directly to
+  // the sidecar WebSocket and authenticates via Sec-WebSocket-Protocol.
+  // Query-token auth remains server-side only for backward-compatible tools.
+  direct.pathname = "/ws/operator";
+  direct.search = "";
+  direct.hash = "";
+  return direct.toString();
+}
+
+async function operatorTelemetryWsProtocols(){
+  const operatorToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.operator);
+  const encoded = operatorWsProtocolToken(operatorToken);
+  if(encoded) return ["operator-token", encoded];
+  const ticket = await operatorTelemetryWsTicketProtocol();
+  return ticket ? ["operator-ticket", ticket] : [];
+}
+
+async function openOperatorTelemetrySocket(url){
+  const protocols = await operatorTelemetryWsProtocols();
+  return protocols.length ? new WebSocket(url, protocols) : new WebSocket(url);
+}
+
+async function operatorTelemetryWsDebugInfo(){
+  const protocols = await operatorTelemetryWsProtocols();
+  return {
+    url: operatorTelemetryWsUrl(),
+    bridged: !!OPERATOR_BRIDGE_PREFIX,
+    tokenProtocol: protocols.some((protocol) => String(protocol || "").startsWith("operator-token.")),
+    ticketProtocol: protocols.some((protocol) => String(protocol || "").startsWith("operator-ticket."))
+  };
+}
+
+function operatorTelemetryLegacyWsUrl(){
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const direct = new URL(`${proto}://${location.host}`);
   if(OPERATOR_BRIDGE_PREFIX){
@@ -951,10 +1391,134 @@ function operatorTelemetryWsUrl(){
 let selectedMode = "safe"; // safe | shadow | live
 const OPERATOR_LIVE_MODE_UI_ENABLED = false;
 const OPERATOR_ADMIN_WRITES_ENABLED = false;
+const OPERATOR_SECRET_WORD_RE = /\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL|MASTER[_-]?KEY)[A-Z0-9_]*\b/gi;
+const OPERATOR_ROUTE_RE = /(?:https?:\/\/[^\s)]+|\/api\/[^\s)]+|\/operator\/api\/[^\s)]+|\/ws\/[^\s)]+)/gi;
+const OPERATOR_STACK_LINE_RE = /\b(?:Traceback|at\s+\S+\s+\(|File\s+"[^"]+"|line\s+\d+|stack|Error:\s*)/i;
 
 function adminWritesEnabled(){
   return OPERATOR_ADMIN_WRITES_ENABLED === true;
 }
+
+function operatorRawErrorText(value, fallback = "request failed"){
+  if(value === undefined || value === null) return fallback;
+  if(typeof value === "string") return value || fallback;
+  if(value instanceof Error) return value.message || fallback;
+  if(typeof value === "object"){
+    return String(
+      value.operator_message ||
+      value.message ||
+      value.reason ||
+      value.summary ||
+      value.detail ||
+      value.error ||
+      value.reason_code ||
+      value.status ||
+      value.state ||
+      fallback
+    );
+  }
+  return String(value || fallback);
+}
+
+function operatorPrimaryText(value, fallback = "No operator-readable detail was returned.", maxLength = 180){
+  return sanitizePrimaryText(value, { fallback, maxLength });
+}
+
+function operatorTechnicalDetails(value){
+  return formatTechnicalDetails(value);
+}
+
+function operatorTechnicalDetailsHtml(value){
+  return technicalDetailsHtml(value, { className:"opTech" });
+}
+
+function operatorStateHtml(options = {}){
+  return stateBlockHtml(options);
+}
+
+function renderOperatorState(id, options = {}){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.innerHTML = operatorStateHtml(options);
+}
+
+function renderOperatorText(id, text){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.textContent = String(text || "");
+}
+
+function renderOperatorPayloadState(id, payload, {
+  subject = "Snapshot",
+  why = "This view supports operator decisions.",
+  action = "Refresh the panel if the state looks stale.",
+  emptyMessage = "The backend returned no records.",
+  okMessage = "Snapshot loaded.",
+  degradedMessage = "The backend reported a degraded state.",
+} = {}){
+  if(!payload || payload.ok === false){
+    renderOperatorState(id, {
+      state: payload ? "degraded" : "error",
+      title: `${subject} unavailable`,
+      message: payload ? operatorPrimaryText(payload, degradedMessage) : "No response was returned.",
+      why,
+      action,
+      details: payload || { error:"no response" }
+    });
+    return;
+  }
+  const status = String(payload.status || payload.state || "").toLowerCase();
+  const rows = safeArray(payload.rows || payload.items || payload.decisions || payload.trades || []);
+  const state = status.includes("degraded") || payload.degraded ? "degraded" : "ok";
+  renderOperatorState(id, {
+    state: rows.length === 0 && /empty|none/i.test(emptyMessage) ? "empty" : state,
+    title: `${subject} loaded`,
+    message: rows.length === 0 ? emptyMessage : okMessage,
+    why,
+    action: state === "degraded" ? action : "No immediate operator action is required.",
+    details: payload
+  });
+}
+
+function renderInitialOperatorStates(){
+  renderOperatorState("healthView", {
+    state:"loading",
+    title:"Loading system health",
+    message:"Fetching the latest backend health snapshot.",
+    why:"Health determines whether the engine can be trusted for operator decisions.",
+    action:"Wait for the refresh to complete."
+  });
+  renderOperatorState("marketView", {
+    state:"loading",
+    title:"Loading market data",
+    message:"Fetching live-feed verification.",
+    why:"Market-data freshness affects signal quality and execution safety.",
+    action:"Wait for the refresh to complete."
+  });
+  renderOperatorState("strategyView", {
+    state:"loading",
+    title:"Loading strategy decisions",
+    message:"Fetching the latest strategy decision summary.",
+    why:"Strategy state explains what the engine would do next.",
+    action:"Wait for the refresh to complete."
+  });
+  renderOperatorState("tradingMonitor", {
+    state:"loading",
+    title:"Loading trading monitor",
+    message:"Fetching positions, orders, fills, PnL, and risk.",
+    why:"Trading monitor state is needed before taking operational action.",
+    action:"Wait for the refresh to complete."
+  });
+  renderOperatorState("tradeBlotter", {
+    state:"loading",
+    title:"Loading trade blotter",
+    message:"Fetching recent executed trades.",
+    why:"The blotter confirms whether orders became fills.",
+    action:"Wait for the refresh to complete."
+  });
+}
+
+renderInitialOperatorStates();
 
 function liveModeUiEnabled(){
   return OPERATOR_LIVE_MODE_UI_ENABLED === true;
@@ -988,16 +1552,18 @@ function applyMonitoringSafetyLocks(){
 // LIVE TELEMETRY STREAM
 // --------------------------------------------------
 let _telemetrySocket = null;
+let _telemetrySocketConnecting = false;
 
-function startTelemetryStream(){
+async function startTelemetryStream(){
 
-  if(_telemetrySocket) return;
+  if(_telemetrySocket || _telemetrySocketConnecting) return;
+  _telemetrySocketConnecting = true;
 
   try{
 
     const url = operatorTelemetryWsUrl();
 
-    _telemetrySocket = new WebSocket(url);
+    _telemetrySocket = await openOperatorTelemetrySocket(url);
 setPill(document.getElementById("dotHealth"), "ok");
 
     _telemetrySocket.onmessage = (ev)=>{
@@ -1005,13 +1571,23 @@ setPill(document.getElementById("dotHealth"), "ok");
         const msg = JSON.parse(ev.data);
 
         if(msg.type === "health_update"){
-          document.getElementById("healthView").innerText =
-            JSON.stringify(msg.payload, null, 2);
+          renderOperatorPayloadState("healthView", msg.payload, {
+            subject: "System health",
+            okMessage: "Realtime health update received.",
+            degradedMessage: "Realtime health update reported a degraded state.",
+            why: "Health determines whether the engine can be trusted for operator decisions.",
+            action: "Open readiness issues and inspect technical details if health remains degraded."
+          });
         }
 
         if(msg.type === "trading_update"){
-          document.getElementById("tradingMonitor").innerText =
-            JSON.stringify(msg.payload, null, 2);
+          renderOperatorPayloadState("tradingMonitor", msg.payload, {
+            subject: "Trading monitor",
+            okMessage: "Realtime trading update received.",
+            degradedMessage: "Realtime trading update reported a degraded state.",
+            why: "Positions, orders, fills, PnL, and risk must be readable before operator action.",
+            action: "Keep execution conservative and inspect technical details if the condition persists."
+          });
         }
 
         if(msg.type === "pnl_update"){
@@ -1038,6 +1614,8 @@ _telemetrySocket.onclose = ()=>{
 
   }catch(e){
     console.warn("telemetry stream failed", e);
+  }finally{
+    _telemetrySocketConnecting = false;
   }
 }
 
@@ -1086,22 +1664,22 @@ async function updateSummary(){
     dot.className = "dot";
 
     if(r.severity === "ok"){
-      card.style.borderLeft = "6px solid #16a34a";
+      card.style.borderLeft = "6px solid var(--status-ok)";
       dot.classList.add("ok");
       txt.innerText = "State: Ready";
     }
     else if(r.severity === "warn"){
-      card.style.borderLeft = "6px solid #f59e0b";
+      card.style.borderLeft = "6px solid var(--status-warn)";
       dot.classList.add("warn");
       txt.innerText = "State: Attention required";
     }
     else if(r.severity === "error"){
-      card.style.borderLeft = "6px solid #dc2626";
+      card.style.borderLeft = "6px solid var(--status-crit)";
       dot.classList.add("fail");
       txt.innerText = "State: System error";
     }
     else{
-      card.style.borderLeft = "6px solid #2563eb";
+      card.style.borderLeft = "6px solid var(--status-info)";
       txt.innerText = "State: Starting";
     }
 
@@ -1150,6 +1728,15 @@ const OPERATOR_CONFIRMATION_SPECS = {
     confirmText: "START_OPERATOR",
     consequence: "Starts operator-controlled runtime processes and may start data or pipeline jobs.",
     submitLabel: "Start engine",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.bootstrap": {
+    title: "Run startup bootstrap",
+    action: "Run startup bootstrap",
+    confirmText: "BOOTSTRAP_OPERATOR",
+    consequence: "Runs the dashboard startup orchestrator in non-live mode and may start data or pipeline jobs.",
+    submitLabel: "Run bootstrap",
     requireReason: true,
     minReasonLength: 6
   },
@@ -1552,14 +2139,20 @@ function renderWizard(steps, ok){
     let title = s.label || s.id || "step";
     if(map[s.id]) title = map[s.id];
 
-    let detail = s.detail;
-    if(typeof detail === "object") detail = JSON.stringify(detail, null, 2);
+    const detailValue = s.detail;
+    const detail = typeof detailValue === "object"
+      ? operatorPrimaryText(detailValue, "Backend returned structured diagnostic details.")
+      : operatorPrimaryText(detailValue || "", "");
+    const technical = detailValue && typeof detailValue === "object"
+      ? operatorTechnicalDetailsHtml(detailValue)
+      : "";
 
     el.innerHTML = `
       <span class="dot ${dot}"></span>
       <div>
         <b>${esc(title)}</b>
         <div class="stepDetail">${esc(detail || "")}</div>
+        ${technical}
       </div>
     `;
     box.appendChild(el);
@@ -1594,13 +2187,30 @@ async function runInstitutional(){
   const j = await jget("/api/operator/institutionalCheck");
 
   const issues = [];
-  if(!j.configValid) issues.push({ level:"error", code:"CONFIG_INVALID", message:"Invalid .env (typed validation failed)" });
-  if(!j.entryExists) issues.push({ level:"error", code:"ENTRY_MISSING", message:"Missing start_system.py" });
-  if(!j.dbPathWritable) issues.push({ level:"warn", code:"DB_NOT_WRITABLE", message:"DB directory not writable" });
-  if(!j.healthOk) issues.push({ level:"error", code:"HEALTH_FAIL", message:"Backend not healthy (/api/health)" });
-  if(!j.dataFlowing) issues.push({ level:"error", code:"DATA_NOT_FLOWING", message:"Telemetry did not change (data not flowing)" });
-  for(const e of (j.errors || [])){
-    issues.push({ level:"info", code:"DETAIL", message:String(e) });
+  const structuredChecks = Array.isArray(j.checks) ? j.checks : [];
+  if(structuredChecks.length){
+    for(const check of structuredChecks){
+      if(check && check.ok) continue;
+      const name = check && check.name ? String(check.name) : "check";
+      const status = check && check.status ? String(check.status) : "fail";
+      const reason = check && check.reason ? String(check.reason) : ((check && Array.isArray(check.reasons) && check.reasons[0]) ? String(check.reasons[0]) : "not ready");
+      issues.push({
+        level: status === "degraded" ? "warn" : "error",
+        code: name.toUpperCase(),
+        message: reason
+      });
+    }
+  }else{
+    if(!j.configValid) issues.push({ level:"error", code:"CONFIG_INVALID", message:"Invalid .env (typed validation failed)" });
+    if(!j.entryExists) issues.push({ level:"error", code:"ENTRY_MISSING", message:"Missing start_system.py" });
+    if(!j.dbPathWritable) issues.push({ level:"warn", code:"DB_NOT_WRITABLE", message:"DB directory not writable" });
+    if(!j.healthOk) issues.push({ level:"error", code:"HEALTH_FAIL", message:"Backend not healthy (/api/health)" });
+    if(!j.dataFlowing) issues.push({ level:"error", code:"DATA_NOT_FLOWING", message:"Telemetry did not change (data not flowing)" });
+  }
+  if(!structuredChecks.length){
+    for(const e of (j.errors || [])){
+      issues.push({ level:"info", code:"DETAIL", message:String(e) });
+    }
   }
 
   renderIssues(document.getElementById("institutionalIssues"), issues);
@@ -1683,10 +2293,18 @@ async function loadLogs(){
     : "/api/operator/logs";
 
   const r = await jget(url, 15000);
-  const text = (r && typeof r.logs === "string")
-    ? r.logs
-    : JSON.stringify(r || { ok:false, error:"logs_unavailable" }, null, 2);
-  document.getElementById("logs").innerText = text || "(no logs yet)";
+  if(r && typeof r.logs === "string"){
+    document.getElementById("logs").innerText = r.logs || "(no logs yet)";
+    return;
+  }
+  renderOperatorState("logs", {
+    state:"error",
+    title:"Logs unavailable",
+    message:operatorPrimaryText(r || "logs unavailable", "Log tail could not be loaded."),
+    why:"Runtime logs are needed for incident diagnosis, but the log endpoint did not return a log tail.",
+    action:"Refresh logs or inspect the selected service on the host.",
+    details:r || { ok:false, error:"logs_unavailable" }
+  });
 }
 
 async function loadSecrets(){
@@ -1735,11 +2353,11 @@ async function preflight(){
         steps.push({
           ok: !!c.ok,
           label: c.label || c.id || "check",
-          detail: (typeof c.details === "string") ? c.details : JSON.stringify(c.details || "", null, 2)
+          detail: (typeof c.details === "string") ? c.details : (c.details || "")
         });
       }
     }else{
-      steps.push({ ok:false, label:"Preflight failed", detail: JSON.stringify(r || {}, null, 2) });
+      steps.push({ ok:false, label:"Preflight failed", detail: r || {} });
     }
 
     renderWizard(steps, !!(r && r.ok));
@@ -1758,12 +2376,12 @@ async function start(){
 
   renderWizard([{ ok:false, label:"Starting…", detail:"sending start request" }], false);
 
-  const r = await jpost("/api/operator/start", request);
+  const r = await jpost("/api/operator/start", request, 30000);
 
   if(r && r.steps){
     renderWizard(r.steps, !!r.ok);
   }else{
-    renderWizard([{ ok:false, label:"Start failed", detail: JSON.stringify(r || {}, null, 2) }], false);
+    renderWizard([{ ok:false, label:"Start failed", detail: r || {} }], false);
   }
 
   await refreshAll();
@@ -1783,7 +2401,7 @@ async function guidedBootstrap(){
   if(r && Array.isArray(r.steps)){
     renderWizard(r.steps, !!r.ok);
   }else{
-    renderWizard([{ ok:false, label:"System setup failed", detail: JSON.stringify(r || {}, null, 2) }], false);
+    renderWizard([{ ok:false, label:"System setup failed", detail: r || {} }], false);
   }
 
   await refreshAll();
@@ -1820,7 +2438,15 @@ async function renderPipeline(){
 
     document.getElementById("startupPipeline").innerHTML = html;
   }catch(e){
-    document.getElementById("startupPipeline").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+    renderOperatorState("startupPipeline", {
+      state:"error",
+      title:"Startup pipeline unavailable",
+      message:operatorPrimaryText(e, "Startup pipeline could not be loaded."),
+      why:"Startup progress cannot be trusted without current bootstrap counts and health.",
+      action:"Refresh the panel or inspect operator health.",
+      details:e,
+      compact:true
+    });
   }
 }
 
@@ -1840,7 +2466,15 @@ async function renderMetrics(){
       renderMetricCard("Models", asNumber(c.model_registry))
     ].join("");
   }catch(e){
-    document.getElementById("runtimeMetrics").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+    renderOperatorState("runtimeMetrics", {
+      state:"error",
+      title:"Runtime metrics unavailable",
+      message:operatorPrimaryText(e, "Runtime metrics could not be loaded."),
+      why:"Counts for symbols, prices, events, labels, and models are unavailable.",
+      action:"Refresh metrics or inspect bootstrap count health.",
+      details:e,
+      compact:true
+    });
   }
 }
 
@@ -1866,7 +2500,15 @@ async function renderOperatorHealthPanels(){
 
     document.getElementById("operatorHealthPanels").innerHTML = html;
   }catch(e){
-    document.getElementById("operatorHealthPanels").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+    renderOperatorState("operatorHealthPanels", {
+      state:"error",
+      title:"Operator health panels unavailable",
+      message:operatorPrimaryText(e, "Operator health panels could not be loaded."),
+      why:"The combined health, readiness, service, watchdog, provider, and supervisor summary is unavailable.",
+      action:"Refresh the panel or inspect operator health.",
+      details:e,
+      compact:true
+    });
   }
 }
 
@@ -1893,7 +2535,15 @@ async function renderConnectionStatus(){
 
     document.getElementById("connectionStatus").innerHTML = html;
   }catch(e){
-    document.getElementById("connectionStatus").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+    renderOperatorState("connectionStatus", {
+      state:"error",
+      title:"Connection status unavailable",
+      message:operatorPrimaryText(e, "Connection status could not be loaded."),
+      why:"Broker, execution barrier, supervisor, provider, and portfolio connectivity are unavailable.",
+      action:"Refresh the panel or inspect operator health.",
+      details:e,
+      compact:true
+    });
   }
 }
 
@@ -1918,7 +2568,15 @@ const priceStale = priceAge > 60;
 
     document.getElementById("ingestionWatchdog").innerHTML = html;
   }catch(e){
-    document.getElementById("ingestionWatchdog").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+    renderOperatorState("ingestionWatchdog", {
+      state:"error",
+      title:"Ingestion watchdog unavailable",
+      message:operatorPrimaryText(e, "Ingestion watchdog could not be loaded."),
+      why:"Price/event freshness and ingestion recovery guidance are unavailable.",
+      action:"Refresh the panel or inspect ingestion health.",
+      details:e,
+      compact:true
+    });
   }
 }
 
@@ -1932,8 +2590,15 @@ async function renderStrategyHeatmap(){
     const r = await jget("/api/operator/strategy_heatmap");
 
     if(!r || !r.ok){
-      document.getElementById("strategyHeatmap").innerText =
-        JSON.stringify(r || {error:"no response"}, null, 2);
+      renderOperatorState("strategyHeatmap", {
+        state:"degraded",
+        title:"Strategy heatmap unavailable",
+        message:operatorPrimaryText(r || "no response", "Strategy heatmap could not be loaded."),
+        why:"Strategy heatmap diagnostics cannot be used for this refresh.",
+        action:"Refresh strategy diagnostics or inspect backend route health.",
+        details:r || { error:"no response" },
+        compact:true
+      });
       return;
     }
 
@@ -1957,8 +2622,15 @@ async function renderStrategyHeatmap(){
 
   }catch(e){
 
-    document.getElementById("strategyHeatmap").innerText =
-      JSON.stringify({error:String(e)}, null, 2);
+    renderOperatorState("strategyHeatmap", {
+      state:"error",
+      title:"Strategy heatmap failed",
+      message:operatorPrimaryText(e, "Strategy heatmap could not be loaded."),
+      why:"Strategy heatmap diagnostics cannot be used for this refresh.",
+      action:"Refresh strategy diagnostics or inspect backend route health.",
+      details:e,
+      compact:true
+    });
 
   }
 
@@ -1984,7 +2656,15 @@ const html = [
 
     document.getElementById("trainingProgress").innerHTML = html;
   }catch(e){
-    document.getElementById("trainingProgress").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+    renderOperatorState("trainingProgress", {
+      state:"error",
+      title:"Training progress unavailable",
+      message:operatorPrimaryText(e, "Training progress could not be loaded."),
+      why:"Training and promotion readiness are unavailable for this refresh.",
+      action:"Refresh the panel or inspect model readiness.",
+      details:e,
+      compact:true
+    });
   }
 }
 
@@ -2006,24 +2686,48 @@ async function renderTradeBlotter(){
     const r = await jget("/api/operator/trade_blotter");
 
     if(!r || !r.ok){
-      document.getElementById("tradeBlotter").innerText =
-        JSON.stringify(r || {error:"no response"}, null, 2);
+      renderOperatorState("tradeBlotter", {
+        state:"degraded",
+        title:"Trade blotter unavailable",
+        message:operatorPrimaryText(r || "no response", "Trade blotter could not be loaded."),
+        why:"Executed trades cannot be confirmed from this panel.",
+        action:"Refresh the blotter; if it repeats, inspect order/fill route health.",
+        details:r || { error:"no response" }
+      });
       return;
     }
 
     const rows = safeArray(r.trades).slice(-50).reverse();
+
+    if(!rows.length){
+      renderOperatorState("tradeBlotter", {
+        state:"empty",
+        title:"Nothing active",
+        message:"No executed trades were returned for the current window.",
+        why:"The blotter is reachable, but there are no fills to display.",
+        action:"Check open orders or wait for the next fill event.",
+        details:r
+      });
+      return;
+    }
 
     const html = rows.map(t => `
       ${esc(t.ts)}  ${esc(t.symbol)}  ${esc(t.side)}  
       qty=${esc(t.qty)}  price=${esc(t.price)}
     `).join("\n");
 
-    document.getElementById("tradeBlotter").innerText = html || "(no trades yet)";
+    renderOperatorText("tradeBlotter", html);
 
   }catch(e){
 
-    document.getElementById("tradeBlotter").innerText =
-      JSON.stringify({error:String(e)}, null, 2);
+    renderOperatorState("tradeBlotter", {
+      state:"error",
+      title:"Trade blotter failed",
+      message:operatorPrimaryText(e, "Trade blotter could not be loaded."),
+      why:"Executed trades cannot be confirmed from this panel.",
+      action:"Refresh the blotter; if it repeats, inspect order/fill route health.",
+      details:e
+    });
 
   }
 
@@ -2034,7 +2738,14 @@ async function renderTradingMonitor(){
     const r = await jget("/api/operator/trading_monitor");
 
     if(!r || !r.ok){
-      document.getElementById("tradingMonitor").innerText = JSON.stringify(r || { error:"no response" }, null, 2);
+      renderOperatorState("tradingMonitor", {
+        state:"degraded",
+        title:"Trading monitor unavailable",
+        message:operatorPrimaryText(r || "no response", "Trading monitor could not be loaded."),
+        why:"Positions, orders, fills, PnL, and risk must be readable before operator action.",
+        action:"Keep execution conservative and inspect runtime route health.",
+        details:r || { error:"no response" }
+      });
       await updatePnlSummary({});
       return;
     }
@@ -2081,12 +2792,39 @@ if(summary.risk){
   }
 
   summary.risk_alert = riskState;
-
 }
-    document.getElementById("tradingMonitor").innerText = JSON.stringify(summary, null, 2);
+    const totalActivity = summary.positions + summary.open_orders + summary.recent_fills;
+    const monitorBody = `
+      <div class="metricsGrid">
+        ${renderMetricCard("Positions", summary.positions)}
+        ${renderMetricCard("Open Orders", summary.open_orders)}
+        ${renderMetricCard("Recent Fills", summary.recent_fills)}
+        ${renderMetricCard("Risk Alert", summary.risk_alert || "none")}
+      </div>
+    `;
+    renderOperatorState("tradingMonitor", {
+      state: summary.risk_alert ? "degraded" : (totalActivity ? "ok" : "empty"),
+      title: summary.risk_alert ? "Trading monitor degraded" : (totalActivity ? "Trading monitor loaded" : "Nothing active"),
+      message: totalActivity
+        ? `Positions ${summary.positions}, open orders ${summary.open_orders}, recent fills ${summary.recent_fills}.`
+        : "No active positions, orders, or recent fills were returned.",
+      why: "This panel summarizes live exposure and execution activity before operator action.",
+      action: summary.risk_alert
+        ? "Inspect risk state before enabling or resuming execution."
+        : "No immediate operator action is required.",
+      bodyHtml: monitorBody,
+      details: summary
+    });
     await updatePnlSummary(summary);
   }catch(e){
-    document.getElementById("tradingMonitor").innerText = JSON.stringify({ error:String(e) }, null, 2);
+    renderOperatorState("tradingMonitor", {
+      state:"error",
+      title:"Trading monitor failed",
+      message:operatorPrimaryText(e, "Trading monitor could not be loaded."),
+      why:"Positions, orders, fills, PnL, and risk must be readable before operator action.",
+      action:"Keep execution conservative and inspect runtime route health.",
+      details:e
+    });
     await updatePnlSummary({});
   }
 }
@@ -2094,26 +2832,61 @@ if(summary.risk){
 async function viewHealth(){
   try{
     const r = await jget("/api/operator/system_health");
-    document.getElementById("healthView").innerText = JSON.stringify(r, null, 2);
+    renderOperatorPayloadState("healthView", r, {
+      subject:"System health",
+      okMessage:"System health snapshot loaded.",
+      degradedMessage:"System health reported degraded or unavailable components.",
+      why:"Health determines whether the engine can be trusted for operator decisions.",
+      action:"Review readiness issues and technical details before taking action."
+    });
   }catch(e){
-    document.getElementById("healthView").innerText = JSON.stringify({ ok:false, error:String(e) }, null, 2);
+    renderOperatorState("healthView", {
+      state:"error",
+      title:"System health failed",
+      message:operatorPrimaryText(e, "System health could not be loaded."),
+      why:"Health determines whether the engine can be trusted for operator decisions.",
+      action:"Refresh health; if it repeats, inspect operator and dashboard service health.",
+      details:e
+    });
   }
 }
 
 async function viewMarket(){
   try{
     const r = await jget("/api/operator/market_data?symbol=SPY&tf=1m&limit=30");
-    document.getElementById("marketView").innerText = JSON.stringify(r, null, 2);
 
     if(r && r.telemetry){
+      renderOperatorState("marketView", {
+        state:"ok",
+        title:"Market data active",
+        message:"Live-feed telemetry was returned for SPY 1m.",
+        why:"Fresh market data is required for signal quality and runtime readiness.",
+        action:"No immediate operator action is required.",
+        details:r
+      });
       setPill(document.getElementById("dotData"), "ok");
       document.getElementById("txtData").innerText = "Market data: active";
     }else{
+      renderOperatorState("marketView", {
+        state:"degraded",
+        title:"Market data missing",
+        message:"The market-data route responded without live telemetry.",
+        why:"Signals may be stale or unavailable when live feed verification is missing.",
+        action:"Inspect provider credentials, ingestion watchdog, and source logs.",
+        details:r || { error:"no telemetry" }
+      });
       setPill(document.getElementById("dotData"), "warn");
       document.getElementById("txtData").innerText = "Market data: missing";
     }
   }catch(e){
-    document.getElementById("marketView").innerText = JSON.stringify({ ok:false, error:String(e) }, null, 2);
+    renderOperatorState("marketView", {
+      state:"error",
+      title:"Market data failed",
+      message:operatorPrimaryText(e, "Market data could not be loaded."),
+      why:"Signals may be stale or unavailable when live feed verification is missing.",
+      action:"Inspect provider credentials, ingestion watchdog, and source logs.",
+      details:e
+    });
     setPill(document.getElementById("dotData"), "fail");
     document.getElementById("txtData").innerText = "Market data: error";
   }
@@ -2122,9 +2895,26 @@ async function viewMarket(){
 async function viewStrategy(){
   try{
     const r = await jget("/api/operator/strategy_decisions");
-    document.getElementById("strategyView").innerText = JSON.stringify(r, null, 2);
+    const decisions = safeArray(r && (r.decisions || r.rows || r.items));
+    renderOperatorState("strategyView", {
+      state: r && r.ok === false ? "degraded" : (decisions.length ? "ok" : "empty"),
+      title: decisions.length ? "Strategy decisions loaded" : "Nothing active",
+      message: decisions.length
+        ? `${decisions.length} strategy decision record(s) returned.`
+        : "No strategy decisions were returned for this window.",
+      why:"Strategy state explains what the engine would do next.",
+      action: decisions.length ? "No immediate operator action is required." : "Wait for the next strategy update or inspect model readiness.",
+      details:r
+    });
   }catch(e){
-    document.getElementById("strategyView").innerText = JSON.stringify({ ok:false, error:String(e) }, null, 2);
+    renderOperatorState("strategyView", {
+      state:"error",
+      title:"Strategy decisions failed",
+      message:operatorPrimaryText(e, "Strategy decisions could not be loaded."),
+      why:"Strategy state explains what the engine would do next.",
+      action:"Refresh strategy decisions; if it repeats, inspect strategy route health.",
+      details:e
+    });
   }
 }
 
@@ -2134,7 +2924,14 @@ async function restartFeeds(){
   });
   if(!payload) return;
   const r = await jpost("/api/operator/restart_feeds", payload);
-  document.getElementById("marketView").innerText = JSON.stringify(r, null, 2);
+  renderOperatorState("marketView", {
+    state:r && r.ok ? "ok" : "degraded",
+    title:r && r.ok ? "Feeds restart requested" : "Feeds restart did not complete",
+    message:r && r.ok ? "The backend accepted the feed restart request." : operatorPrimaryText(r || "restart failed", "Feed restart failed."),
+    why:"Market data may remain stale until feed jobs restart and publish fresh telemetry.",
+    action:r && r.ok ? "Wait for market data telemetry to recover." : "Inspect feed service status and technical details.",
+    details:r
+  });
   await refreshAll();
 }
 
@@ -2148,9 +2945,9 @@ async function restartEngine(){
     payload
   );
   if(r && r.ok){
-    renderWizard([{ ok:true, label:"Restart Engine", detail:JSON.stringify(r, null, 2) }], true);
+    renderWizard([{ ok:true, label:"Restart Engine", detail:r }], true);
   }else{
-    renderWizard([{ ok:false, label:"Restart Engine", detail:JSON.stringify(r || {}, null, 2) }], false);
+    renderWizard([{ ok:false, label:"Restart Engine", detail:r || {} }], false);
   }
   await refreshAll();
 }
@@ -2165,9 +2962,9 @@ async function emergencyStopHard(){
     payload
   );
   if(r && r.ok){
-    renderWizard([{ ok:true, label:"Emergency Stop", detail:JSON.stringify(r, null, 2) }], true);
+    renderWizard([{ ok:true, label:"Emergency Stop", detail:r }], true);
   }else{
-    renderWizard([{ ok:false, label:"Emergency Stop", detail:JSON.stringify(r || {}, null, 2) }], false);
+    renderWizard([{ ok:false, label:"Emergency Stop", detail:r || {} }], false);
   }
   await refreshAll();
 }
@@ -2209,7 +3006,7 @@ async function repairSystem(){
     const steps = (r.steps || []).map((s) => ({
       ok: !!s.ok,
       label: s.step || s.label || "step",
-      detail: (typeof s.detail === "string") ? s.detail : JSON.stringify(s.detail || s.error || "", null, 2)
+      detail: (typeof s.detail === "string") ? s.detail : (s.detail || s.error || "")
     }));
     renderWizard(steps, !!r.ok);
     alert(r.ok ? "Repair: OK" : "Repair: PARTIAL/FAILED (see wizard steps)");
@@ -2297,9 +3094,17 @@ async function loadServiceStatus(){
 
     if(!r || r.ok === false){
       if(panel){
-        panel.innerHTML = `<div class="panelItem"><span class="dot fail"></span><span>Service status unavailable</span><span class="muted">${esc(JSON.stringify(r || {}, null, 2))}</span></div>`;
+        panel.innerHTML = operatorStateHtml({
+          state:"error",
+          title:"Service status unavailable",
+          message:operatorPrimaryText(r || "service status unavailable", "Service status could not be loaded."),
+          why:"Service status is needed before running backup, update, or restart actions.",
+          action:"Refresh service status or inspect the host service manager.",
+          details:r || {},
+          compact:true
+        });
       }
-      if(msg) msg.innerText = r && r.error ? `Service status error: ${r.error}` : "Service status unavailable.";
+      if(msg) msg.innerText = r && r.error ? `Service status error: ${operatorPrimaryText(r.error)}` : "Service status unavailable.";
       return;
     }
 
@@ -2346,7 +3151,15 @@ async function loadServiceStatus(){
     }).join("");
   }catch(e){
     if(panel){
-      panel.innerHTML = `<div class="panelItem"><span class="dot fail"></span><span>Service status exception</span><span class="muted">${esc(String(e))}</span></div>`;
+      panel.innerHTML = operatorStateHtml({
+        state:"error",
+        title:"Service status failed",
+        message:operatorPrimaryText(e, "Service status could not be loaded."),
+        why:"Service status is needed before running backup, update, or restart actions.",
+        action:"Refresh service status or inspect the host service manager.",
+        details:e,
+        compact:true
+      });
     }
   }
 }
@@ -2360,7 +3173,17 @@ async function runBackup(){
   if(msg) msg.innerText = "Running backup…";
 
   const r = await jpost("/api/operator/backup", payload);
-  if(msg) msg.innerText = (r && r.ok) ? "Backup started." : `Backup failed: ${JSON.stringify(r || {}, null, 2)}`;
+  if(msg) msg.innerHTML = (r && r.ok)
+    ? "Backup started."
+    : operatorStateHtml({
+        state:"error",
+        title:"Backup failed",
+        message:operatorPrimaryText(r || "backup failed", "Backup request failed."),
+        why:"Backup evidence may be stale until the backup job starts successfully.",
+        action:"Inspect backup service status and technical details.",
+        details:r || {},
+        compact:true
+      });
 
   await loadServiceStatus();
   await loadLogs();
@@ -2375,7 +3198,17 @@ async function runSystemUpdate(){
   if(msg) msg.innerText = "Starting system update…";
 
   const r = await jpost("/api/operator/update", payload);
-  if(msg) msg.innerText = (r && r.ok) ? "System update started." : `System update failed: ${JSON.stringify(r || {}, null, 2)}`;
+  if(msg) msg.innerHTML = (r && r.ok)
+    ? "System update started."
+    : operatorStateHtml({
+        state:"error",
+        title:"System update failed",
+        message:operatorPrimaryText(r || "update failed", "System update request failed."),
+        why:"The update workflow did not start cleanly.",
+        action:"Inspect upgrade service status and technical details.",
+        details:r || {},
+        compact:true
+      });
 
   await loadServiceStatus();
   await loadLogs();
@@ -2390,7 +3223,17 @@ async function restartOperatorService(){
   if(msg) msg.innerText = "Restarting operator UI service…";
 
   const r = await jpost("/api/operator/restart_operator", payload);
-  if(msg) msg.innerText = (r && r.ok) ? "Operator UI restart requested." : `Operator restart failed: ${JSON.stringify(r || {}, null, 2)}`;
+  if(msg) msg.innerHTML = (r && r.ok)
+    ? "Operator UI restart requested."
+    : operatorStateHtml({
+        state:"error",
+        title:"Operator restart failed",
+        message:operatorPrimaryText(r || "restart failed", "Operator restart request failed."),
+        why:"The operator UI service may not restart automatically.",
+        action:"Inspect operator service status and technical details.",
+        details:r || {},
+        compact:true
+      });
 }
 
 async function copyLogs(){

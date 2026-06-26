@@ -11,6 +11,8 @@ Group=trading
 EnvironmentFile=-/etc/trading/trading.env
 EnvironmentFile=-/etc/trading/provider.env
 Environment=BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
+Environment=BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key
+Environment=TS_SECRETS_PROVIDER=systemd-creds
 Environment=PGHOST=/var/run/postgresql
 Environment=PGPORT=5432
 Environment=PGUSER=postgres
@@ -21,6 +23,7 @@ Environment=TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=0
 Environment=TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0
 Environment=TS_BACKUP_EVIDENCE_PROBE_TIMEOUT_S=5
 Environment=TS_BACKUP_EVIDENCE_SYSTEMCTL_TIMEOUT_S=5
+LoadCredentialEncrypted=backup_evidence_hmac_key:/etc/credstore.encrypted/backup_evidence_hmac_key.cred
 ExecStart=/bin/bash /opt/trading/ops/backup/backup_restore_evidence.sh
 TimeoutStartSec=8min
 Restart=no

@@ -237,9 +237,9 @@ These tables support orchestration rather than trading logic directly.
 | Table | Role |
 | --- | --- |
 | `runtime_meta` | small key/value state used across the runtime |
-| `job_history` | start/stop/error history for jobs |
-| `job_locks` | coordination for jobs that must not overlap; the `ingestion_restart_guard/v1::` row prefix is reserved for expiring ingestion child restart-storm accounting |
-| `job_heartbeats` | liveness data from running jobs |
+| `job_history` | start/stop/error history for jobs; read-only dashboard history resolves this table from the main runtime database, matching the writer and `/api/db/health` |
+| `job_locks` | coordination for jobs that must not overlap; the `ingestion_restart_guard/v1::` row prefix is reserved for expiring ingestion child restart-storm accounting; SQLite safe/test runs may store this liveness table in the liveness database |
+| `job_heartbeats` | liveness data from running jobs; SQLite safe/test runs may store this liveness table in the liveness database |
 | `job_checkpoints` | progress checkpoints for resumable or tracked jobs |
 | `event_log` | structured runtime event stream |
 | `event_log_state` | event-log cursor/state tracking |
@@ -351,6 +351,14 @@ intended OPT-04 gate input; `USE_OPTIONS_FEATURES` remains off by default.
 | `weather_forecast_region_daily`, `weather_alerts`, `weather_provider_health` | weather source tables and provider state; alert/forecast events are also normalized into `events` |
 | `gdelt_macro_features` | macro/event-style derived features built from normalized news/macro events |
 
+Weather dashboard reads are defensive: `/api/weather/alerts` returns an empty
+active-alert list with `ready:false` and `reason:"weather_alerts_table_missing"`
+when `weather_alerts` is absent, `/api/weather/effect` does the same for
+`model_weather_effect`, and `/api/weather/snapshot` returns a zero-filled
+snapshot with `ready:false` when its forecast source table is absent. SQLite
+sim/test bootstrap creates these weather tables; the degraded path exists for
+cold, partially initialized, or externally managed databases.
+
 ### Features, Labels, And Prediction Tables
 
 These tables sit between raw data and trade decisions.
@@ -411,6 +419,14 @@ These tables answer:
 | `promotion_statistical_evidence` | current promotion-gate evidence for BH-FDR, Reality Check, pool, MPC, and era robustness payloads |
 | `strategy_promotion_candidates` | governed shadow-strategy promotion candidates and operator approval state; live mutation still requires realized PnL, replay/OPE/statistical evidence, cooldown, and audit records |
 | `experiment_ledger` | append-only generated-candidate ledger for lineage, trial budgets, false-discovery evidence, redundancy checks, and promotion decisions |
+
+`GET /api/system/competition` and `GET /api/operator/competition` are route
+aliases for the same competition read model. The snapshot path normalizes
+legacy `champion_assignments` and `model_competition_rankings` shapes before
+strict reads, falls back to persisted ranking rows when the runtime-meta cache
+is empty, and labels a truly empty competition store as
+`ok:true, status:"empty", reason:"no_competition_data"` instead of surfacing a
+database `OperationalError`.
 
 ### Decisions And Alerts Tables
 
@@ -556,7 +572,7 @@ This is the main warning/attention table for operators and policy layers.
 
 ### `alert_acks`, `alert_shelves`, and `alert_lifecycle_events`
 
-These tables record operator alert lifecycle actions without treating the alert row itself as the only source of lifecycle truth.
+These tables record operator alert lifecycle actions without treating the alert row itself as the only source of lifecycle truth. A lifecycle row must reference an existing `alerts.id`; acknowledgement, shelving, and resolution mutations reject unknown alert ids with `404 not_found` before writing, and migration `0078_alert_lifecycle_orphan_cleanup` removes legacy orphan lifecycle rows.
 
 | Table | Column | Meaning |
 | --- | --- | --- |

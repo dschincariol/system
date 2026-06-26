@@ -59,6 +59,13 @@ This is the HTTP/UI boundary and part of runtime orchestration.
 | `_update_startup_trace()` | publishes startup trace updates |
 | `_record_startup_failure()` | publishes startup failure details |
 
+### `engine/dashboard/routing.py`
+
+This owns dashboard route assembly. `filter_route_specs_for_handlers(...)` now
+fails loudly when any advertised `ROUTE_SPECS` entry names a handler that is
+missing or non-callable in `dashboard_server.API_HANDLERS`, preventing silent
+route drops during boot and UI contract validation.
+
 ### `boot/operator_server.js`
 
 This is the local operator control plane and repair proxy.
@@ -496,9 +503,9 @@ This file owns write-side API helpers used by dashboard/operator mutation routes
 
 | Function | What it does |
 | --- | --- |
-| `ack_alert(...)` | writes or refreshes an alert acknowledgement with expiry and lifecycle event |
-| `shelve_alert(...)` | shelves an alert with a required reason and bounded expiry |
-| `resolve_alert(...)` | records alert resolution and lifecycle event |
+| `ack_alert(...)` | writes or refreshes an alert acknowledgement with expiry and lifecycle event; unknown alert ids return `404 not_found` without audit writes |
+| `shelve_alert(...)` | shelves a known alert with a required reason and bounded expiry; unknown alert ids return `404 not_found` without audit writes |
+| `resolve_alert(...)` | records alert resolution and lifecycle event; unknown alert ids return `404 not_found` without audit writes |
 | `write_job_event(...)` | delegates job-history writes to the runtime lock/history subsystem |
 | `set_promotion_enabled(...)` | updates the promotion guard flag |
 

@@ -19,6 +19,8 @@ from engine.runtime.storage import connect as _db_connect, run_write_txn
 
 
 log = logging.getLogger(__name__)
+REPAIR_SCHEMA_CONFIRM_TOKEN = "REPAIR_SCHEMA"
+REPAIR_SCHEMA_ACTION_ID = "operator.repair_schema"
 
 
 ROUTE_SPECS_SELF_REPAIR = [
@@ -59,6 +61,37 @@ def _failure_out(event: str, code: str, error: BaseException, **extra) -> dict:
     return payload
 
 
+def _truthy_confirmation_value(value) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "ack", "confirmed"}
+
+
+def _repair_schema_confirmation_error(body) -> dict | None:
+    payload = body if isinstance(body, dict) else {}
+    actual = str(payload.get("confirmation") or payload.get("confirm") or "").strip()
+    missing = []
+    if actual != REPAIR_SCHEMA_CONFIRM_TOKEN:
+        missing.append("confirmation")
+    if not _truthy_confirmation_value(payload.get("consequence_ack")):
+        missing.append("consequence_ack")
+    if not missing:
+        return None
+    return {
+        "ok": False,
+        "error": "confirmation_required",
+        "required_confirm": REPAIR_SCHEMA_CONFIRM_TOKEN,
+        "required_token": REPAIR_SCHEMA_CONFIRM_TOKEN,
+        "required_fields": missing,
+        "action_id": REPAIR_SCHEMA_ACTION_ID,
+        "severity": "high",
+        "consequence": "Runs schema repair against runtime storage.",
+        "meta": {"status": 422},
+    }
+
+
 def api_get_runtime_health(_parsed, ctx=None):
     from engine.api.api_system import api_get_runtime_health as _impl
 
@@ -72,7 +105,10 @@ def api_get_trading_readiness(_parsed, ctx=None):
 
 
 def api_post_repair_schema(_parsed=None, body=None, ctx=None):
-    del _parsed, body, ctx
+    del _parsed, ctx
+    confirmation_error = _repair_schema_confirmation_error(body)
+    if confirmation_error is not None:
+        return confirmation_error
     try:
         from engine.runtime.jobs.repair_schema import run as repair_schema
 

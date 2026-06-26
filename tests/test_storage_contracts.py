@@ -44,6 +44,7 @@ _POST_BOOTSTRAP_STORAGE_HELPERS = (
     "_ensure_options_symbol_ingestion_state_schema",
     "_ensure_insider_transactions_schema",
     "_ensure_congressional_trades_schema",
+    "_ensure_weather_schema",
 )
 
 _EXTERNAL_SCHEMA_MODULES = (
@@ -1148,6 +1149,64 @@ def test_init_db_rebuilds_prices_extra_json_drift_to_owned_contract(storage_runt
     assert row == (4002, "IWM", 202.5, 202.5, "legacy_feed")
 
 
+def test_init_db_repairs_legacy_events_for_normalized_options_dq(storage_runtime) -> None:
+    storage = storage_runtime["storage"]
+    db_path = storage_runtime["db_path"]
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute(
+            """
+            CREATE TABLE events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts_ms INTEGER NOT NULL,
+              timestamp INTEGER,
+              event_type TEXT,
+              symbol TEXT,
+              source TEXT,
+              title TEXT,
+              body TEXT,
+              url TEXT,
+              event_key TEXT,
+              importance_score REAL,
+              meta_json TEXT
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO events(ts_ms, timestamp, event_type, symbol, source, title, event_key, meta_json)
+            VALUES (5001, 5001, 'legacy', 'SPY', 'legacy', 'legacy event', 'legacy:5001', '{}')
+            """
+        )
+
+    storage.init_db()
+
+    actual_columns = _table_columns(db_path, "events")
+    for column_name in (
+        "raw_payload",
+        "derived_features",
+        "source_id",
+        "dedupe_hash",
+        "event_key",
+        "ts_ms",
+    ):
+        assert column_name in actual_columns
+
+    assert "ux_events_event_key_ts_ms" in _actual_indexes(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        index_columns = [
+            str(row[2])
+            for row in con.execute("PRAGMA index_info(ux_events_event_key_ts_ms)").fetchall()
+        ]
+        row = con.execute(
+            "SELECT raw_payload, derived_features, source_id, dedupe_hash FROM events WHERE event_key=?",
+            ("legacy:5001",),
+        ).fetchone()
+
+    assert index_columns == ["event_key", "ts_ms"]
+    assert row == (None, None, None, None)
+
+
 def test_init_db_rebuilds_legacy_price_quotes_raw_schema(storage_runtime) -> None:
     storage = storage_runtime["storage"]
     db_path = storage_runtime["db_path"]
@@ -1490,9 +1549,9 @@ def test_db_validation_snapshot_public_shape_golden(initialized_storage) -> None
         "schema_version_ok": True,
         "schema_status": "applied",
         "quick_check": "skipped",
-        "required_table_count": 40,
+        "required_table_count": 41,
         "required_index_count": 82,
-        "have_table_count": 131,
+        "have_table_count": 135,
         "owned_tables": [
             "prices",
             "price_quotes",

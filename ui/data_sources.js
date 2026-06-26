@@ -7,6 +7,26 @@
 */
 
 import { requestConfirmation } from "./confirmation_modal.mjs";
+import {
+  emptyStateHtml,
+  loadingStateHtml,
+  stateBlockHtml,
+  summarizeOperatorError,
+  technicalDetailsHtml
+} from "./state_presenter.js";
+import {
+  guidanceListHtml,
+  statusPillHtml,
+} from "./utils.js";
+import {
+  applyOperationalContextToUrl,
+  clearOperationalContext,
+  getOperationalContext,
+  hasOperationalContext,
+  initOperationalContext,
+  operationalContextSummary,
+  updateOperationalContext,
+} from "./symbol_context.mjs";
 
 const SESSION_STORAGE_KEY = "dataSourceControlPlaneSession";
 
@@ -18,6 +38,7 @@ const state = {
   runtime: {},
   auth: {},
   selectedKey: "",
+  launchSourceKey: "",
   refreshTimer: null,
   editingKey: "",
   editingSource: null,
@@ -66,12 +87,12 @@ function flash(message, isError = false) {
 
 function statusPill(source) {
   const status = String(source.status || "unknown").toLowerCase();
-  if (status === "ok" || status === "tested") return `<span class="pill ok">${esc(status)}</span>`;
-  if (status === "needs_credentials") return `<span class="pill err">needs credentials</span>`;
-  if (status === "test_degraded") return `<span class="pill warn">${esc(status)}</span>`;
-  if (status === "error" || status === "test_failed") return `<span class="pill err">${esc(status)}</span>`;
-  if (status === "test_unsupported") return `<span class="pill dim">${esc(status)}</span>`;
-  return `<span class="pill dim">${esc(status)}</span>`;
+  if (status === "ok" || status === "tested") return statusPillHtml(status, "ok");
+  if (status === "needs_credentials") return statusPillHtml("needs credentials", "crit");
+  if (status === "test_degraded") return statusPillHtml(status, "warn");
+  if (status === "error" || status === "test_failed") return statusPillHtml(status, "crit");
+  if (status === "test_unsupported") return statusPillHtml(status, "unavailable");
+  return statusPillHtml(status, "neutral");
 }
 
 function runnableStateLabel(value) {
@@ -99,11 +120,75 @@ function runnableStateTone(value) {
 
 function runnableStatePill(source) {
   const runtimeState = String(source?.runnable_state || "off").toLowerCase();
-  return `<span class="pill ${esc(runnableStateTone(runtimeState))}">${esc(runnableStateLabel(runtimeState))}</span>`;
+  return statusPillHtml(runnableStateLabel(runtimeState), runnableStateTone(runtimeState));
 }
 
 function queryParam(name) {
   return new URLSearchParams(window.location.search).get(name) || "";
+}
+
+function initialSourceKeyFromUrl() {
+  const direct = String(queryParam("source_key") || "").trim();
+  if (direct) return direct;
+  const legacy = String(queryParam("source") || "").trim();
+  if (!legacy || ["command_palette", "dashboard", "dashboard_nav", "terminal"].includes(legacy)) return "";
+  return legacy;
+}
+
+function initSourceContext() {
+  const context = initOperationalContext({
+    source: "data_sources_url",
+    surface: "data_sources",
+    persistStorage: true,
+  });
+  state.launchSourceKey = context.source_key || initialSourceKeyFromUrl();
+  state.selectedKey = state.launchSourceKey;
+  renderContextBar(context);
+  updateDashboardLink(context);
+}
+
+function sourceContext(sourceKey = state.selectedKey, source = "data_sources_selection") {
+  return updateOperationalContext({
+    source_key: sourceKey,
+    source,
+    surface: "data_sources",
+  }, {
+    persistStorage: true,
+    persistUrl: !!sourceKey,
+  });
+}
+
+function renderContextBar(context = getOperationalContext()) {
+  const target = el("activeContext");
+  const clearBtn = el("clearContextBtn");
+  if (!target) return;
+  const hasContext = hasOperationalContext(context);
+  target.innerHTML = `
+    <span class="pill ${hasContext ? "ok" : "dim"}">${esc(operationalContextSummary(context))}</span>
+    <span class="context-note">${hasContext ? "This source context is preserved in links and bookmarks." : "No source context is pinned."}</span>
+  `;
+  if (clearBtn) clearBtn.disabled = !hasContext;
+}
+
+function updateDashboardLink(context = getOperationalContext()) {
+  const link = el("dashboardLink");
+  if (!link) return;
+  const url = new URL("/ui/dashboard.html", window.location.origin);
+  url.searchParams.set("screen", "data");
+  link.href = applyOperationalContextToUrl(url.toString(), context);
+}
+
+function clearSourceContext() {
+  const context = clearOperationalContext({
+    source: "data_sources_clear",
+    surface: "data_sources",
+    persistStorage: true,
+    persistUrl: true,
+  });
+  state.launchSourceKey = "";
+  renderContextBar(context);
+  updateDashboardLink(context);
+  flash("Cross-surface source context cleared.");
 }
 
 function saveSession() {
@@ -133,7 +218,9 @@ function loadSession() {
 function renderSession() {
   el("actorInput").value = state.session.actor;
   el("tokenInput").value = state.session.token;
-  const tokenRequired = !!state.auth.token_required;
+  const tokenRequired = state.auth.mutation_token_required !== undefined
+    ? !!state.auth.mutation_token_required
+    : !!state.auth.token_required;
   const actorValue = state.session.actor.trim() || "operator";
   el("sessionNote").textContent = tokenRequired
     ? `Mutating requests require X-API-Token. Changes will be attributed to ${actorValue}.`
@@ -197,9 +284,9 @@ function providerAccountTemplateByKey(accountKey) {
 
 function accountStatusPill(account) {
   const status = String(account?.status || "empty").toLowerCase();
-  if (status === "configured") return `<span class="pill ok">configured</span>`;
-  if (status === "error") return `<span class="pill err">error</span>`;
-  return `<span class="pill dim">${esc(status || "empty")}</span>`;
+  if (status === "configured") return statusPillHtml("configured", "ok");
+  if (status === "error") return statusPillHtml("error", "crit");
+  return statusPillHtml(status || "empty", "unavailable");
 }
 
 function guideForSource(source) {
@@ -234,15 +321,15 @@ function isFxDataSource(source, template = null) {
 
 function fxSourceBadge(source, template = null) {
   if (!isFxDataSource(source, template)) return "";
-  return `<span class="pill fx">FX feed</span>`;
+  return statusPillHtml("FX feed", "info", { className: "fx" });
 }
 
 function fxFeedStatusPill(source) {
   const status = String(source?.status || source?.runnable_state || "unknown").toLowerCase();
   const tone = status === "ok" || status === "tested" || status === "healthy"
     ? "ok"
-    : (status.includes("fail") || status === "error" ? "err" : "dim");
-  return `<span class="pill ${tone}">FX status ${esc(status || "unknown")}</span>`;
+    : (status.includes("fail") || status === "error" ? "crit" : "unavailable");
+  return statusPillHtml(`FX status ${status || "unknown"}`, tone);
 }
 
 function deriveSourceState(source, template) {
@@ -442,7 +529,7 @@ function deriveSourceState(source, template) {
 }
 
 function statePill(stateInfo) {
-  return `<span class="pill ${esc(stateInfo.tone || "dim")}">${esc(stateInfo.label || "Unknown")}</span>`;
+  return statusPillHtml(stateInfo.label || "Unknown", stateInfo.tone || "neutral", { className: "sourceStatePill" });
 }
 
 function createTemplates() {
@@ -463,23 +550,64 @@ function renderMetrics(payload) {
   const healthy = sources.filter((row) => deriveSourceState(row, templateForSource(row)).tone === "ok").length;
   const runnable = sources.filter((row) => ["scheduled-waiting", "running", "healthy", "degraded"].includes(String(row.runnable_state || ""))).length;
   const errors = sources.reduce((sum, row) => sum + Number(row.error_count || 0), 0);
+  const blocked = sources.filter((row) => ["err", "crit"].includes(deriveSourceState(row, templateForSource(row)).tone)).length;
+  const waiting = sources.filter((row) => ["warn"].includes(deriveSourceState(row, templateForSource(row)).tone)).length;
+  const setKpi = (id, value, meta, tone) => {
+    const valueEl = el(id);
+    const metaEl = el(`${id}Meta`);
+    const tile = valueEl ? valueEl.closest(".opsKpiTile") : null;
+    if (valueEl) valueEl.textContent = String(value);
+    if (metaEl) metaEl.textContent = String(meta || "-");
+    if (tile) {
+      tile.dataset.status = tone;
+      tile.setAttribute("aria-label", `${valueEl?.previousElementSibling?.textContent || id}: ${value}. ${meta || ""}`);
+    }
+  };
+
+  const totalTone = sources.length ? (blocked ? "warn" : "ok") : "unavailable";
+  const runnableTone = !sources.length
+    ? "unavailable"
+    : enabled === 0
+      ? "warn"
+      : runnable === enabled
+        ? "ok"
+        : runnable > 0
+          ? "warn"
+          : "crit";
+  const healthyTone = !sources.length
+    ? "unavailable"
+    : healthy === sources.length
+      ? "ok"
+      : healthy > 0
+        ? "warn"
+        : (enabled > 0 ? "crit" : "unavailable");
+  const errorTone = errors > 0 ? "crit" : (sources.length ? "ok" : "unavailable");
+
   el("metricTotal").textContent = String(sources.length);
   el("metricEnabled").textContent = `${enabled} / ${runnable}`;
   el("metricHealthy").textContent = String(healthy);
   el("metricErrors").textContent = String(errors);
+  setKpi("metricTotal", sources.length, blocked ? `${blocked} blocked source${blocked === 1 ? "" : "s"}` : `${waiting} degraded/waiting`, totalTone);
+  setKpi("metricEnabled", `${enabled} / ${runnable}`, `${enabled} enabled · ${runnable} runnable`, runnableTone);
+  setKpi("metricHealthy", healthy, `${sources.length ? Math.round((healthy / sources.length) * 100) : 0}% of configured sources`, healthyTone);
+  setKpi("metricErrors", errors, errors ? "inspect source cards and logs" : "no accumulated source errors", errorTone);
 }
 
 function selectSource(sourceKey) {
   state.selectedKey = String(sourceKey || "");
+  const context = sourceContext(state.selectedKey);
   renderTable();
   renderSourceCards();
   renderDetail();
+  renderContextBar(context);
+  updateDashboardLink(context);
   if (state.selectedKey) loadLogs();
 }
 
 function renderOverview() {
   const target = el("actionCenter");
   const quickGuide = el("quickGuide");
+  const actionCenterState = el("actionCenterState");
   const actionRows = state.sources
     .map((source) => ({
       source,
@@ -493,8 +621,22 @@ function renderOverview() {
 
   const urgent = actionRows.filter((row) => row.stateInfo.priority <= 2).slice(0, 4);
   const nextActions = urgent.length ? urgent : actionRows.slice(0, 3);
+  const actionTone = urgent.some((row) => row.stateInfo.tone === "err" || row.stateInfo.tone === "crit")
+    ? "crit"
+    : urgent.length
+      ? "warn"
+      : actionRows.length
+        ? "ok"
+        : "unavailable";
+  if (actionCenterState) {
+    actionCenterState.outerHTML = statusPillHtml(
+      urgent.length ? `${urgent.length} urgent` : actionRows.length ? "ready" : "empty",
+      actionTone,
+      { id: "actionCenterState" }
+    );
+  }
   target.innerHTML = nextActions.map((row) => `
-    <div class="action-item">
+    <div class="action-item opsActionItem">
       <div class="action-item-head">
         <div>
           <div class="action-item-title">${esc(row.source.display_name)}</div>
@@ -507,25 +649,34 @@ function renderOverview() {
         <button class="btn-secondary action-open-btn" data-key="${esc(row.source.source_key)}">Open Source</button>
       </div>
     </div>
-  `).join("") || `<div class="empty">No sources available.</div>`;
+  `).join("") || emptyStateHtml("configured", {
+    message: "No data sources are configured.",
+    action: "Add an RSS feed or load the built-in source catalog, then refresh.",
+    compact: true,
+  });
   target.querySelectorAll(".action-open-btn").forEach((button) => {
     button.addEventListener("click", () => selectSource(button.getAttribute("data-key") || ""));
   });
 
-  quickGuide.innerHTML = `
-    <div class="quick-list">
-      <div class="quick-item">1. Look at the recommended next step on the left. The page highlights the most urgent source setup or recovery task first.</div>
-      <div class="quick-item">2. Click a source card below to see plain-language setup instructions, test status, and the right recovery action.</div>
-      <div class="quick-item">3. Use only this page for source credentials, source settings, testing, enabling, disabling, and resets.</div>
-    </div>
-  `;
+  quickGuide.innerHTML = guidanceListHtml([
+    urgent.length
+      ? "Resolve urgent credential, failed, or degraded source rows before treating feeds as production-ready."
+      : "Review the recommended source row before changing feed configuration.",
+    "Open a source card to inspect setup instructions, test status, runtime telemetry, and recovery action.",
+    "Use this page for source credentials, source settings, testing, enabling, disabling, and resets.",
+  ]);
 }
 
 function renderProviderAccounts() {
   const target = el("providerAccounts");
   if (!target) return;
   if (!state.providerAccounts.length) {
-    target.innerHTML = `<div class="empty">No provider accounts are defined.</div>`;
+    target.innerHTML = emptyStateHtml("configured", {
+      message: "No provider accounts are defined.",
+      why: "Shared provider credentials cannot be inherited until an account exists.",
+      action: "Create a provider account only when multiple feeds should share credentials.",
+      compact: true,
+    });
     return;
   }
   target.innerHTML = state.providerAccounts.map((account) => {
@@ -572,7 +723,11 @@ function renderSourceCards() {
   const target = el("sourceCards");
   if (!target) return;
   if (!state.sources.length) {
-    target.innerHTML = `<div class="empty">No sources configured.</div>`;
+    target.innerHTML = emptyStateHtml("configured", {
+      message: "No sources are configured.",
+      action: "Add an RSS feed or restore the built-in source catalog, then refresh.",
+      compact: true,
+    });
     return;
   }
   const orderedSources = [...state.sources].sort((a, b) => {
@@ -615,7 +770,11 @@ function renderSourceCards() {
 function renderTable() {
   const body = el("sourcesBody");
   if (!state.sources.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">No sources configured.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7">${emptyStateHtml("configured", {
+      message: "No sources are configured.",
+      action: "Add a source before using the inventory table.",
+      compact: true,
+    })}</td></tr>`;
     return;
   }
   body.innerHTML = state.sources.map((source) => `
@@ -705,15 +864,52 @@ function testStatusTone(result) {
   return "dim";
 }
 
+function renderLiveFeedWarning(result) {
+  if (!result || result.live_market_data_ok !== false) return "";
+  const status = String(result.live_feed_status || result.classification || "not_live").trim();
+  const reason = String(result.live_feed_reason || result.message || "").trim();
+  const missing = (result.missing_credential_env_vars || result.missing_env_vars || [])
+    .map((name) => String(name || "").trim())
+    .filter(Boolean);
+  const missingText = missing.length ? `Missing credentials: ${missing.join(", ")}` : "No live credentialed provider succeeded.";
+  return `
+    <div class="live-feed-warning">
+      <strong>Not live market data</strong><br>
+      Status: ${esc(status || "not_live")}<br>
+      ${esc(missingText)}${reason ? `<br>Reason: ${esc(reason)}` : ""}
+    </div>
+  `;
+}
+
 function renderEvidence(evidence) {
   const entries = Object.entries(evidence || {});
   if (!entries.length) return "No evidence returned.";
   return entries.map(([key, value]) => {
-    const rendered = typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+    const primitive = value === null || ["string", "number", "boolean"].includes(typeof value);
+    const rendered = primitive
       ? String(value)
-      : JSON.stringify(value);
-    return `<div class="evidence-row"><span class="mono">${esc(key)}</span><span>${esc(rendered)}</span></div>`;
+      : summarizeStructuredValue(value);
+    return `
+      <div class="evidence-row">
+        <span class="mono">${esc(key)}</span>
+        <div>
+          ${esc(rendered)}
+          ${primitive ? "" : technicalDetailsHtml(value, { summary: "Technical details", className: "evidence-technical-details" })}
+        </div>
+      </div>
+    `;
   }).join("");
+}
+
+function summarizeStructuredValue(value) {
+  if (Array.isArray(value)) return `${value.length} item(s) returned`;
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value);
+    return keys.length
+      ? `${keys.length} field(s): ${keys.slice(0, 4).join(", ")}${keys.length > 4 ? ", ..." : ""}`
+      : "empty object";
+  }
+  return String(value ?? "");
 }
 
 function contractTone(value) {
@@ -739,7 +935,8 @@ function renderPopulateEvidencePanel(source) {
         Latest: ${esc(fmtTs(evidence.latest_ts_ms))}<br>
         Latency: ${esc(fmtAgeMs(evidence.latency_ms))}<br>
         Stale/gap: ${esc(evidence.stale_gap_status || "not checked")}<br>
-        Missing/nulls: ${esc(JSON.stringify(evidence.missing_null_counts || {}))}<br>
+        Missing/nulls: ${esc(summarizeStructuredValue(evidence.missing_null_counts || {}))}<br>
+        ${technicalDetailsHtml(evidence.missing_null_counts || {}, { summary: "Technical details", className: "evidence-technical-details" })}
         Duplicate drops: ${esc(evidence.duplicate_drops || 0)}${evidence.error ? `<br>Error: ${esc(evidence.error)}` : ""}
         <div class="evidence-list">${renderEvidence(providerEvidence)}</div>
       </div>
@@ -772,6 +969,7 @@ function renderTestResultPanel(source) {
         <span class="pill ${tone}">${esc(result.status || "unknown")}</span>
         <span class="pill dim">${esc(result.classification || "unclassified")}</span><br>
         ${esc(result.message || result.error || "No message returned.")}
+        ${renderLiveFeedWarning(result)}
         <div class="evidence-list">${renderEvidence(result.evidence || {})}</div>
         <div class="next-steps">${nextSteps}</div>
       </div>
@@ -808,7 +1006,13 @@ function renderDetail() {
   const source = selectedSource();
   const pane = el("detailPane");
   if (!source) {
-    pane.innerHTML = `<div class="empty">Select a source to inspect health, schema, telemetry, and logs.</div>`;
+    pane.innerHTML = emptyStateHtml("active", {
+      title: "No source selected",
+      message: "Select a source to inspect health, schema, telemetry, and logs.",
+      why: "The detail pane needs an active source before it can render runtime context.",
+      action: "Choose a source card or inventory row.",
+      compact: false,
+    });
     return;
   }
 
@@ -913,11 +1117,11 @@ function renderDetail() {
           </div>
           <div class="detail-block">
             <div class="detail-label">Masked Credentials</div>
-            <pre class="mono">${esc(JSON.stringify(source.masked_credentials || {}, null, 2))}</pre>
+            ${technicalDetailsHtml(source.masked_credentials || {}, { summary: "Technical details" })}
           </div>
           <div class="detail-block">
             <div class="detail-label">Settings</div>
-            <pre class="mono">${esc(JSON.stringify(source.settings || {}, null, 2))}</pre>
+            ${technicalDetailsHtml(source.settings || {}, { summary: "Technical details" })}
           </div>
           <div class="detail-block">
             <div class="detail-label">Template Policy</div>
@@ -934,7 +1138,7 @@ function renderDetail() {
       <div class="card-head card-inline-head">
         <h2>Source Logs</h2>
       </div>
-      <div class="logs" id="detailLogs"><div class="empty">Loading logs...</div></div>
+      <div class="logs" id="detailLogs">${loadingStateHtml("Loading source logs.", { compact: true })}</div>
     </div>
   `;
 
@@ -957,12 +1161,18 @@ async function loadLogs() {
   const source = selectedSource();
   const target = el("detailLogs");
   if (!source || !target) return;
-  target.innerHTML = `<div class="empty">Loading logs...</div>`;
+  target.innerHTML = loadingStateHtml("Loading source logs.", { compact: true });
   try {
     const payload = await request(`/api/data_sources/logs?source_key=${encodeURIComponent(source.source_key)}&limit=80`);
     const logs = payload.logs || [];
     if (!logs.length) {
-      target.innerHTML = `<div class="empty">No logs for this source yet.</div>`;
+      target.innerHTML = emptyStateHtml("active", {
+        title: "No source logs yet",
+        message: "This source has not emitted logs in the requested window.",
+        why: "The source may be idle, newly configured, or not yet scheduled.",
+        action: "Run Test Connection or Populate Now if you expected activity.",
+        compact: true,
+      });
       return;
     }
     const logState = payload.runnable_state || source.runnable_state || "off";
@@ -979,7 +1189,15 @@ async function loadLogs() {
       </div>
     `).join("");
   } catch (error) {
-    target.innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+    target.innerHTML = stateBlockHtml({
+      state: "error",
+      title: "Source logs unavailable",
+      message: summarizeOperatorError(error, "Source logs could not be loaded."),
+      why: "Recent source activity and provider errors are not visible in this pane.",
+      action: "Refresh the page; if it repeats, inspect the data-source logs route.",
+      details: error,
+      compact: true,
+    });
   }
 }
 
@@ -992,8 +1210,25 @@ async function refreshSources({ preserveSelection = true } = {}) {
   state.runtime = payload.runtime || {};
   state.auth = payload.auth || {};
   renderSession();
-  if (!preserveSelection || !state.sources.some((row) => String(row.source_key) === String(state.selectedKey))) {
+  const previousSelectedKey = state.selectedKey;
+  const requestedKey = preserveSelection ? "" : (state.launchSourceKey || initialSourceKeyFromUrl());
+  const requestedSource = requestedKey
+    ? state.sources.find((row) => String(row.source_key || "").trim() === requestedKey)
+    : null;
+  let context = getOperationalContext();
+  if (requestedSource) {
+    state.selectedKey = String(requestedSource.source_key || "");
+    context = sourceContext(state.selectedKey, "data_sources_url");
+  } else if (!preserveSelection || !state.sources.some((row) => String(row.source_key) === String(state.selectedKey))) {
     state.selectedKey = state.sources.length ? String(state.sources[0].source_key) : "";
+    if (requestedKey || previousSelectedKey) {
+      context = clearOperationalContext({
+        source: "data_sources_missing_source",
+        surface: "data_sources",
+        persistStorage: true,
+        persistUrl: true,
+      });
+    }
   }
   renderMetrics(payload);
   renderOverview();
@@ -1001,6 +1236,8 @@ async function refreshSources({ preserveSelection = true } = {}) {
   renderSourceCards();
   renderTable();
   renderDetail();
+  renderContextBar(context);
+  updateDashboardLink(context);
   if (state.selectedKey) loadLogs();
 }
 
@@ -1166,7 +1403,13 @@ function renderCredentialEditors(template, source) {
   const target = el("credentialsFields");
   const clearTarget = el("clearCredentials");
   if (!fields.length) {
-    target.innerHTML = `<div class="empty">No credentials are required for this template.</div>`;
+    target.innerHTML = emptyStateHtml("configured", {
+      title: "No credentials required",
+      message: "This template does not define credential fields.",
+      why: "The source can be configured without storing provider secrets.",
+      action: "Review settings, then save or test the source.",
+      compact: true,
+    });
     clearTarget.innerHTML = "";
     return;
   }
@@ -1198,7 +1441,13 @@ function renderAccountCredentialEditors(account, template) {
   const target = el("accountCredentialsFields");
   const clearTarget = el("clearAccountCredentials");
   if (!fields.length) {
-    target.innerHTML = `<div class="empty">No account credential fields are defined.</div>`;
+    target.innerHTML = emptyStateHtml("configured", {
+      title: "No account credentials required",
+      message: "This provider account schema does not define credential fields.",
+      why: "There are no shared credentials to edit for this account.",
+      action: "Close the editor or update account metadata outside this credential form.",
+      compact: true,
+    });
     clearTarget.innerHTML = "";
     return;
   }
@@ -1253,7 +1502,13 @@ function renderSettingEditors(template, source) {
   const fields = (template && template.setting_fields) || [];
   const target = el("settingsFields");
   if (!fields.length) {
-    target.innerHTML = `<div class="empty">No structured settings are defined for this template.</div>`;
+    target.innerHTML = emptyStateHtml("configured", {
+      title: "No settings required",
+      message: "This template does not define structured settings.",
+      why: "There are no optional runtime settings to edit here.",
+      action: "Save credentials or run Test Connection if the source is otherwise configured.",
+      compact: true,
+    });
     return;
   }
   const sourceSettings = (source && source.settings) || {};
@@ -1508,7 +1763,7 @@ async function testSource(sourceKey) {
   state.lastTestResults[String(sourceKey)] = result;
   const status = String(result.status || (result.ok ? "pass" : "fail"));
   const classification = String(result.classification || "");
-  flash(`${status}: ${result.message || result.error || "Test completed."}${classification ? ` (${classification})` : ""}`, status === "fail");
+  flash(`${status}: ${result.message || result.error || "Test completed."}${classification ? ` (${classification})` : ""}`, result.ok !== true);
   await refreshSources();
 }
 
@@ -1597,7 +1852,7 @@ async function resetSourceCredentials(source, template) {
 
 function wireEvents() {
   el("addSourceBtn").addEventListener("click", () => openModal());
-  el("refreshBtn").addEventListener("click", () => refreshSources().catch((error) => flash(error.message, true)));
+  el("refreshBtn").addEventListener("click", () => refreshSources().catch((error) => flash(summarizeOperatorError(error, "Refresh failed."), true)));
   el("modalCloseBtn").addEventListener("click", closeModal);
   el("modalCancelBtn").addEventListener("click", closeModal);
   el("modalForm").addEventListener("submit", saveSource);
@@ -1625,22 +1880,27 @@ function wireEvents() {
     saveSession();
     flash("API token cleared.");
   });
+  const clearContextBtn = el("clearContextBtn");
+  if (clearContextBtn) {
+    clearContextBtn.addEventListener("click", clearSourceContext);
+  }
 }
 
 async function boot() {
   loadSession();
+  initSourceContext();
   wireEvents();
   renderSession();
   await refreshSources({ preserveSelection: false });
   state.refreshTimer = window.setInterval(() => {
     refreshSources().catch((error) => {
-      flash(error.message, true);
+      flash(summarizeOperatorError(error, "Refresh failed."), true);
     });
   }, 15000);
 }
 
 window.addEventListener("DOMContentLoaded", () => {
   boot().catch((error) => {
-    flash(error.message, true);
+    flash(summarizeOperatorError(error, "Data-source page failed to initialize."), true);
   });
 });

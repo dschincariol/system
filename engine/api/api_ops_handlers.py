@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 
 from engine.runtime.gates import execution_gate_snapshot
+from engine.api.degradation import degraded_missing_table_read, is_missing_table_error
 from engine.api.http_parsing import qs as _qs, deny_if_shutdown
 from engine.runtime.failure_diagnostics import failure_response, log_failure
 from engine.runtime.logging import get_logger
@@ -115,7 +116,7 @@ def api_post_notifications_test(parsed, body=None, ctx=None):
         source = str(payload.get("source") or "dashboard").strip() or "dashboard"
 
         if not channel:
-            return {"ok": False, "error": "missing_channel"}
+            return {"ok": False, "error": "missing_channel", "meta": {"status": 400}}
 
         return send_notification_test(channel, actor=actor, source=source)
     except Exception as e:
@@ -344,6 +345,19 @@ def api_get_execution_advisories(parsed, ctx):
         limit = _parse_int(qs.get("limit", "20") or "20", 20, 1, 200)
         return list_execution_advisories(limit=limit)
     except Exception as e:
+        for table_name in ("execution_ai_advisory", "execution_ai_advisory_actions"):
+            if is_missing_table_error(e, table_name):
+                _warn_nonfatal(
+                    "API_OPS_HANDLERS_EXECUTION_ADVISORIES_TABLE_MISSING",
+                    e,
+                    once_key=f"execution_advisories_missing:{table_name}",
+                    table=table_name,
+                )
+                return degraded_missing_table_read(
+                    table_name,
+                    items=[],
+                    summary={"count": 0, "high_urgency": 0, "approved": 0, "rejected": 0},
+                )
         payload = _failure_out(
             "api_ops_handlers_execution_advisories_failed",
             "API_OPS_HANDLERS_EXECUTION_ADVISORIES_FAILED",
@@ -351,6 +365,7 @@ def api_get_execution_advisories(parsed, ctx):
             items=[],
             summary={},
         )
+        payload["error"] = "execution_advisories_failed"
         return payload
 
 def api_get_social_features(parsed, ctx):

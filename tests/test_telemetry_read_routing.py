@@ -244,6 +244,8 @@ class TelemetryReadRoutingTests(unittest.TestCase):
         self.assertIn("unit-test", str(created[0].kwargs["conninfo"]))
         self.assertEqual(created[0].kwargs["min_size"], 1)
         self.assertEqual(created[0].kwargs["max_size"], 3)
+        self.assertIs(created[0].kwargs["check"], router._check_timescale_read_connection)
+        self.assertIs(created[0].kwargs["reset"], router._reset_timescale_read_connection)
         self.assertEqual(created[0].open_calls, [(True, 0.2)])
         self.assertEqual(created[0].getconn_calls, [0.2, 0.2])
         self.assertEqual(len(created[0].putconn_calls), 2)

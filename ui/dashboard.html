@@ -17,51 +17,13 @@
 
 
     :root{
-  /* Motion system (ops-safe) */
-  --m-fast: 120ms;
-  --m-med: 180ms;
-  --m-slow: 260ms;
-  --ease-out: cubic-bezier(.22,.61,.36,1);
-      --bg: #0e1117;
-      --panel: #0b0f15;
-      --panel2:#0a0d12;
-      --text:#e6edf3;
-      --muted:#9da7b3;
-      --border:#30363d;
-      --chip:#0e1117;
-      --btn:#161b22;
-
-      --status-neutral:#A7B0BC;
-      --status-info:#56B4E9;
-      --status-ok:#009E73;
-      --status-warn:#E69F00;
-      --status-high:#CC79A7;
-      --status-crit:#D55E00;
-      --status-blocked:#73B7E6;
-      --status-unavailable:#8B949E;
-      --status-neutral-bg:rgba(167,176,188,.13);
-      --status-info-bg:rgba(86,180,233,.14);
-      --status-ok-bg:rgba(0,158,115,.14);
-      --status-warn-bg:rgba(230,159,0,.15);
-      --status-high-bg:rgba(204,121,167,.15);
-      --status-crit-bg:rgba(213,94,0,.16);
-      --status-blocked-bg:rgba(115,183,230,.16);
-      --status-unavailable-bg:rgba(139,148,158,.13);
-
-      --ok:var(--status-ok);
-      --warn:var(--status-warn);
-      --crit:var(--status-crit);
-      --info:var(--status-info);
-
-      --r: 14px;
-      --r2: 10px;
-      --shadow: 0 10px 24px rgba(0,0,0,.30);
+      /* Canonical tokens are owned by /ui/base.css. */
     }
 
     * { box-sizing: border-box; }
     html, body { height: 100%; }
     body {
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-family: var(--font-sans);
       background: var(--bg);
       color: var(--text);
       margin: 0;
@@ -183,7 +145,7 @@
   display:flex;
   gap:18px;
   align-items:center;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size:12px;
   background: var(--panel2);
   border:1px solid var(--border);
@@ -645,8 +607,8 @@
   border-color: var(--status-unavailable);
   border-style: dotted;
 }
-    .pill.acked{ background:#6e7681; color:#fff; border-color: rgba(0,0,0,.25); }
-    .pill.resolved { background:#444; color:#ddd; border-color: rgba(0,0,0,.25); }
+    .pill.acked{ background:var(--status-neutral); color:var(--surface-contrast); border-color: rgba(0,0,0,.25); }
+    .pill.resolved { background:var(--surface-chip); color:var(--text-secondary); border-color: rgba(0,0,0,.25); }
 
     @keyframes critPulse {
   0%   { box-shadow: 0 0 0 rgba(213,94,0,0); }
@@ -781,7 +743,7 @@ body.mode-expert .operatorOnly { display:none !important; }
 
     .hmHead{
       font-weight: 800;
-      background: #0b0f15;
+      background: var(--surface-panel);
       position: sticky;
       top: 0;
       z-index: 1;
@@ -811,6 +773,46 @@ body.mode-expert .operatorOnly { display:none !important; }
       flex-direction:column;
       gap:10px;
       margin-top: 12px;
+    }
+
+    .alertLifecycleSummary{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+      gap:8px;
+      margin-top:10px;
+    }
+    .alertSummaryTile{
+      border:1px solid rgba(48,54,61,.6);
+      border-radius:8px;
+      padding:8px 9px;
+      background: rgba(255,255,255,.025);
+      min-height:72px;
+      display:flex;
+      flex-direction:column;
+      justify-content:space-between;
+    }
+    .alertSummaryTile[data-tone="crit"]{ border-color:var(--crit); background:var(--status-crit-bg); }
+    .alertSummaryTile[data-tone="high"]{ border-color:var(--status-high); background:var(--status-high-bg); }
+    .alertSummaryTile[data-tone="warn"]{ border-color:var(--warn); background:var(--status-warn-bg); }
+    .alertSummaryTile[data-tone="info"]{ border-color:var(--status-info); background:var(--status-info-bg); }
+    .alertSummaryTile[data-tone="ok"]{ border-color:var(--ok); background:var(--status-ok-bg); }
+    .alertSummaryLabel{
+      color:var(--muted);
+      font-size:11px;
+      font-weight:800;
+      text-transform:uppercase;
+      letter-spacing:.04em;
+    }
+    .alertSummaryValue{
+      font-size:22px;
+      line-height:1;
+      font-weight:950;
+      margin-top:4px;
+    }
+    .alertSummaryDetail{
+      color:var(--muted);
+      font-size:11px;
+      margin-top:4px;
     }
 
 .incidentItem{
@@ -893,12 +895,19 @@ body.mode-expert .operatorOnly { display:none !important; }
       gap:8px;
       flex-wrap:wrap;
     }
+    .incidentAction{
+      color:var(--text);
+      align-items:flex-start;
+    }
+    .incidentState{
+      white-space:nowrap;
+    }
     canvas.spark{
       width: 86px;
       height: 18px;
       border: 1px solid rgba(48,54,61,.55);
       border-radius: 8px;
-      background: #0b0f15;
+      background: var(--surface-panel);
     }
 
     @keyframes incidentIn {
@@ -928,7 +937,7 @@ body.mode-expert .operatorOnly { display:none !important; }
   right:0;
   height:100%;
   width:min(520px, 92vw);
-  background: #0b0f15;
+  background: var(--surface-panel);
   border-left: 1px solid var(--border);
   box-shadow: -18px 0 40px rgba(0,0,0,.55);
   padding: 14px;
@@ -944,7 +953,7 @@ body.mode-expert .operatorOnly { display:none !important; }
       position: sticky;
       top: 0;
       z-index: 2;
-      background: linear-gradient(to bottom, #0b0f15 85%, rgba(11,15,21,0));
+      background: linear-gradient(to bottom, var(--surface-panel) 85%, rgba(11,15,21,0));
       padding: 8px 0 10px;
       border-bottom: 1px solid rgba(48,54,61,.45);
     }
@@ -972,7 +981,7 @@ body.mode-expert .operatorOnly { display:none !important; }
       font-size: 12px;
     }
     .kvK{ color: var(--muted); }
-    .kvV{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .kvV{ font-family: var(--font-mono); font-size: 12px; }
     .alertLifecycleList{
       list-style:none;
       margin:0;
@@ -995,7 +1004,7 @@ body.mode-expert .operatorOnly { display:none !important; }
       place-items:center;
       font-size:11px;
       font-weight:900;
-      background:#111827;
+      background:var(--surface-input);
     }
     .alertLifecycleMarker.ok{ border-color:var(--ok); color:var(--ok); }
     .alertLifecycleMarker.warn{ border-color:var(--warn); color:var(--warn); border-style:dashed; }
@@ -1068,7 +1077,7 @@ body.mode-expert .operatorOnly { display:none !important; }
 
     /* Text helpers */
     .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-family: var(--font-mono);
       font-size: 12px;
       white-space: pre-wrap;
       opacity: 0.95;
@@ -1278,7 +1287,7 @@ body.mode-expert .operatorOnly { display:none !important; }
     }
     .killSwitchName,
     .killSwitchState {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-family: var(--font-mono);
       font-size: 12px;
       font-weight: 800;
       overflow-wrap: anywhere;
@@ -1388,7 +1397,7 @@ body.mode-expert .operatorOnly { display:none !important; }
   border: 1px solid var(--border);
   border-radius: var(--r2);
   padding: 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   max-height: 240px;
   overflow: auto;
@@ -1657,9 +1666,9 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
     #replayChart{
       width:100%;
       height:280px;
-      border:1px solid #30363d;
+      border:1px solid var(--border-default);
       border-radius:10px;
-      background:#0a0d12;
+      background:var(--surface-panel-muted);
     }
     @media (max-width: 920px){
       .replayControls{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1731,7 +1740,7 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
 
     .postureDot{
       width: 10px; height: 10px; border-radius: 999px;
-      background: #6e7681;
+      background: var(--status-neutral);
       box-shadow: 0 0 0 3px rgba(110,118,129,.15);
     }
     .postureBadge.monitor .postureDot{ background: var(--status-ok); box-shadow: 0 0 0 3px var(--status-ok-bg); }
@@ -1780,7 +1789,7 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
     }
 #btnVoice.isListening::after{
   content: " ●";
-  color: #58a6ff;
+  color: var(--status-info);
   font-weight: 900;
 }
 
@@ -1802,8 +1811,8 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
 .modalInner {
   max-width: 980px;
   margin: 0 auto;
-  background:#0b0f15;
-  border:1px solid #30363d;
+  background:var(--surface-panel);
+  border:1px solid var(--border-default);
   border-radius:12px;
   padding:12px;
 }
@@ -2059,7 +2068,7 @@ tr.symbolContextMatch td{
   flex:0 0 auto;
   min-width:26px;
   text-align:center;
-  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-weight:900;
 }
 .decisionStepperSummary.is-ok{
@@ -2139,7 +2148,7 @@ tr.symbolContextMatch td{
   justify-content:center;
   border:1px solid rgba(255,255,255,.16);
   border-radius:999px;
-  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size:10px;
   font-weight:900;
   line-height:1;
@@ -2170,7 +2179,7 @@ tr.symbolContextMatch td{
 }
 .decisionStepTimestamp{
   margin-top:5px;
-  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size:10px;
 }
 .decisionStepperItem.is-ok .decisionStep{
@@ -2215,7 +2224,7 @@ tr.symbolContextMatch td{
   box-shadow:0 0 0 2px rgba(255,255,255,.10), 0 12px 26px rgba(0,0,0,.28);
 }
 .decisionStepperItem.is-emphasized .decisionStepLabel{
-  color:#fff;
+  color:var(--surface-contrast);
 }
 @media (max-width: 760px){
   .decisionStepper{
@@ -2253,7 +2262,7 @@ tr.symbolContextMatch td{
 }
 .recommendedActionSub{
   margin-top:6px;
-  color:#e6edf3;
+  color:var(--text-primary);
   font-size:13px;
 }
 .recommendedActionReason{
@@ -2388,13 +2397,94 @@ tr.symbolContextMatch td{
   margin-top:6px;
   font-size:14px;
   font-weight:800;
-  color:#e6edf3;
+  color:var(--text-primary);
 }
 .structuredSummaryMeta{
   margin-top:4px;
   font-size:11px;
   color:var(--muted);
   line-height:1.4;
+}
+.uiState{
+  display:flex;
+  gap:10px;
+  min-height:112px;
+  align-items:flex-start;
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:8px;
+  padding:12px;
+  background:rgba(255,255,255,.025);
+  color:var(--text);
+}
+.uiState--compact{
+  min-height:0;
+  padding:10px;
+}
+.uiStateIcon{
+  flex:0 0 28px;
+  width:28px;
+  height:28px;
+  border-radius:999px;
+  display:grid;
+  place-items:center;
+  font-size:11px;
+  font-weight:900;
+  font-family: var(--font-mono);
+  border:1px solid var(--status-unavailable);
+  background:var(--status-unavailable-bg);
+  color:var(--status-unavailable);
+}
+.uiState--loading .uiStateIcon,
+.uiState--empty .uiStateIcon{
+  border-color:var(--status-unavailable);
+  background:var(--status-unavailable-bg);
+  color:var(--status-unavailable);
+}
+.uiState--degraded .uiStateIcon{
+  border-color:var(--status-warn);
+  background:var(--status-warn-bg);
+  color:var(--status-warn);
+}
+.uiState--error .uiStateIcon{
+  border-color:var(--status-crit);
+  background:var(--status-crit-bg);
+  color:var(--status-crit);
+}
+.uiState--ok .uiStateIcon{
+  border-color:var(--status-ok);
+  background:var(--status-ok-bg);
+  color:var(--status-ok);
+}
+.uiStateBody{
+  min-width:0;
+  flex:1 1 auto;
+}
+.uiStateTitle{
+  font-weight:900;
+  font-size:13px;
+}
+.uiStateMessage,
+.uiStateMeta{
+  margin-top:4px;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.4;
+  overflow-wrap:anywhere;
+}
+.uiStateDetails{
+  margin-top:8px;
+}
+.uiStateDetails summary{
+  cursor:pointer;
+  color:var(--muted);
+  user-select:none;
+}
+.uiStateRaw{
+  margin-top:8px;
+  max-height:360px;
+  overflow:auto;
+  white-space:pre-wrap;
+  word-break:break-word;
 }
 .promotionComparisonBars{
   display:grid;
@@ -2548,7 +2638,7 @@ tr.symbolContextMatch td{
   border-radius:10px;
   border:1px solid rgba(255,255,255,.12);
   background:rgba(11,15,21,.92);
-  color:#e6edf3;
+  color:var(--text-primary);
   font-size:12px;
   line-height:1.45;
   box-shadow:0 10px 30px rgba(0,0,0,.28);
@@ -2589,53 +2679,101 @@ tr.symbolContextMatch td{
     <div id="dashboardDegradedBannerDetail" class="opsBannerMeta">Validating health, readiness, and execution safety.</div>
   </div>
 
-<div class="appHeader">
-    <div>
-      <h1 class="appTitle">📊 Market Impact Dashboard</h1>
-      <div class="appSubtitle">Multi-screen ops surface • overview • operate • explain • analyze • data health • positions</div>
-    </div>
-    <div class="appRight">
-      <a class="btn" id="appDataSourcesLink" href="/ui/data_sources.html" title="Open Data Source Control Plane">🧭 Sources</a>
-      <a class="btn" id="appTerminalLink" href="/ui/terminal/terminal.html" title="Open Trading Terminal">⚡ Terminal</a>
-      <a class="btn" id="appOperatorLink" href="/operator/" title="Open Operator Console">🛠 Operator</a>
-      <button class="btn" id="btnCopilotToggle" type="button" aria-expanded="false" aria-controls="copilotPanel">🤖 Copilot</button>
-      <span class="pill dim">UI: <span class="mono">/ui/dashboard.html</span></span>
-      <span class="pill dim">API: <span class="mono">/api/*</span></span>
-    </div>
-</div>
-
 <div id="page-dashboard" class="screenShell">
-  <div class="screenTabs" id="dashboardScreenTabs" aria-label="Dashboard screens">
-    <div class="screenTabGroup">
-      <button class="screenTab is-active" type="button" data-screen-target="overview">Overview</button>
-      <button class="screenTab" type="button" data-screen-target="operate">Operate</button>
-      <button class="screenTab" type="button" data-screen-target="explain">Explain</button>
-      <button class="screenTab" type="button" data-screen-target="analyze">Analyze</button>
-      <button class="screenTab" type="button" data-screen-target="data">Data Health</button>
-      <button class="screenTab" type="button" data-screen-target="positions">Positions</button>
-      <button class="screenTab" type="button" data-screen-target="execution">Execution</button>
-    </div>
-    <div class="screenMeta">
-      Screen: <span id="dashboardScreenLabel" class="mono">overview</span>
-      <label class="personaControl" for="dashboardPersonaSelect">
-        Persona:
-        <select id="dashboardPersonaSelect" class="personaSelect" aria-label="Dashboard persona filter">
-          <option value="operations">Operations</option>
-          <option value="fund_manager">Fund Manager</option>
-          <option value="expert">Expert / All</option>
-        </select>
-      </label>
-      <span class="pill dim">View: <span id="dashboardPersonaLabel" class="mono">Operations</span></span>
-      <span id="operatorWsStatus" class="pill dim meta-pill-offset" title="Operator WebSocket status">
-        <span id="operatorWsDot" aria-hidden="true" style="display:inline-block; width:8px; height:8px; border-radius:999px; background:#6e7681; margin-right:6px; vertical-align:middle;"></span>
-        <span id="operatorWsLabel" class="mono">polling</span>
-      </span>
-    </div>
-  </div>
+  <header class="missionBar" aria-label="Mission-control command surface">
+    <div class="missionBarTop">
+      <div class="missionBrand">
+        <h1 class="appTitle">Market Impact Dashboard</h1>
+        <div class="appSubtitle">
+          <span>Mission control</span>
+          <span>Screen: <span id="dashboardScreenLabel" class="mono">overview</span></span>
+        </div>
+      </div>
 
-  <div id="healthScoreBar" class="healthScoreBar" role="status" aria-live="polite">
+      <div class="missionStateGrid" role="status" aria-live="polite">
+        <div class="missionStateItem">
+          <span class="missionStateQuestion">Can trade?</span>
+          <span id="missionTradePill" class="pill dim">checking</span>
+          <span id="missionTradeDetail" class="missionStateDetail">Waiting for execution barrier and readiness.</span>
+        </div>
+        <div class="missionStateItem">
+          <span class="missionStateQuestion">Should trade?</span>
+          <span id="missionShouldPill" class="pill dim">checking</span>
+          <span id="missionShouldDetail" class="missionStateDetail">Waiting for operator guidance.</span>
+        </div>
+        <div class="missionStateItem">
+          <span class="missionStateQuestion">What changed?</span>
+          <span id="missionChangeText" class="missionStateValue">Waiting for recent decisions.</span>
+          <span id="missionChangeMeta" class="missionStateDetail">No decision timeline loaded.</span>
+        </div>
+        <div class="missionStateItem missionStateItemWide">
+          <span class="missionStateQuestion">Next operator action</span>
+          <span id="missionNextText" class="missionStateValue">Review detailed runtime panels before intervening.</span>
+          <span id="missionNextMeta" class="missionStateDetail">Guidance refresh pending.</span>
+        </div>
+      </div>
+
+      <div class="missionHealthMini" aria-label="Health-score coverage summary">
+        <span id="missionHealthValue" class="missionHealthValue">—</span>
+        <span id="missionHealthBadge" class="pill dim">waiting</span>
+        <span id="missionHealthCoverage" class="pill dim mono">0/4 factors</span>
+      </div>
+    </div>
+
+    <div class="missionBarNav">
+      <div class="screenTabs" id="dashboardScreenTabs" aria-label="Dashboard screens" role="navigation">
+        <div class="screenTabGroup">
+          <button class="screenTab is-active" type="button" data-screen-target="overview">Overview</button>
+          <button class="screenTab" type="button" data-screen-target="operate">Operate</button>
+          <button class="screenTab" type="button" data-screen-target="explain">Explain</button>
+          <button class="screenTab" type="button" data-screen-target="analyze">Analyze</button>
+          <button class="screenTab" type="button" data-screen-target="data">Data Health</button>
+          <button class="screenTab" type="button" data-screen-target="positions">Positions</button>
+          <button class="screenTab" type="button" data-screen-target="execution">Execution</button>
+        </div>
+      </div>
+
+      <div class="missionControls">
+        <label class="personaControl" for="dashboardPersonaSelect">
+          Persona
+          <select id="dashboardPersonaSelect" class="personaSelect" aria-label="Dashboard persona filter">
+            <option value="operations">Operations</option>
+            <option value="fund_manager">Fund Manager</option>
+            <option value="expert">Expert / All</option>
+          </select>
+        </label>
+        <button class="btn btnSmall" id="btnCommandPaletteToggle" type="button" aria-label="Open command palette">
+          <svg class="i"><use href="#i-bolt"></use></svg>
+          Commands
+        </button>
+        <span id="activeContextPill" class="pill dim mono" title="No active cross-surface context">context none</span>
+        <button class="btn btnSmall" id="btnClearContext" type="button" disabled>Clear Context</button>
+        <a class="btn btnSmall" id="appTerminalLink" href="/ui/terminal/terminal.html" title="Open Trading Terminal" data-command-palette="true" data-command-title="Open Trading Terminal" data-command-type="Navigation" data-command-context="Terminal / active symbol context" data-command-keywords="terminal chart order ticket positions fills trading">Terminal</a>
+        <a class="btn btnSmall" id="appOperatorLink" href="/operator/" title="Open Operator Console" data-command-palette="true" data-command-title="Open Operator Console" data-command-type="Navigation" data-command-context="Operator console / incident control" data-command-keywords="operator sidecar incident bridge recovery">Operator</a>
+        <button class="btn btnSmall" id="btnCopilotToggle" type="button" aria-expanded="false" aria-controls="copilotPanel" data-command-palette="true" data-command-title="Toggle Copilot" data-command-type="Panel" data-command-context="Dashboard copilot drawer" data-command-action="click" data-command-keywords="copilot assistant ask incident explain">Copilot</button>
+        <details class="missionOverflow">
+          <summary class="btn btnSmall">More</summary>
+          <div class="missionOverflowMenu">
+            <button class="btn btnSmall" id="btnSaveWorkspace" type="button">Save Workspace</button>
+            <button class="btn btnSmall" id="btnRestoreWorkspace" type="button">Restore Workspace</button>
+            <a class="btn btnSmall" id="appDataSourcesLink" href="/ui/data_sources.html" title="Open Data Source Control Plane" data-command-palette="true" data-command-title="Open Data Sources" data-command-type="Navigation" data-command-context="Data source control plane" data-command-keywords="sources providers credentials feeds ingestion polygon ibkr ccxt">Sources</a>
+            <span class="pill dim">View: <span id="dashboardPersonaLabel" class="mono">Operations</span></span>
+            <span id="operatorWsStatus" class="pill dim meta-pill-offset" title="Operator WebSocket status">
+              <span id="operatorWsDot" aria-hidden="true" style="display:inline-block; width:8px; height:8px; border-radius:999px; background:var(--status-neutral); margin-right:6px; vertical-align:middle;"></span>
+              <span id="operatorWsLabel" class="mono">polling</span>
+            </span>
+            <span class="pill dim">UI: <span class="mono">/ui/dashboard.html</span></span>
+            <span class="pill dim">API: <span class="mono">/api/*</span></span>
+          </div>
+        </details>
+      </div>
+    </div>
+  </header>
+
+  <section class="missionViewport" aria-label="Mission-control first viewport">
+  <div id="healthScoreBar" class="healthScoreBar missionHealthBar" role="status" aria-live="polite">
     <div class="healthScoreLead">
-      <div class="healthScoreKicker">Top-level health</div>
+      <div class="healthScoreKicker">Health confidence</div>
       <div class="healthScoreMain">
         <span id="healthScoreValue" class="healthScoreValue">—</span>
         <span id="healthScoreBadge" class="pill dim">waiting</span>
@@ -2648,11 +2786,34 @@ tr.symbolContextMatch td{
     <div id="healthScoreFactors" class="healthScoreFactors" aria-label="Health score factor breakdown"></div>
   </div>
 
-  <div class="card operatorOverviewCard" id="operatorOverviewCard" data-screens="overview" aria-labelledby="operatorOverviewTitle">
+  <div id="dashboardOpsKpis" class="opsKpiGrid dashboardOpsKpis" data-screens="overview" role="group" aria-label="Operational KPI summary">
+    <div class="opsKpiTile" data-status="unavailable" role="group" aria-label="Runtime unavailable">
+      <span class="opsKpiLabel">Runtime</span>
+      <strong class="opsKpiValue">—</strong>
+      <span class="opsKpiMeta">waiting</span>
+    </div>
+    <div class="opsKpiTile" data-status="unavailable" role="group" aria-label="Execution unavailable">
+      <span class="opsKpiLabel">Execution</span>
+      <strong class="opsKpiValue">—</strong>
+      <span class="opsKpiMeta">waiting</span>
+    </div>
+    <div class="opsKpiTile" data-status="unavailable" role="group" aria-label="Data unavailable">
+      <span class="opsKpiLabel">Data</span>
+      <strong class="opsKpiValue">—</strong>
+      <span class="opsKpiMeta">waiting</span>
+    </div>
+    <div class="opsKpiTile" data-status="unavailable" role="group" aria-label="Alerts unavailable">
+      <span class="opsKpiLabel">Alerts</span>
+      <strong class="opsKpiValue">—</strong>
+      <span class="opsKpiMeta">waiting</span>
+    </div>
+  </div>
+
+  <div class="card operatorOverviewCard missionSurface" id="operatorOverviewCard" data-screens="overview" aria-labelledby="operatorOverviewTitle">
     <div class="operatorOverviewHeader">
       <div>
         <div class="section-kicker">Operator Overview</div>
-        <h2 id="operatorOverviewTitle">At-a-glance runtime state</h2>
+        <h2 id="operatorOverviewTitle">Command state</h2>
       </div>
       <span class="pill dim">read-only</span>
     </div>
@@ -2661,8 +2822,8 @@ tr.symbolContextMatch td{
       <section id="overviewStatusTile" class="overviewTile overviewStatusTile" role="group" aria-label="System status unavailable.">
         <div class="overviewTileTop">
           <div>
-            <div class="overviewTileQuestion">Is the system OK?</div>
-            <div class="overviewTileTitle">System status</div>
+            <div class="overviewTileQuestion">Can the system trade?</div>
+            <div class="overviewTileTitle">Execution posture</div>
           </div>
           <span id="overviewStatusFreshness" class="pill dim mono">Freshness unavailable</span>
         </div>
@@ -2683,7 +2844,7 @@ tr.symbolContextMatch td{
       <section id="overviewDecisionTile" class="overviewTile overviewDecisionTile" role="group" aria-label="Current decision unavailable.">
         <div class="overviewTileTop">
           <div>
-            <div class="overviewTileQuestion">What is it doing right now?</div>
+            <div class="overviewTileQuestion">What changed?</div>
             <div id="overviewDecisionTitle" class="overviewTileTitle">No recent decisions</div>
           </div>
           <span id="overviewDecisionMeta" class="pill dim mono">Decision freshness unavailable</span>
@@ -2701,7 +2862,7 @@ tr.symbolContextMatch td{
       <section id="overviewTrustTile" class="overviewTile overviewTrustTile" role="group" aria-label="Risk headroom and trust state unavailable.">
         <div class="overviewTileTop">
           <div>
-            <div class="overviewTileQuestion">Should I trust it?</div>
+            <div class="overviewTileQuestion">Should it trade?</div>
             <div class="overviewTileTitle">Trust and headroom</div>
           </div>
           <span class="pill dim">advisory</span>
@@ -2729,7 +2890,7 @@ tr.symbolContextMatch td{
     </div>
   </div>
 
-  <div class="card collapsible" id="readinessEvidencePanel" data-screens="overview,operate" aria-labelledby="readinessEvidenceTitle">
+  <div class="card collapsible missionEvidencePanel" id="readinessEvidencePanel" data-screens="overview,operate" aria-labelledby="readinessEvidenceTitle">
     <h2 id="readinessEvidenceTitle">Readiness Evidence <span id="readinessEvidenceMeta" class="pill dim meta-pill-offset">loading</span></h2>
     <div class="small">Authoritative blockers and warnings from runtime, execution, broker, data, and governance evidence.</div>
     <div id="readinessEvidenceGroups" class="readinessEvidenceGrid" aria-live="polite">
@@ -2756,11 +2917,11 @@ tr.symbolContextMatch td{
     </div>
   </div>
 
-  <div class="card" id="recommendedActionCard">
-    <h2 class="card-header">🎯 Recommended Action <span id="recommendedActionStatePill" class="pill dim meta-pill-offset">loading</span></h2>
+  <div class="card opsStateTreatment missionGuidancePanel" id="recommendedActionCard">
+    <h2 class="card-header">Operator Guidance <span id="recommendedActionStatePill" class="pill dim meta-pill-offset">loading</span></h2>
     <div class="recommendedActionGrid">
       <div class="recommendedActionHero">
-        <div class="recommendedActionKicker">Primary action</div>
+        <div class="recommendedActionKicker">Recommended operator stance</div>
         <div id="recommendedActionPrimary" class="recommendedActionTitle">WAIT</div>
         <div id="recommendedActionTarget" class="recommendedActionSub">Waiting for decisions, advisories, and runtime health.</div>
         <div id="recommendedActionReason" class="recommendedActionReason">Decision support is loading.</div>
@@ -2771,13 +2932,20 @@ tr.symbolContextMatch td{
           <span id="recommendedActionBlocking" class="pill dim">status —</span>
           <span id="recommendedActionUpdated" class="pill dim mono">updated —</span>
         </div>
-        <div class="small section-note-title">Why this action</div>
+        <div class="opsGuidancePanel" aria-labelledby="recommendedActionGuidanceTitle">
+          <div id="recommendedActionGuidanceTitle" class="opsGuidanceTitle">Operator guidance</div>
+          <ol id="recommendedActionSteps" class="opsGuidanceList">
+            <li>Wait for decisions, advisories, and runtime health.</li>
+          </ol>
+        </div>
+        <div class="small section-note-title">Evidence</div>
         <div id="recommendedActionNotes" class="opsNotes small">
           <div class="opsNote">(loading...)</div>
         </div>
       </div>
     </div>
   </div>
+  </section>
 
 <div class="dashboard-grid">
   <div class="dashboard-left">
@@ -3003,12 +3171,12 @@ Trade Execution Integrity —
     </label>
   </div>
   <div class="surfaceWrap">
-    <div id="liveMarketChart" style="width:100%; height:420px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+    <div id="liveMarketChart" style="width:100%; height:420px; border:1px solid var(--border-default); border-radius:10px; background:var(--surface-panel-muted);"></div>
     <div id="proChartsSurfaceState" class="surfaceOverlayState" aria-live="polite"></div>
   </div>
   <div id="proChartsOverlayLegend" class="overlayLegend" aria-live="polite"></div>
   <div id="liveMarketChartA11y" class="chartA11y"></div>
-  <div id="proChartsCrosshair" style="margin-top:8px; min-height:52px; border:1px solid #30363d; border-radius:10px; background:#0b0f15; padding:8px 10px; color:#e6edf3;" class="small mono">hover chart</div>
+  <div id="proChartsCrosshair" style="margin-top:8px; min-height:52px; border:1px solid var(--border-default); border-radius:10px; background:var(--surface-panel); padding:8px 10px; color:var(--text-primary);" class="small mono">hover chart</div>
 </div>
 
 <div class="card collapsible" id="replayCard" data-screens="overview,analyze" style="width:100%;">
@@ -3785,7 +3953,8 @@ loading
 
       <!-- Operator-first scanning -->
       <div class="operatorOnly">
-        <div class="small">Scan → click to investigate → follow guided steps. Advanced actions require unlock.</div>
+        <div class="small">Scan grouped alarms first, then informational notifications. Acknowledgement is not resolution.</div>
+        <div id="alertLifecycleSummary" class="alertLifecycleSummary" aria-live="polite"></div>
 
         <div class="small" style="margin-top:6px;">Severity × Confidence by Symbol / Horizon</div>
 <div class="heatmapWrap" style="margin-top:6px;">
@@ -3802,14 +3971,14 @@ loading
             <thead>
               <tr>
                 <th>Time</th>
-                <th>Prediction Horizon</th>
-                <th>Symbol</th>
+                <th>Severity / State</th>
+                <th>Affected Entity</th>
                 <th>Prediction Horizon</th>
                 <th>Standardized Z-Score</th>
                 <th>Model Confidence</th>
-                <th>Event Description</th>
-                <th>Age</th>
-                <th>Why</th>
+                <th>Event / Operator Guidance</th>
+                <th>Freshness / Lifecycle</th>
+                <th>Drilldown</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -3994,7 +4163,10 @@ loading
 
   <canvas id="calibCanvas" width="900" height="180" style="margin-top:10px;"></canvas>
   <div id="calibCanvasA11y" class="chartA11y"></div>
-  <pre id="calibRaw" class="small" style="white-space:pre-wrap; margin-top:8px;"></pre>
+  <details class="rawToggle">
+    <summary>Technical details</summary>
+    <pre id="calibRaw" class="small uiStateRaw"></pre>
+  </details>
 </div>
 
     <!-- Why Not Promoted (promotion audit feed) -->
@@ -4125,7 +4297,7 @@ loading
         </select>
         <span class="pill dim" id="performanceDivergenceCharted">chart -</span>
       </div>
-      <canvas id="performanceDivergenceChart" width="900" height="120" style="width:100%; height:120px; margin-top:8px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
+      <canvas id="performanceDivergenceChart" width="900" height="120" style="width:100%; height:120px; margin-top:8px; border:1px solid var(--border-default); border-radius:10px; background:var(--surface-panel-muted);"></canvas>
       <div id="performanceDivergenceChartA11y" class="chartA11y"></div>
       <div class="table-wrap table-wrap-spaced-sm">
         <table>
@@ -4792,14 +4964,14 @@ loading
       <div class="row" style="gap:12px; margin-top:10px;">
         <div style="flex:1 1 360px; min-width:320px;">
           <div class="small" style="margin:0 0 6px;">Equity Curve</div>
-          <canvas id="portfolioEquityCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
-          <div id="portfolioEquityPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+          <canvas id="portfolioEquityCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid var(--border-default); border-radius:10px; background:var(--surface-panel-muted);"></canvas>
+          <div id="portfolioEquityPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid var(--border-default); border-radius:10px; background:var(--surface-panel-muted);"></div>
           <div id="portfolioEquityCanvasA11y" class="chartA11y"></div>
         </div>
         <div style="flex:1 1 360px; min-width:320px;">
           <div class="small" style="margin:0 0 6px;">Drawdown</div>
-          <canvas id="portfolioDdCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
-          <div id="portfolioDdPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+          <canvas id="portfolioDdCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid var(--border-default); border-radius:10px; background:var(--surface-panel-muted);"></canvas>
+          <div id="portfolioDdPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid var(--border-default); border-radius:10px; background:var(--surface-panel-muted);"></div>
           <div id="portfolioDdCanvasA11y" class="chartA11y"></div>
         </div>
       </div>
@@ -4897,8 +5069,8 @@ loading
     <div style="
       max-width: 980px;
       margin: 0 auto;
-      background:#0b0f15;
-      border:1px solid #30363d;
+      background:var(--surface-panel);
+      border:1px solid var(--border-default);
       border-radius:12px;
       padding:12px;
     ">

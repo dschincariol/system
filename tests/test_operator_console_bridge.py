@@ -127,6 +127,57 @@ class _SidecarHandler(BaseHTTPRequestHandler):
         self._handle()
 
 
+class _HealthProxyDashboardHandler(BaseHTTPRequestHandler):
+    requests = []
+
+    def log_message(self, *_args):
+        return
+
+    def _send_json(self, payload, status=200):
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.path)
+        record = {
+            "method": self.command,
+            "path": parsed.path,
+            "query": parsed.query,
+            "headers": dict(self.headers.items()),
+        }
+        type(self).requests.append(record)
+
+        if parsed.path == "/api/health":
+            self._send_json(
+                {
+                    "ok": True,
+                    "ts_ms": 1_700_000_000_000,
+                    "db": {"ok": True, "detail": "test_dashboard_health"},
+                    "alert_lifecycle": {"ok": True},
+                    "async_price_persistence": {"ok": True},
+                }
+            )
+            return
+        if parsed.path == "/api/operator/support_snapshot":
+            self._send_json(
+                {
+                    "ok": True,
+                    "mode": "quick",
+                    "health": {"ok": True, "source": "test_dashboard_health"},
+                    "runtime": {"ok": True},
+                }
+            )
+            return
+
+        self._send_json({"ok": False, "error": "not_found", "path": parsed.path}, status=404)
+
+
 @contextmanager
 def _http_server(handler_cls):
     server = _TestHTTPServer(("127.0.0.1", 0), handler_cls)
@@ -157,6 +208,24 @@ def _read_json(url: str, *, method: str = "GET", body=None, headers=None):
     with urlopen(req, timeout=5) as response:
         payload = json.loads(response.read().decode("utf-8"))
         return int(response.status), dict(response.headers), payload
+
+
+def _wait_for_operator_sidecar(proc, port: int):
+    deadline = time.time() + 10
+    last_error = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            out, err = proc.communicate(timeout=1)
+            raise AssertionError(f"operator sidecar exited early code={proc.returncode}\nstdout={out}\nstderr={err}")
+        try:
+            status, _headers, payload = _read_json(f"http://127.0.0.1:{port}/api/operator/ping")
+            if status == 200 and payload.get("ok") is True:
+                return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.1)
+    out, err = proc.communicate(timeout=1) if proc.poll() is not None else ("", "")
+    raise AssertionError(f"operator sidecar did not start: {last_error}\nstdout={out}\nstderr={err}")
 
 
 def _build_operator_bridge_handler(*, token="", events=None, limiter=None, monkeypatch=None):
@@ -203,9 +272,46 @@ def test_operator_sidecar_status_payload_reports_bridge_metadata(monkeypatch):
     assert payload["http_proxy_prefix"] == "/operator/api/"
     assert "Start or restart" in payload["action"]
     assert payload["websocket"]["proxy_enabled"] is False
+    assert payload["websocket"]["direct_sidecar_required"] is True
+    assert payload["websocket"]["ticket_endpoint"] == "/operator/ws_ticket"
+    assert payload["websocket"]["path"] == "/ws/operator"
+    assert payload["websocket"]["origin_checked"] is True
+    assert "Sec-WebSocket-Protocol" in payload["websocket"]["auth"]
     assert "direct_url" not in payload["websocket"]
     assert "direct_url" not in payload
     assert seen["url"] == "http://127.0.0.1:4555/api/operator/ping"
+
+
+def test_operator_bridge_ws_ticket_requires_dashboard_auth_and_does_not_expose_operator_token(monkeypatch):
+    token = "dashboard-token-1234567890"
+    sidecar_token = "operator-token-1234567890"
+    handler_cls = _build_operator_bridge_handler(token=token, monkeypatch=monkeypatch)
+    monkeypatch.setenv("OPERATOR_API_TOKEN", sidecar_token)
+
+    with _http_server(handler_cls) as (base_url, _server):
+        status, headers, payload = _read_json(
+            f"{base_url}/operator/ws_ticket",
+            headers={"X-API-Token": token},
+        )
+        try:
+            _read_json(f"{base_url}/operator/ws_ticket")
+            raise AssertionError("ticket request unexpectedly succeeded without dashboard token")
+        except HTTPError as exc:
+            denied_status = exc.code
+            denied = json.loads(exc.read().decode("utf-8"))
+
+    raw = json.dumps(payload)
+    assert status == 200
+    assert headers["X-Operator-Console-Bridge"] == "1"
+    assert headers["Cache-Control"] == "no-store"
+    assert payload["ok"] is True
+    assert payload["protocol"] == "operator-ticket"
+    assert payload["ticket"].count(".") == 1
+    assert payload["origin"].startswith("http://127.0.0.1:")
+    assert payload["expires_at_ms"] > int(time.time() * 1000)
+    assert sidecar_token not in raw
+    assert denied_status == 401
+    assert denied["ok"] is False
 
 
 def test_operator_bridge_serves_operator_ui_for_prefix_routes():
@@ -229,29 +335,36 @@ def test_operator_ui_prefix_logic_uses_same_origin_operator_api(tmp_path):
     root = Path(__file__).resolve().parents[1]
     html = (root / "boot" / "operator_ui.html").read_text(encoding="utf-8")
     start = html.index("const OPERATOR_BRIDGE_PREFIX =")
-    end = html.index("function operatorTelemetryWsUrl", start)
+    end = html.index("let selectedMode", start)
     bridge_block = html[start:end]
 
     script = tmp_path / "operator_bridge_prefix_test.mjs"
     script.write_text(
         "\n".join(
             [
-                "function run(pathname) {",
-                "  const location = { pathname, protocol: 'http:', host: '127.0.0.1:8000' };",
-                "  const window = {};",
+                "async function run(pathname) {",
+                "  const location = { pathname, protocol: 'http:', host: '127.0.0.1:8000', hostname: '127.0.0.1', search: '?operator_token=operator-token-1234567890&dashboard_token=dashboard-token-1234567890' };",
+                "  const store = new Map();",
+                "  const window = { sessionStorage: { getItem: (k) => store.get(k) || '', setItem: (k, v) => store.set(k, String(v)) }, localStorage: { getItem: () => '', setItem: () => {} } };",
                 bridge_block,
+                "  const protocols = await operatorTelemetryWsProtocols();",
+                "  const debug = await operatorTelemetryWsDebugInfo();",
                 "  return {",
                 "    prefix: OPERATOR_BRIDGE_PREFIX,",
                 "    absolute: operatorBridgeUrl('/api/operator/status'),",
                 "    summary: operatorBridgeUrl('/api/operator_summary'),",
                 "    relative: operatorBridgeUrl('api/operator/start'),",
-                "    passthrough: operatorBridgeUrl('/assets/app.js')",
+                "    passthrough: operatorBridgeUrl('/assets/app.js'),",
+                "    ws: operatorTelemetryWsUrl(),",
+                "    legacyWs: operatorTelemetryLegacyWsUrl(),",
+                "    protocols,",
+                "    debug",
                 "  };",
                 "}",
                 "process.stdout.write(JSON.stringify({",
-                "  bridged: run('/operator/'),",
-                "  nested: run('/operator/deep/link'),",
-                "  direct: run('/')",
+                "  bridged: await run('/operator/'),",
+                "  nested: await run('/operator/deep/link'),",
+                "  direct: await run('/')",
                 "}));",
             ]
         ),
@@ -273,9 +386,18 @@ def test_operator_ui_prefix_logic_uses_same_origin_operator_api(tmp_path):
     assert payload["bridged"]["summary"] == "/operator/api/operator_summary"
     assert payload["bridged"]["relative"] == "/operator/api/operator/start"
     assert payload["bridged"]["passthrough"] == "/assets/app.js"
+    assert payload["bridged"]["ws"] == "ws://127.0.0.1:4001/ws/operator"
+    assert payload["bridged"]["legacyWs"] == "ws://127.0.0.1:8000/operator/ws/operator?operator_token=operator-token-1234567890"
+    assert payload["bridged"]["protocols"][0] == "operator-token"
+    assert payload["bridged"]["protocols"][1].startswith("operator-token.")
+    assert payload["bridged"]["debug"]["bridged"] is True
+    assert payload["bridged"]["debug"]["tokenProtocol"] is True
+    assert payload["bridged"]["debug"]["ticketProtocol"] is False
     assert payload["nested"]["absolute"] == "/operator/api/operator/status"
+    assert payload["nested"]["ws"] == "ws://127.0.0.1:4001/ws/operator"
     assert payload["direct"]["prefix"] == ""
     assert payload["direct"]["absolute"] == "/api/operator/status"
+    assert payload["direct"]["ws"] == "ws://127.0.0.1:8000/ws/operator"
 
 
 def test_operator_status_route_reports_useful_sidecar_status(monkeypatch):
@@ -300,6 +422,10 @@ def test_operator_status_route_reports_useful_sidecar_status(monkeypatch):
     assert payload["http_proxy_prefix"] == "/operator/api/"
     assert payload["base_url"] == f"http://127.0.0.1:{sidecar.server_port}"
     assert payload["websocket"]["proxy_enabled"] is False
+    assert payload["websocket"]["direct_sidecar_required"] is True
+    assert payload["websocket"]["path"] == "/ws/operator"
+    assert payload["websocket"]["origin_checked"] is True
+    assert "Sec-WebSocket-Protocol" in payload["websocket"]["auth"]
     assert "direct_url" not in payload["websocket"]
     assert any(req["path"] == "/api/operator/ping" for req in _SidecarHandler.requests)
 
@@ -526,6 +652,252 @@ def test_operator_api_proxy_unavailable_is_graceful_and_actionable(monkeypatch):
     assert "detail" in body and body["detail"]
 
 
+def test_operator_sidecar_proxy_health_uses_health_contract_and_keeps_snapshot_proxy(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    operator_port = _unused_local_port()
+    operator_token = "operator-token-1234567890"
+    _HealthProxyDashboardHandler.requests = []
+
+    with _http_server(_HealthProxyDashboardHandler) as (dashboard_base, _dashboard):
+        dashboard_port = dashboard_base.rsplit(":", 1)[1]
+        env_path = tmp_path / "operator.env"
+        env_path.write_text(
+            "\n".join(
+                [
+                    f"DASHBOARD_BASE={dashboard_base}",
+                    "DASHBOARD_HOST=127.0.0.1",
+                    f"DASHBOARD_PORT={dashboard_port}",
+                    f"DASHBOARD_API_TOKEN_FILE={os.environ['DASHBOARD_API_TOKEN_FILE']}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env.update(
+            {
+                "OPERATOR_BIND_HOST": "127.0.0.1",
+                "OPERATOR_PORT": str(operator_port),
+                "OPERATOR_API_TOKEN": operator_token,
+                "OPERATOR_ENV_PATH": str(env_path),
+                "OPERATOR_DATA_DIR": str(tmp_path / "operator-data"),
+                "OPERATOR_AUTO_START": "0",
+                "DASHBOARD_BASE": dashboard_base,
+                "DASHBOARD_HOST": "127.0.0.1",
+                "DASHBOARD_PORT": dashboard_port,
+                "NODE_ENV": "test",
+            }
+        )
+
+        proc = subprocess.Popen(
+            ["node", "boot/operator_server.js"],
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_operator_sidecar(proc, operator_port)
+
+            status, _headers, health = _read_json(
+                f"http://127.0.0.1:{operator_port}/api/operator/proxy/health",
+                headers={"X-Operator-Token": operator_token},
+            )
+            snapshot_status, _snapshot_headers, snapshot = _read_json(
+                f"http://127.0.0.1:{operator_port}/api/operator/support_snapshot?mode=quick",
+                headers={"X-Operator-Token": operator_token},
+            )
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+
+    assert status == 200
+    assert health["ok"] is True
+    assert health["healthy"] is True
+    assert health["status"] == 200
+    assert health["body"]["ok"] is True
+    assert health["body"]["ts_ms"] == 1_700_000_000_000
+    assert health["body"]["db"]["ok"] is True
+    assert health["body"]["alert_lifecycle"]["ok"] is True
+    assert health["body"]["async_price_persistence"]["ok"] is True
+
+    assert snapshot_status == 200
+    assert snapshot["ok"] is True
+    assert snapshot["mode"] == "quick"
+    assert snapshot["health"]["ok"] is True
+
+    assert any(req["path"] == "/api/health" for req in _HealthProxyDashboardHandler.requests)
+    assert any(req["path"] == "/api/operator/support_snapshot" for req in _HealthProxyDashboardHandler.requests)
+
+
+def test_operator_telemetry_websocket_accepts_trusted_token_protocol_and_rejects_bad_handshakes(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    operator_port = _unused_local_port()
+    operator_token = "operator-token-1234567890"
+    _HealthProxyDashboardHandler.requests = []
+
+    with _http_server(_HealthProxyDashboardHandler) as (dashboard_base, _dashboard):
+        dashboard_port = dashboard_base.rsplit(":", 1)[1]
+        env_path = tmp_path / "operator.env"
+        env_path.write_text(
+            "\n".join(
+                [
+                    "DASHBOARD_HOST=127.0.0.1",
+                    f"DASHBOARD_PORT={dashboard_port}",
+                    f"DASHBOARD_API_TOKEN_FILE={os.environ['DASHBOARD_API_TOKEN_FILE']}",
+                    "OPERATOR_ALLOWED_ORIGIN=http://127.0.0.1:8000",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env.update(
+            {
+                "OPERATOR_BIND_HOST": "127.0.0.1",
+                "OPERATOR_PORT": str(operator_port),
+                "OPERATOR_API_TOKEN": operator_token,
+                "OPERATOR_ENV_PATH": str(env_path),
+                "OPERATOR_DATA_DIR": str(tmp_path / "operator-data"),
+                "OPERATOR_AUTO_START": "0",
+                "DASHBOARD_HOST": "127.0.0.1",
+                "DASHBOARD_PORT": dashboard_port,
+                "OPERATOR_ALLOWED_ORIGIN": "http://127.0.0.1:8000",
+                "NODE_ENV": "test",
+            }
+        )
+
+        proc = subprocess.Popen(
+            ["node", "boot/operator_server.js"],
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_operator_sidecar(proc, operator_port)
+            script = tmp_path / "operator_ws_probe.cjs"
+            script.write_text(
+                f"""
+const crypto = require("crypto");
+const WebSocket = require({json.dumps(str(root / "node_modules" / "ws"))});
+const url = "ws://127.0.0.1:{operator_port}/ws/operator";
+const token = {json.dumps(operator_token)};
+const trustedOrigin = "http://127.0.0.1:8000";
+
+function wsTicket(origin) {{
+  const payload = {{
+    aud: "operator_ws",
+    origin,
+    exp_ms: Date.now() + 60000,
+    iat_ms: Date.now(),
+  }};
+  const payloadB64 = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const sig = crypto.createHmac("sha256", token).update(payloadB64).digest("base64url");
+  return `${{payloadB64}}.${{sig}}`;
+}}
+
+function attempt(name, options) {{
+  const protocols = options.protocols || [];
+  const origin = options.origin || trustedOrigin;
+  const expectFrame = !!options.expectFrame;
+  return new Promise((resolve, reject) => {{
+    const result = {{ name, upgradeStatus: null, rejectStatus: null, open: false, frame: null, error: null }};
+    const ws = new WebSocket(url, protocols, {{ headers: {{ Origin: origin }} }});
+    const timer = setTimeout(() => {{
+      try {{ ws.terminate(); }} catch {{}}
+      reject(new Error(`${{name}} timeout ${{JSON.stringify(result)}}`));
+    }}, expectFrame ? 15000 : 5000);
+    const done = () => {{
+      clearTimeout(timer);
+      try {{ ws.close(); }} catch {{}}
+      resolve(result);
+    }};
+    ws.on("upgrade", (res) => {{
+      result.upgradeStatus = res.statusCode;
+    }});
+    ws.on("open", () => {{
+      result.open = true;
+      if (!expectFrame) done();
+    }});
+    ws.on("message", (data) => {{
+      result.frame = String(data);
+      done();
+    }});
+    ws.on("unexpected-response", (_req, res) => {{
+      result.rejectStatus = res.statusCode;
+      done();
+    }});
+    ws.on("error", (err) => {{
+      result.error = String((err && err.message) || err);
+      if (!expectFrame) done();
+    }});
+  }});
+}}
+
+(async () => {{
+  const accepted = await attempt("accepted", {{
+    protocols: ["operator-ticket", `operator-ticket.${{wsTicket(trustedOrigin)}}`],
+    expectFrame: true,
+  }});
+  const unauthenticated = await attempt("unauthenticated", {{
+    protocols: [],
+    expectFrame: false,
+  }});
+  const crossOrigin = await attempt("crossOrigin", {{
+    protocols: ["operator-ticket", `operator-ticket.${{wsTicket(trustedOrigin)}}`],
+    origin: "http://evil.example:8000",
+    expectFrame: false,
+  }});
+  const payload = {{ accepted, unauthenticated, crossOrigin }};
+  console.log(JSON.stringify(payload));
+  if (accepted.upgradeStatus !== 101 || !accepted.open || !accepted.frame || !accepted.frame.includes("health_update")) {{
+    process.exit(10);
+  }}
+  if (unauthenticated.rejectStatus !== 403 || unauthenticated.open) process.exit(11);
+  if (crossOrigin.rejectStatus !== 403 || crossOrigin.open) process.exit(12);
+}})().catch((err) => {{
+  console.error(err && err.stack || err);
+  process.exit(1);
+}});
+""",
+                encoding="utf-8",
+            )
+            probe = subprocess.run(
+                ["node", str(script)],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+
+    assert probe.returncode == 0, f"stdout={probe.stdout}\nstderr={probe.stderr}"
+    payload = json.loads(probe.stdout)
+    assert payload["accepted"]["upgradeStatus"] == 101
+    assert payload["accepted"]["open"] is True
+    frame = json.loads(payload["accepted"]["frame"])
+    assert frame["type"] == "health_update"
+    assert payload["unauthenticated"]["rejectStatus"] == 403
+    assert payload["unauthenticated"]["open"] is False
+    assert payload["crossOrigin"]["rejectStatus"] == 403
+    assert payload["crossOrigin"]["open"] is False
+
+
 def test_operator_websocket_bridge_returns_deferred_upgrade_response(monkeypatch):
     import dashboard_server
 
@@ -551,9 +923,9 @@ def test_operator_websocket_bridge_returns_deferred_upgrade_response(monkeypatch
     assert headers["Upgrade"] == "websocket"
     assert body["ok"] is False
     assert body["error"] == "websocket_proxy_deferred"
-    assert "dashboard HTTP polling" in body["action"]
+    assert "direct sidecar WebSocket" in body["action"]
     assert "sidecar_ws_url" not in body
-    assert "HTTP only" in body["detail"]
+    assert "proxies HTTP only" in body["detail"]
 
 
 def test_operator_sidecar_rejects_sensitive_get_without_operator_token_and_redacts_config(tmp_path):
@@ -783,28 +1155,33 @@ def test_operator_sidecar_rejects_missing_structured_confirmation_with_operator_
             out, err = proc.communicate(timeout=1) if proc.poll() is not None else ("", "")
             raise AssertionError(f"operator sidecar did not start: {last_error}\nstdout={out}\nstderr={err}")
 
-        req = Request(
-            f"http://127.0.0.1:{port}/api/operator/factoryReset",
-            data=b"{}",
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "X-Operator-Token": operator_token,
-                },
-            method="POST",
-        )
-        try:
-            urlopen(req, timeout=5)
-            raise AssertionError("request unexpectedly succeeded")
-        except HTTPError as exc:
-            code = exc.code
-            body = json.loads(exc.read().decode("utf-8"))
+        for path, action_id, required_token in [
+            ("/api/operator/factoryReset", "operator.factory_reset", "FACTORY_RESET"),
+            ("/api/operator/start", "operator.start", "START_OPERATOR"),
+            ("/api/operator/bootstrap", "operator.bootstrap", "BOOTSTRAP_OPERATOR"),
+        ]:
+            req = Request(
+                f"http://127.0.0.1:{port}{path}",
+                data=b"{}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "X-Operator-Token": operator_token,
+                    },
+                method="POST",
+            )
+            try:
+                urlopen(req, timeout=5)
+                raise AssertionError(f"{path} unexpectedly succeeded")
+            except HTTPError as exc:
+                code = exc.code
+                body = json.loads(exc.read().decode("utf-8"))
 
-        assert code == 422
-        assert body["ok"] is False
-        assert body["error"] == "confirmation_required"
-        assert body["action_id"] == "operator.factory_reset"
-        assert body["required_token"] == "FACTORY_RESET"
+            assert code == 422
+            assert body["ok"] is False
+            assert body["error"] == "confirmation_required"
+            assert body["action_id"] == action_id
+            assert body["required_token"] == required_token
     finally:
         if proc.poll() is None:
             proc.terminate()

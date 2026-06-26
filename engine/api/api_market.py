@@ -216,6 +216,10 @@ def api_get_market_candles(parsed: Any, _ctx=None) -> Dict[str, Any]:
         since = max(0, now_ms - lookback_ms)
 
         rows = _quote_rows_ascending(_rows_since(symbol=symbol, since_ts_ms=since, limit=fetch_limit))
+        stale_fallback = False
+        if not rows and since > 0:
+            rows = _quote_rows_ascending(_rows_since(symbol=symbol, since_ts_ms=0, limit=fetch_limit))
+            stale_fallback = bool(rows)
         candles = _build_candles_from_rows(rows, tf_ms=tf_ms)
         if len(candles) > limit:
             candles = candles[-limit:]
@@ -236,6 +240,7 @@ def api_get_market_candles(parsed: Any, _ctx=None) -> Dict[str, Any]:
                 "max_points": int(max_points),
                 "fetch_limit": int(fetch_limit),
                 "order": "ascending",
+                "stale_fallback": bool(stale_fallback),
             },
         }
 

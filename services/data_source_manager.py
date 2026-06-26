@@ -37,6 +37,11 @@ from engine.data.broker_readonly import (
 )
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.platform import default_ibkr_host
+from engine.runtime.feed_truth import (
+    classify_market_data_liveness,
+    is_simulated_provider,
+    missing_live_market_credentials_from_sources,
+)
 from engine.runtime.data_source_log_store import (
     DATA_SOURCE_LOG_REDACTION_TIMESCALE_MARKER_KEY,
     append_data_source_log_row,
@@ -7592,6 +7597,42 @@ class DataSourceManager:
         """Return the explicit source-test registry used by ``test_connection``."""
         return {str(key): dict(value) for key, value in _PROVIDER_TEST_REGISTRY.items()}
 
+    def _missing_live_market_credential_env_vars(self) -> List[str]:
+        try:
+            return missing_live_market_credentials_from_sources(self.list_sources() or [])
+        except Exception as exc:
+            _warn_nonfatal(
+                "DATA_SOURCE_MANAGER_MISSING_LIVE_MARKET_CREDENTIALS_FAILED",
+                exc,
+                once_key="missing_live_market_credentials",
+            )
+            return []
+
+    def _connection_liveness_evidence(
+        self,
+        source: Dict[str, Any],
+        *,
+        ok: bool,
+        simulated: bool = False,
+        missing_credential_env_vars: Iterable[Any] = (),
+    ) -> Dict[str, Any]:
+        provider_name = str(source.get("provider_name") or source.get("source_key") or "")
+        source_type = str(source.get("source_type") or "")
+        missing = list(missing_credential_env_vars or [])
+        if source_type in {"price_provider", "options_provider"} and is_simulated_provider(provider_name):
+            missing = list(dict.fromkeys(missing + self._missing_live_market_credential_env_vars()))
+        truth = classify_market_data_liveness(
+            provider_name=provider_name,
+            ok=bool(ok),
+            simulated=bool(simulated or is_simulated_provider(provider_name)),
+            missing_credential_env_vars=missing,
+        )
+        return {
+            **truth,
+            "live_capable": bool(truth.get("live_market_data_ok")),
+            "not_live": not bool(truth.get("live_market_data_ok")),
+        }
+
     def _connection_result(
         self,
         status: str,
@@ -7648,10 +7689,20 @@ class DataSourceManager:
         source: Optional[Dict[str, Any]] = None,
     ) -> ConnectionTestResult:
         clean_fields = [str(field) for field in fields if str(field or "").strip()]
+        missing_env_vars = clean_fields
+        if source is not None:
+            missing_from_source = [
+                str(name)
+                for name in list(source.get("missing_credential_env_vars") or [])
+                if str(name or "").strip()
+            ]
+            if missing_from_source:
+                missing_env_vars = list(dict.fromkeys(missing_from_source))
         evidence: Dict[str, Any] = {
             "provider": str(provider),
             "missing_fields": clean_fields,
-            "missing_env_vars": clean_fields,
+            "missing_env_vars": missing_env_vars,
+            "missing_credential_env_vars": missing_env_vars,
         }
         if source is not None:
             _template_key, definition = self._resolve_definition(
@@ -7662,7 +7713,14 @@ class DataSourceManager:
             evidence["missing_credentials"] = self._missing_credential_metadata(
                 source,
                 definition,
-                clean_fields,
+                missing_env_vars,
+            )
+            evidence.update(
+                self._connection_liveness_evidence(
+                    source,
+                    ok=False,
+                    missing_credential_env_vars=missing_env_vars,
+                )
             )
         return self._connection_fail(
             "missing_credentials",
@@ -8597,12 +8655,21 @@ class DataSourceManager:
                 "simulated_price_empty_payload",
                 evidence={"provider": "simulated", "simulated": True, "payload_count": 0},
             )
-        return self._connection_pass(
-            "simulated_price_connection_ok",
-            provider="simulated",
-            simulated=True,
-            symbol=str(next(iter(rows.keys()))),
-            payload_count=len(rows),
+        evidence = {
+            "provider": "simulated",
+            "simulated": True,
+            "symbol": str(next(iter(rows.keys()))),
+            "payload_count": len(rows),
+        }
+        evidence.update(self._connection_liveness_evidence(source, ok=True, simulated=True))
+        return self._connection_degraded(
+            "simulated_not_live",
+            "simulated_price_connection_not_live",
+            evidence=evidence,
+            next_steps=(
+                "Use simulated prices only for safe/test validation.",
+                "Configure and pass a credentialed live market-data source before treating feeds as live.",
+            ),
         )
 
     def _test_ccxt_connection(self, source: Dict[str, Any]) -> ConnectionTestResult:
@@ -9428,6 +9495,21 @@ class DataSourceManager:
         payload["source_type"] = str(source.get("source_type") or "")
         payload["test_registry_key"] = str(registry_key or "")
         payload["ts_ms"] = int(now_ms)
+        if str(source.get("source_type") or "") in {"price_provider", "options_provider"}:
+            payload.update(
+                self._connection_liveness_evidence(
+                    source,
+                    ok=bool(result.ok),
+                    simulated=bool((payload.get("evidence") or {}).get("simulated") or payload.get("simulated")),
+                    missing_credential_env_vars=(
+                        payload.get("missing_credential_env_vars")
+                        or payload.get("missing_env_vars")
+                        or (payload.get("evidence") or {}).get("missing_credential_env_vars")
+                        or (payload.get("evidence") or {}).get("missing_env_vars")
+                        or []
+                    ),
+                )
+            )
         event_level = "INFO" if result.ok else ("WARNING" if str(result.status) in {"degraded", "unsupported"} else "ERROR")
         self.log_event(
             key,

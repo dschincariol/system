@@ -43,6 +43,51 @@ class HttpTransportStatusContractTests(unittest.TestCase):
 
         self.assertEqual(_derive_response_status(payload, default_status=200), 200)
 
+    def test_reasoned_business_false_keeps_http_200(self) -> None:
+        payload = {
+            "ok": False,
+            "reason": "warming_up",
+            "reason_code": "WARMING_UP",
+            "data": {"rows": []},
+        }
+
+        self.assertEqual(_derive_response_status(payload, default_status=200), 200)
+
+    def test_business_false_response_preserves_reason_without_request_failed(self) -> None:
+        def _business_degraded(_parsed=None, _body=None, _ctx=None):
+            return {
+                "ok": False,
+                "reason": "warming_up",
+                "reason_code": "WARMING_UP",
+                "data": {"rows": []},
+            }
+
+        handler_cls = http_transport.build_handler(
+            ROUTE_SPECS=[("GET", "/business_degraded", "api_business_degraded")],
+            API_HANDLERS={"api_business_degraded": _business_degraded},
+            dashboard_api_token="",
+            ctx={},
+            static_dir=str(REPO_ROOT / "ui"),
+        )
+        server = _TestHTTPServer(("127.0.0.1", 0), handler_cls)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/business_degraded", timeout=5) as response:
+                code = response.status
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(code, 200)
+        self.assertIs(payload["error"], None)
+        self.assertEqual(payload["reason"], "warming_up")
+        self.assertEqual(payload["reason_code"], "WARMING_UP")
+        self.assertEqual(payload["meta"]["status"], 200)
+        self.assertNotIn("request_failed", json.dumps(payload, sort_keys=True))
+
     def test_missing_input_maps_to_http_400(self) -> None:
         payload = {"ok": False, "error": "missing_name"}
         self.assertEqual(_derive_response_status(payload, default_status=200), 400)

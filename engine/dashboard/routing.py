@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -13,6 +14,7 @@ FALLBACK_ROUTE_SPECS = [
     {"method": "GET",  "path": "/api/operator/sidecar_status",  "handler": "api_get_operator_sidecar_status"},
     {"method": "GET",  "path": "/api/operator/status",            "handler": "api_get_operator_status"},
     {"method": "GET",  "path": "/api/operator/bootstrap",         "handler": "api_get_operator_bootstrap_status"},
+    {"method": "GET",  "path": "/api/operator/bootstrap_status",  "handler": "api_get_operator_bootstrap_status"},
     {"method": "GET",  "path": "/api/operator/bootstrapStatus",   "handler": "api_get_operator_bootstrap_status"},
     {"method": "GET",  "path": "/api/operator/readiness",         "handler": "api_get_readiness"},
     {"method": "GET",  "path": "/api/operator/health",            "handler": "api_get_health"},
@@ -35,7 +37,9 @@ FALLBACK_ROUTE_SPECS = [
     {"method": "POST", "path": "/api/operator/execution_arm",     "handler": "api_post_operator_execution_arm"},
     {"method": "POST", "path": "/api/operator/clear_manual_halt", "handler": "api_post_operator_clear_manual_halt"},
     {"method": "POST", "path": "/api/operator/autofix",           "handler": "api_post_operator_autofix"},
+    {"method": "POST", "path": "/api/operator/clear_last_error",  "handler": "api_post_operator_clear_last_error"},
     {"method": "POST", "path": "/api/operator/clearLastError",    "handler": "api_post_operator_clear_last_error"},
+    {"method": "GET",  "path": "/api/operator/institutional_check","handler": "api_get_operator_institutional_check"},
     {"method": "GET",  "path": "/api/operator/institutionalCheck","handler": "api_get_operator_institutional_check"},
 
 
@@ -211,11 +215,43 @@ def filter_route_specs_for_handlers(
     route_specs: list[dict[str, str]],
     api_handlers: dict[str, Any],
 ) -> list[dict[str, str]]:
-    return [
-        route
-        for route in route_specs
-        if str(route.get("handler") or "").strip() in api_handlers
-    ]
+    missing_handlers = find_missing_route_handlers(route_specs, api_handlers)
+    if missing_handlers:
+        raise RuntimeError(
+            "route_handler_registration_failed: "
+            + json.dumps(missing_handlers[:50], sort_keys=True)
+        )
+    return list(route_specs)
+
+
+def find_missing_route_handlers(
+    route_specs: list[dict[str, str]],
+    api_handlers: dict[str, Any],
+) -> list[dict[str, str]]:
+    missing_handlers: list[dict[str, str]] = []
+    for route in route_specs:
+        handler_name = str(route.get("handler") or "").strip()
+        if not handler_name:
+            missing_handlers.append(
+                {
+                    "method": str(route.get("method") or ""),
+                    "path": str(route.get("path") or ""),
+                    "handler": handler_name,
+                    "reason": "blank_handler",
+                }
+            )
+            continue
+        handler = api_handlers.get(handler_name)
+        if handler_name not in api_handlers or not callable(handler):
+            missing_handlers.append(
+                {
+                    "method": str(route.get("method") or ""),
+                    "path": str(route.get("path") or ""),
+                    "handler": handler_name,
+                    "reason": "handler_not_registered",
+                }
+            )
+    return missing_handlers
 
 
 def validate_canonical_route_owners(

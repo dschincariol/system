@@ -649,6 +649,41 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertTrue(json_lines, msg=f"expected broker_apply_orders JSON output, got: {stdout!r}")
         return rc, json.loads(json_lines[-1]), stdout
 
+    def test_closed_connection_finalization_is_skipped(self) -> None:
+        class _ClosedConnection:
+            def __init__(self) -> None:
+                self._closed = True
+                self.commit_called = False
+                self.close_called = False
+
+            def commit(self) -> None:
+                self.commit_called = True
+                raise AssertionError("commit must not be called on a closed connection")
+
+            def close(self) -> None:
+                self.close_called = True
+                raise AssertionError("close must not be called on a closed connection")
+
+        con = _ClosedConnection()
+        with patch.object(self.broker_apply_orders, "_warn_nonfatal") as warn_nonfatal:
+            committed = self.broker_apply_orders._safe_commit_connection(
+                con,
+                context="unit_test",
+                once_key="unit_test_commit",
+            )
+            closed = self.broker_apply_orders._safe_close_connection(
+                con,
+                context="unit_test",
+                once_key="unit_test_close",
+            )
+
+        self.assertFalse(committed)
+        self.assertFalse(closed)
+        self.assertFalse(con.commit_called)
+        self.assertFalse(con.close_called)
+        warn_nonfatal.assert_called_once()
+        self.assertEqual(warn_nonfatal.call_args.args[0], "BROKER_APPLY_ORDERS_COMMIT_SKIPPED_CLOSED_CONNECTION")
+
     def test_shadow_mode_execution(self) -> None:
         now_ms = self._seed_runtime_live()
         self._set_mode("shadow")

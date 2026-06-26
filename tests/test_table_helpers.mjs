@@ -13,13 +13,17 @@ import {
 } from "../ui/utils.js";
 import {
   ALERT_SEVERITY_ORDER,
+  alertLifecycleState,
+  buildAlertIncidentGroups,
   cellColor,
+  defaultAlertRecommendedAction,
   filterAlerts,
   normalizeAlert,
   normalizeSeverity,
   renderHeatmap,
   renderIncidentQueue,
   severityRank,
+  summarizeAlertLifecycleCounts,
 } from "../ui/alerts.js";
 import {
   alertLifecycleSummary,
@@ -27,6 +31,7 @@ import {
   _meaningForAlert,
   normalizeAlertLifecycle,
   notificationPolicySummary,
+  renderAlertLifecycleCountSummary,
   _recommendedPosture,
   _safeToIgnore,
   _scoreCell,
@@ -391,6 +396,98 @@ test("alert lifecycle helpers preserve shelved and re-triggered state", () => {
     filterAlerts([row], { sev: "WARN", rangeMs: 120_000, changedOnly: false }, localState).map((item) => item.id),
     ["life-1"]
   );
+});
+
+test("alert lifecycle summary separates alarms, notifications, stale, and shelved unresolved states", async () => {
+  const now = Date.now();
+  const rows = [
+    { id: "info", severity: "INFO", ts_ms: now - 5_000, message: "background context" },
+    {
+      id: "acked",
+      severity: "HIGH",
+      ts_ms: now - 60_000,
+      message: "risk elevated",
+      acked: true,
+      acked_ts_ms: now - 30_000,
+      ack_expires_ts_ms: now + 600_000,
+    },
+    {
+      id: "shelved",
+      severity: "WARN",
+      ts_ms: now - 60_000,
+      message: "known upstream outage",
+      shelved: true,
+      shelved_ts_ms: now - 10_000,
+      shelve_expires_ts_ms: now + 900_000,
+      notification_policy: { suppressed: true, severity: "WARN" },
+    },
+    {
+      id: "stale",
+      severity: "CRIT",
+      ts_ms: now - 60 * 60 * 1000,
+      message: "data path broken",
+      rule_id: "DATA_PATH_BROKEN",
+    },
+    {
+      id: "resolved",
+      severity: "HIGH",
+      ts_ms: now - 60_000,
+      message: "fixed",
+      status: "resolved",
+      resolved_ts_ms: now - 1_000,
+    },
+  ];
+
+  const summary = summarizeAlertLifecycleCounts(rows, now);
+  assert.equal(summary.alarms, 3);
+  assert.equal(summary.notifications, 1);
+  assert.equal(summary.acknowledged, 1);
+  assert.equal(summary.shelved, 1);
+  assert.equal(summary.suppressed, 1);
+  assert.equal(summary.stale, 1);
+  assert.equal(summary.resolved, 1);
+  assert.equal(alertLifecycleState(rows[1], now).label, "Acknowledged, unresolved");
+  assert.equal(alertLifecycleState(rows[2], now).label, "Shelved, unresolved");
+  assert.match(defaultAlertRecommendedAction(rows[1], now), /Acknowledged only/);
+  assert.match(defaultAlertRecommendedAction(rows[2], now), /Shelved only/);
+
+  await withFakeDocument(["summary"], (elements) => {
+    renderAlertLifecycleCountSummary(elements.get("summary"), rows, now);
+    assert.match(elements.get("summary").innerHTML, /Open alarms/);
+    assert.match(elements.get("summary").innerHTML, /Acknowledged/);
+    assert.match(elements.get("summary").innerHTML, /still unresolved/);
+    assert.match(elements.get("summary").innerHTML, /Shelved/);
+    assert.match(elements.get("summary").innerHTML, /Stale/);
+    assert.match(elements.get("summary").attributes["aria-label"], /shelved, 1 suppressed, 1 stale/);
+  });
+});
+
+test("alert floods collapse into parent incidents with lifecycle and action labels", async () => {
+  const now = Date.now();
+  const rows = [
+    { id: "flood-1", symbol: "AAPL", severity: "WARN", horizon_s: 60, rule_id: "FEED_STALE", ts_ms: now - 4_000, message: "feed stale 10s" },
+    { id: "flood-2", symbol: "AAPL", severity: "HIGH", horizon_s: 60, rule_id: "FEED_STALE", ts_ms: now - 3_000, message: "feed stale 12s" },
+    { id: "flood-3", symbol: "AAPL", severity: "WARN", horizon_s: 60, rule_id: "FEED_STALE", ts_ms: now - 2_000, message: "feed stale 14s" },
+    { id: "solo", symbol: "MSFT", severity: "CRIT", horizon_s: 60, rule_id: "BROKER_DOWN", ts_ms: now - 1_000, message: "broker down" },
+  ];
+
+  const groups = buildAlertIncidentGroups(rows, now);
+  const flood = groups.find((group) => group.key.includes("FEED_STALE".toLowerCase()));
+  assert.ok(flood);
+  assert.equal(flood.count, 3);
+  assert.equal(flood.parent.id, "flood-2");
+  assert.equal(flood.lifecycle.actionability, "alarm");
+
+  await withFakeDocument([], () => {
+    const incidentHost = new FakeElement("incidents");
+    renderIncidentQueue(incidentHost, rows, { nowMs: now });
+    const groupedItem = incidentHost.children.find((child) => child.dataset.groupCount === "3");
+    assert.ok(groupedItem);
+    assert.equal(groupedItem.dataset.actionability, "alarm");
+    assert.match(groupedItem.innerHTML, /3 related/);
+    assert.match(groupedItem.innerHTML, /Recommended action/);
+    assert.match(groupedItem.innerHTML, /Alarm/);
+  });
 });
 
 test("alert heatmap scoring and incident list keep HIGH distinct", async () => {

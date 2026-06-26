@@ -18,8 +18,8 @@ from typing import Dict, Any, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.storage import connect
-from engine.data.weather_features import get_weather_feature_snapshot
+from engine.runtime.storage import connect, table_exists
+from engine.data.weather_features import get_weather_feature_snapshot, zero_weather_feature_snapshot
 
 LOG = get_logger("engine.runtime.dashboard_weather_widgets")
 
@@ -51,6 +51,28 @@ def _table_columns(con, table_name: str) -> set[str]:
         return set()
 
 
+def _missing_tables(con, table_names: tuple[str, ...]) -> list[str]:
+    return [str(table_name) for table_name in table_names if not table_exists(con, table_name)]
+
+
+def _single_missing_table_reason(missing_tables: list[str], *, fallback: str) -> str:
+    if len(missing_tables) == 1:
+        return f"{missing_tables[0]}_table_missing"
+    return str(fallback)
+
+
+def _empty_meta(reason: str, *, missing_tables: list[str] | None = None) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "ready": False,
+        "status": 200,
+        "count": 0,
+        "reason": str(reason),
+    }
+    if missing_tables:
+        meta["missing_tables"] = list(missing_tables)
+    return meta
+
+
 def _optional_metric(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -63,13 +85,50 @@ def _optional_metric(value: Any) -> Optional[float]:
 def get_weather_snapshot_for_symbol(symbol: str, ts_ms: Optional[int] = None) -> Dict[str, Any]:
     if ts_ms is None:
         ts_ms = _utc_ms()
+    sym = str(symbol).upper()
+
+    con = connect()
+    try:
+        missing_required = _missing_tables(con, ("weather_forecast_region_daily",))
+        missing_optional = _missing_tables(con, ("weather_alerts",))
+    finally:
+        try:
+            con.close()
+        except Exception as e:
+            _warn_nonfatal("DASHBOARD_WEATHER_WIDGETS_CLOSE_FAILED", e, operation="get_weather_snapshot_for_symbol")
+
+    if missing_required:
+        reason = _single_missing_table_reason(
+            missing_required,
+            fallback="weather_snapshot_source_tables_missing",
+        )
+        return {
+            "ok": True,
+            "error": None,
+            "ts_ms": int(ts_ms),
+            "symbol": sym,
+            "wx": zero_weather_feature_snapshot(),
+            "meta": _empty_meta(reason, missing_tables=missing_required),
+        }
+
     # Keep the response JSON-ready so the dashboard layer can forward it
     # directly without additional translation.
     wx = get_weather_feature_snapshot(symbol=str(symbol), ts_ms=int(ts_ms)) or {}
+    meta: Dict[str, Any] = {"ready": True, "status": 200, "count": 1}
+    if missing_optional:
+        meta["degraded"] = True
+        meta["reason"] = _single_missing_table_reason(
+            missing_optional,
+            fallback="weather_snapshot_optional_tables_missing",
+        )
+        meta["missing_tables"] = missing_optional
     return {
+        "ok": True,
+        "error": None,
         "ts_ms": int(ts_ms),
-        "symbol": str(symbol).upper(),
+        "symbol": sym,
         "wx": dict(wx),
+        "meta": meta,
     }
 
 
@@ -79,6 +138,15 @@ def get_weather_effect_summary(ts_ms: Optional[int] = None) -> Dict[str, Any]:
 
     con = connect()
     try:
+        if not table_exists(con, "model_weather_effect"):
+            return {
+                "ok": True,
+                "error": None,
+                "ts_ms": int(ts_ms),
+                "series": [],
+                "meta": _empty_meta("model_weather_effect_table_missing", missing_tables=["model_weather_effect"]),
+            }
+
         columns = _table_columns(con, "model_weather_effect")
         base_spearman_expr = "base_spearman" if "base_spearman" in columns else "NULL AS base_spearman"
         wx_spearman_expr = "wx_spearman" if "wx_spearman" in columns else "NULL AS wx_spearman"
@@ -120,11 +188,14 @@ def get_weather_effect_summary(ts_ms: Optional[int] = None) -> Dict[str, Any]:
 
         out = [best[k] for k in sorted(best.keys())]
         return {
+            "ok": True,
+            "error": None,
             "ts_ms": int(ts_ms),
             "series": out,
             "meta": {
                 "ready": bool(out),
                 "status": 200,
+                "count": int(len(out)),
                 "missing_columns": sorted(
                     col
                     for col in ("base_spearman", "wx_spearman", "spearman_delta")
@@ -145,6 +216,15 @@ def get_weather_alert_summary(ts_ms: Optional[int] = None) -> Dict[str, Any]:
 
     con = connect()
     try:
+        if not table_exists(con, "weather_alerts"):
+            return {
+                "ok": True,
+                "error": None,
+                "ts_ms": int(ts_ms),
+                "active": [],
+                "meta": _empty_meta("weather_alerts_table_missing", missing_tables=["weather_alerts"]),
+            }
+
         # Treat no-expiry alerts as active for a bounded window so widgets stay
         # informative without keeping stale alerts around forever.
         # active alerts (expires_ts==0 means unknown -> treat as active for 24h)
@@ -191,7 +271,13 @@ def get_weather_alert_summary(ts_ms: Optional[int] = None) -> Dict[str, Any]:
                 LOG.warning("dashboard_weather_widgets alert_row_parse_failed", exc_info=True)
                 continue
 
-        return {"ts_ms": int(ts_ms), "active": out}
+        return {
+            "ok": True,
+            "error": None,
+            "ts_ms": int(ts_ms),
+            "active": out,
+            "meta": {"ready": bool(out), "status": 200, "count": int(len(out))},
+        }
     finally:
         try:
             con.close()

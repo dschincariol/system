@@ -48,6 +48,16 @@ from engine.api.feature_visibility import (
 LOG = logging.getLogger(__name__)
 
 
+def _bad_audit_table_response(table: str, error: BaseException, *, reason: str) -> dict:
+    return {
+        "ok": False,
+        "error": str(reason),
+        "reason": str(reason),
+        "table": str(table),
+        "meta": {"status": 400},
+    }
+
+
 def _parse_int(value, default, minimum=None, maximum=None):
     try:
         out = int(value)
@@ -205,34 +215,44 @@ def api_get_audit_records(parsed, _ctx=None):
         except (AssertionError, ValueError) as e:
             log_failure(
                 LOG,
-                event="api_dashboard_reads_unauthorized_table",
-                code="API_DASHBOARD_READS_UNAUTHORIZED_TABLE",
-                message=str(e),
+                event="api_dashboard_reads_bad_audit_table",
+                code="API_DASHBOARD_READS_BAD_AUDIT_TABLE",
+                message="unauthorized_table",
                 error=e,
                 level=logging.WARNING,
                 component="engine.api.api_dashboard_reads",
-                extra={"table": str(table)},
+                extra={"table": str(table), "reason": "unauthorized_table"},
                 persist=False,
             )
-            return {
-                "ok": False,
-                "error": "unauthorized_table",
-                "reason": "unauthorized_table",
-                "detail": str(e),
-                "meta": {"status": 400},
-            }
+            return _bad_audit_table_response(table, e, reason="unauthorized_table")
         limit = _parse_int(qs.get("limit", "100") or "100", 100, 1, 10000)
         from_id_raw = qs.get("from_id", "") or ""
         to_id_raw = qs.get("to_id", "") or ""
         from_id = _parse_int(from_id_raw, 0, 1) if from_id_raw else None
         to_id = _parse_int(to_id_raw, 0, 1) if to_id_raw else None
-        return get_audit_records(table=table, limit=limit, from_id=from_id, to_id=to_id)
+        try:
+            return get_audit_records(table=table, limit=limit, from_id=from_id, to_id=to_id)
+        except ValueError as e:
+            if str(e).startswith("not_audit_table:"):
+                log_failure(
+                    LOG,
+                    event="api_dashboard_reads_bad_audit_table",
+                    code="API_DASHBOARD_READS_BAD_AUDIT_TABLE",
+                    message="not_audit_table",
+                    error=e,
+                    level=logging.WARNING,
+                    component="engine.api.api_dashboard_reads",
+                    extra={"table": str(table), "reason": "not_audit_table"},
+                    persist=False,
+                )
+                return _bad_audit_table_response(table, e, reason="not_audit_table")
+            raise
     except Exception as e:
         return failure_response(
             LOG,
             event="api_dashboard_reads_audit_records_failed",
             code="API_DASHBOARD_AUDIT_RECORDS_FAILED",
-            message=str(e),
+            message="audit_records_failed",
             error=e,
             component="engine.api.api_dashboard_reads",
             ctx=_ctx,

@@ -26,7 +26,7 @@ sudo groupadd --system trading 2>/dev/null || true
 sudo install -d -o root -g trading -m 0750 /etc/trading
 openssl rand -hex 32 | sudo tee /etc/trading/backup_evidence.hmac.key >/dev/null
 sudo chown root:trading /etc/trading/backup_evidence.hmac.key
-sudo chmod 0640 /etc/trading/backup_evidence.hmac.key
+sudo chmod 0600 /etc/trading/backup_evidence.hmac.key
 ```
 3. Create the secret files referenced by `.env`. Keep these files outside the repository checkout and use owner `root:trading` or the service user with mode `0600`:
 

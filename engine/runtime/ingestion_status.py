@@ -14,6 +14,7 @@ import time
 from typing import Any, Dict, Optional
 
 from engine.runtime.runtime_meta import meta_get, meta_set
+from engine.runtime.feed_truth import classify_pipeline_liveness
 from engine.runtime.storage import connect_ro
 from engine.runtime.telemetry_append_buffer import append_ingestion_pipeline_health_row
 from engine.runtime.timeseries_write_policy import get_timeseries_write_policy
@@ -260,12 +261,27 @@ def pipeline_health_summary(*, stale_after_s: float = 900.0) -> Dict[str, Any]:
     pipelines = get_all_pipeline_statuses()
     healthy = 0
     stale = 0
+    not_live = 0
+    simulated = 0
+    missing_credentials = 0
     for status in pipelines.values():
         updated_ts_ms = int(status.get("updated_ts_ms") or 0)
         age_ms = max(0, now_ms - updated_ts_ms) if updated_ts_ms > 0 else 10**12
         status["age_ms"] = int(age_ms)
         status["stale"] = bool(age_ms > max_age_ms)
-        if bool(status.get("ok")) and not bool(status.get("stale")):
+        truth = classify_pipeline_liveness(status)
+        if bool(truth.get("applies")):
+            status.update(truth)
+            if not bool(truth.get("live_market_data_ok")) and bool(status.get("ok")) and not bool(status.get("stale")):
+                not_live += 1
+                if bool(truth.get("simulated")):
+                    simulated += 1
+                if str(truth.get("live_feed_status") or "") == "missing_credentials":
+                    missing_credentials += 1
+        counts_as_healthy = bool(status.get("ok")) and not bool(status.get("stale")) and bool(
+            truth.get("live_market_data_ok", True)
+        )
+        if counts_as_healthy:
             healthy += 1
         if bool(status.get("stale")):
             stale += 1
@@ -274,6 +290,9 @@ def pipeline_health_summary(*, stale_after_s: float = 900.0) -> Dict[str, Any]:
         "total": int(len(pipelines)),
         "healthy": int(healthy),
         "stale": int(stale),
+        "not_live": int(not_live),
+        "simulated": int(simulated),
+        "missing_credentials": int(missing_credentials),
         "stale_after_s": float(stale_after_s),
         "pipelines": pipelines,
         "updated_ts_ms": int(now_ms),

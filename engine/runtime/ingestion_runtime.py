@@ -33,6 +33,7 @@ from engine.runtime.ingestion_shards import (
     ingestion_state_key,
 )
 from engine.runtime.ipc import publish_channel_state, publish_message
+from engine.runtime.feed_truth import annotate_provider_map_liveness
 from engine.runtime.job_registry import ALLOWED_JOBS, INGESTION_DAEMON_JOBS
 from engine.runtime.platform import default_local_log_dir
 from engine.runtime.runtime_meta import meta_get
@@ -99,7 +100,10 @@ _PROVIDER_ALERT_STATE = {}
 _CHILDREN_LOCK = threading.RLock()
 _SUPERVISOR_SNAPSHOT_CACHE_LOCK = threading.RLock()
 _SUPERVISOR_SNAPSHOT_CACHE: Dict[str, Dict[str, object]] = {}
-_DATA_SOURCE_CONFIG_SNAPSHOT_NAMES = ("child_control_plane", "enabled_price_providers")
+_DATA_SOURCE_CONFIG_SNAPSHOT_NAMES = (
+    "child_control_plane",
+    "enabled_price_providers",
+)
 _LAST_DATA_SOURCES_RELOAD_TS_MS: Optional[int] = None
 
 
@@ -1772,6 +1776,7 @@ def _load_latest_price_source_rows() -> Dict[str, object]:
     cutoff_ms = int(time.time() * 1000 - effective_max_age_ms)
     con = connect_ro()
     row = (0, 0, 0)
+    latest_price_source = ""
     provider_rows: List[Dict[str, object]] = []
     try:
         row = con.execute(
@@ -1783,6 +1788,19 @@ def _load_latest_price_source_rows() -> Dict[str, object]:
             """,
             (int(cutoff_ms),),
         ).fetchone() or (0, 0, 0)
+        try:
+            source_row = con.execute(
+                """
+                SELECT source
+                FROM prices
+                WHERE price IS NOT NULL
+                ORDER BY ts_ms DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            latest_price_source = str((source_row or [""])[0] or "")
+        except Exception:
+            latest_price_source = ""
 
         try:
             raw_provider_rows = con.execute(
@@ -1828,6 +1846,7 @@ def _load_latest_price_source_rows() -> Dict[str, object]:
             _safe_int(row[1], 0),
             _safe_int(row[2], 0),
         ),
+        "latest_price_source": latest_price_source,
         "provider_rows": provider_rows,
     }
 
@@ -1903,10 +1922,22 @@ def _latest_prices_state() -> Dict[str, object]:
 
     fresh_rows = _safe_int(row[0] if len(row) > 0 else 0, 0)
     fresh_symbols = _safe_int(row[1] if len(row) > 1 else 0, 0)
+    latest_price_source = str(snapshot_rows.get("latest_price_source") or "")
 
     if healthy <= 0 and fresh_rows > 0 and last_price_ts_ms > 0 and age_ms < effective_max_age_ms:
-        providers["derived_from_prices"] = {"last_ts_ms": int(last_price_ts_ms), "ok": True}
+        providers["derived_from_prices"] = {
+            "last_ts_ms": int(last_price_ts_ms),
+            "ok": True,
+            "simulated": latest_price_source.lower() == "simulated",
+            "source": latest_price_source,
+        }
         healthy = 1
+    truth = annotate_provider_map_liveness(
+        providers,
+        missing_credential_env_vars=[],
+    )
+    providers = truth["providers"]
+    live_healthy = int(truth["live_healthy_providers"])
 
     provider_errors = {
         str(name): str(info.get("error") or "")
@@ -1921,7 +1952,13 @@ def _latest_prices_state() -> Dict[str, object]:
         "price_age_ms": int(age_ms),
         "providers": providers,
         "provider_errors": provider_errors,
-        "healthy_providers": int(healthy),
+        "raw_healthy_providers": int(healthy),
+        "healthy_providers": int(live_healthy),
+        "live_healthy_providers": int(live_healthy),
+        "simulated_healthy_providers": int(truth["simulated_healthy_providers"]),
+        "missing_credential_env_vars": list(truth["missing_credential_env_vars"]),
+        "live_market_data_ok": bool(truth["live_market_data_ok"] and fresh_rows > 0),
+        "live_feed_status": str(truth["live_feed_status"] or "degraded"),
         "updated_ts_ms": int(now_ms),
     }
 

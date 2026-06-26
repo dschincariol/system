@@ -1086,7 +1086,7 @@ paths:
       operationId: getOperatorRuntimeWatchdogs
       responses:
         '200':
-          description: Watchdog payload containing job heartbeat state, restart counters, and ingestion freshness.
+          description: Watchdog payload containing job heartbeat state, restart counters, and ingestion freshness. Top-level `ok` reflects response-envelope success; operational watchdog health is reported by `watchdogs_ok` and `watchdog_reasons`.
           content:
             application/json:
               schema:
@@ -1394,7 +1394,11 @@ paths:
         template metadata. Template rows include provider setup guidance,
         docs/signup links, plan notes, credential and setting field schemas,
         validation hints, used-by references, inheritance status, and safety
-        warnings used by the data-source UI.
+        warnings used by the data-source UI. Local safe loopback reads are
+        intentionally open, while production/live and LAN/remote-bind sensitive
+        reads require `X-API-Token`. The response `auth` object reports this as
+        explicit mutation/read posture fields such as `mutation_token_required`,
+        `read_open_on_loopback`, and `read_token_required_on_lan`.
       operationId: getDataSources
       responses:
         '200':
@@ -1403,6 +1407,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FreeformObject'
+        '401':
+          description: Sensitive read auth failed on production/live or LAN/remote-bind deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/data_sources/logs:
     get:
       tags: [data-sources]

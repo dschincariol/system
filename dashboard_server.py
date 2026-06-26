@@ -32,6 +32,9 @@ APIs:
   /api/confidence_massv
 """
 import json
+import base64
+import hashlib
+import hmac
 import importlib
 import os
 import sys
@@ -63,6 +66,7 @@ from engine.dashboard.serialization import (
     normalize_explain_json as _dashboard_normalize_explain_json,
     snapshot_json_default as _dashboard_snapshot_json_default,
 )
+from engine.api.degradation import degraded_empty_read
 from engine.runtime.platform import (
     apply_network_mode_bind_defaults as _apply_network_mode_bind_defaults,
     default_local_log_dir,
@@ -809,6 +813,38 @@ def _operator_sidecar_ws_url() -> str:
     return _operator_sidecar_base_url().replace("http://", "ws://", 1) + "/ws/operator"
 
 
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _operator_ws_ticket_origin(headers) -> str:
+    host = str(headers.get("Host") or "").strip()
+    if not host:
+        host, port = _operator_sidecar_host_port()
+        host = f"{host}:{port}"
+    proto = str(headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().lower()
+    if proto not in {"http", "https"}:
+        proto = "http"
+    return f"{proto}://{host}"
+
+
+def _operator_ws_ticket_for_origin(origin: str) -> tuple[str, int]:
+    token = _operator_sidecar_api_token()
+    if not token:
+        raise RuntimeError("operator_token_unconfigured")
+    expires_at_ms = int(time.time() * 1000) + 60_000
+    payload = {
+        "aud": "operator_ws",
+        "origin": str(origin or "").strip(),
+        "exp_ms": expires_at_ms,
+        "iat_ms": int(time.time() * 1000),
+    }
+    payload_raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = _b64url(payload_raw)
+    signature = hmac.new(token.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256).digest()
+    return f"{payload_b64}.{_b64url(signature)}", expires_at_ms
+
+
 def _operator_sidecar_status_payload(timeout_s: Optional[float] = None) -> dict:
     timeout = float(timeout_s if timeout_s is not None else min(_OPERATOR_PROXY_TIMEOUT_S, 2.0))
     base_url = _operator_sidecar_base_url()
@@ -824,10 +860,16 @@ def _operator_sidecar_status_payload(timeout_s: Optional[float] = None) -> dict:
         "action": "Start or restart the Node operator sidecar if reachable is false.",
         "websocket": {
             "proxy_enabled": False,
+            "direct_sidecar_required": True,
+            "path": "/ws/operator",
+            "ticket_endpoint": "/operator/ws_ticket",
+            "auth": "short-lived dashboard-minted ticket via Sec-WebSocket-Protocol; raw operator token accepted only for direct sidecar access and compatibility tooling",
+            "origin_checked": True,
             "deferred_reason": (
                 "Python SimpleHTTPRequestHandler does not safely implement "
-                "WebSocket upgrade proxying; the bridged UI uses HTTP proxy "
-                "paths and polling through the dashboard origin."
+                "WebSocket upgrade proxying. The bridged operator UI keeps "
+                "HTTP calls on /operator/api/* and connects telemetry directly "
+                "to the authenticated sidecar WebSocket."
             ),
         },
         "meta": {"status": 200},
@@ -1301,15 +1343,39 @@ def _wrap_operator_console_routes(BaseHandler):
                 self._operator_send_json(200, _operator_sidecar_status_payload())
                 return True
 
+            if path == "/operator/ws_ticket":
+                if not self._operator_require_bridge_read_gate("/operator/ws_ticket"):
+                    return True
+                try:
+                    origin = _operator_ws_ticket_origin(self.headers)
+                    ticket, expires_at_ms = _operator_ws_ticket_for_origin(origin)
+                except Exception as e:
+                    _warn_nonfatal("DASHBOARD_SERVER_OPERATOR_WS_TICKET_FAILED", e)
+                    self._operator_send_json(503, {
+                        "ok": False,
+                        "error": "operator_ws_ticket_unavailable",
+                        "detail": f"{type(e).__name__}: {e}",
+                    })
+                    return True
+                self._operator_send_json(200, {
+                    "ok": True,
+                    "ticket": ticket,
+                    "expires_at_ms": expires_at_ms,
+                    "origin": origin,
+                    "protocol": "operator-ticket",
+                }, headers={"Cache-Control": "no-store"})
+                return True
+
             if path == "/operator/ws/operator":
                 self._operator_send_json(426, {
                     "ok": False,
                     "error": "websocket_proxy_deferred",
-                    "action": "Use dashboard HTTP polling until same-origin WebSocket proxying is implemented.",
+                    "action": "Use the operator UI direct sidecar WebSocket target for telemetry.",
                     "detail": (
                         "The Python dashboard bridge proxies HTTP only. "
-                        "The operator sidecar is not a LAN entrypoint in the "
-                        "production contract."
+                        "The operator UI keeps API calls on this bridge and "
+                        "opens /ws/operator directly on the authenticated "
+                        "sidecar origin for telemetry."
                     ),
                 }, headers={"Upgrade": "websocket"})
                 return True
@@ -2239,18 +2305,39 @@ def api_post_copilot_ask(_parsed, body=None, _ctx=None):
     """
     payload = body if isinstance(body, dict) else {}
     if payload.get("__body_error__"):
+        body_error = str(payload.get("__body_error__") or "invalid_request_body")
+        body_status = 413 if body_error == "body_too_large" else 400
         return {
             "ok": False,
+            "error": body_error,
+            "reason": "Copilot request body could not be read safely.",
+            "reason_code": body_error,
             "answer": "Copilot request could not be read safely. Try a shorter question.",
             "suggested_actions": [
                 "Review the health summary, active alerts, and execution barrier directly in the dashboard.",
             ],
-            "error": str(payload.get("__body_error__")),
+            "meta": {"status": body_status},
         }
 
     question = _copilot_text(payload.get("question") or "", _COPILOT_MAX_QUESTION_CHARS)
     active_view = _copilot_view(payload.get("active_view"))
     persona = _copilot_persona(payload.get("persona"))
+
+    if not question:
+        return {
+            "ok": False,
+            "error": "missing_question",
+            "reason": "A non-empty copilot question is required.",
+            "reason_code": "missing_question",
+            "answer": "Ask a question such as “why is health degraded?” or “explain this alert.”",
+            "suggested_actions": _copilot_suggested_actions(
+                active_view=active_view,
+                active_alert={},
+                server_context={},
+            ),
+            "meta": {"status": 422},
+        }
+
     visible_state = _copilot_compact(_json_dict(payload.get("visible_state")), max_depth=3)
     history = _copilot_history(payload.get("history"))
     active_alert = _copilot_active_alert(payload, _ctx)
@@ -2261,18 +2348,15 @@ def api_post_copilot_ask(_parsed, body=None, _ctx=None):
         server_context=server_context,
     )
 
-    if not question:
-        return {
-            "ok": False,
-            "answer": "Ask a question such as “why is health degraded?” or “explain this alert.”",
-            "suggested_actions": suggested_actions,
-        }
-
     if not str(COPILOT_LLM_ENDPOINT or "").strip():
         return {
             "ok": False,
+            "error": None,
+            "reason": "No read-only copilot model endpoint is configured.",
+            "reason_code": "copilot_llm_unconfigured",
             "answer": "AI copilot is unavailable because no read-only model endpoint is configured for this dashboard.",
             "suggested_actions": suggested_actions,
+            "meta": {"status": 200},
         }
 
     prompt_payload = _copilot_prompt_payload(
@@ -2288,8 +2372,12 @@ def api_post_copilot_ask(_parsed, body=None, _ctx=None):
     if not answer:
         return {
             "ok": False,
+            "error": "copilot_llm_unavailable",
+            "reason": "The configured read-only copilot model endpoint did not return an answer.",
+            "reason_code": "copilot_llm_unavailable",
             "answer": "AI copilot is temporarily unavailable. Review the suggested dashboard panels directly.",
             "suggested_actions": suggested_actions,
+            "meta": {"status": 503},
         }
 
     return {
@@ -2877,6 +2965,7 @@ _OPS_HANDLER_NAMES = [
     "api_get_validation",
     "api_get_model_diagnostics",
     "api_get_model_registry",
+    "api_get_model_lifecycle",
     "api_get_model_performance_divergence",
     "api_get_embed_model_eval",
     "api_get_embed_conf_calib",
@@ -2921,6 +3010,7 @@ api_get_feeds = _unavailable("api_get_feeds")
 api_get_validation = _unavailable("api_get_validation")
 api_get_model_diagnostics = _unavailable("api_get_model_diagnostics")
 api_get_model_registry = _unavailable("api_get_model_registry")
+api_get_model_lifecycle = _unavailable("api_get_model_lifecycle")
 api_get_model_performance_divergence = _unavailable("api_get_model_performance_divergence")
 api_get_embed_model_eval = _unavailable("api_get_embed_model_eval")
 api_get_embed_conf_calib = _unavailable("api_get_embed_conf_calib")
@@ -3906,34 +3996,161 @@ def _dashboard_db_connect():
 
 
 def _dashboard_table_exists(con, table_name):
+    table = str(table_name or "").strip()
+    if not table.replace("_", "").isalnum():
+        return False
+    try:
+        con.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+        return True
+    except Exception as e:
+        _warn_nonfatal(
+            "DASHBOARD_SERVER_TABLE_DIRECT_PROBE_FAILED",
+            e,
+            table_name=table,
+        )
     try:
         row = con.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-            (str(table_name),),
+            (table,),
         ).fetchone()
         return bool(row)
     except Exception as e:
         _warn_nonfatal(
             "DASHBOARD_SERVER_TABLE_EXISTS_FAILED",
             e,
-            table_name=str(table_name),
+            table_name=table,
         )
         exists = False
         return exists
 
 
 def _dashboard_table_columns(con, table_name):
+    table = str(table_name or "").strip()
+    if not table.replace("_", "").isalnum():
+        return []
     try:
-        rows = con.execute(f"PRAGMA table_info({table_name})").fetchall() or []
-        return [str(r[1]) for r in rows if len(r) > 1]
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall() or []
+        cols = [str(r[1]) for r in rows if len(r) > 1]
+        if cols:
+            return cols
+    except Exception as e:
+        _warn_nonfatal(
+            "DASHBOARD_SERVER_TABLE_COLUMNS_PRAGMA_FAILED",
+            e,
+            table_name=table,
+        )
+    try:
+        cur = con.execute(f"SELECT * FROM {table} LIMIT 0")
+        return [str(d[0]) for d in (cur.description or []) if d and d[0]]
     except Exception as e:
         _warn_nonfatal(
             "DASHBOARD_SERVER_TABLE_COLUMNS_FAILED",
             e,
-            table_name=str(table_name),
+            table_name=table,
         )
         columns: list[str] = []
         return columns
+
+
+def _dashboard_table_missing_reason(table_name: str) -> str:
+    table = str(table_name or "").strip()
+    return f"{table}_table_missing" if table else "table_missing"
+
+
+def _dashboard_empty_read_payload(
+    *,
+    reason: str,
+    source: str,
+    table_present: bool | None,
+    count: int = 0,
+    **extra: Any,
+) -> dict[str, Any]:
+    return degraded_empty_read(
+        reason,
+        source=source,
+        table_present=table_present,
+        count=count,
+        **extra,
+    )
+
+
+def _dashboard_empty_table_payload(
+    *,
+    table_name: str,
+    table_present: bool,
+    empty_reason: str,
+    count: int = 0,
+    **extra: Any,
+) -> dict[str, Any]:
+    return _dashboard_empty_read_payload(
+        reason=str(empty_reason) if table_present else _dashboard_table_missing_reason(table_name),
+        source=str(table_name),
+        table_present=bool(table_present),
+        count=count,
+        **extra,
+    )
+
+
+def _dashboard_audit_marker(con, *, rows: list[Any] | None = None) -> dict[str, Any]:
+    audit_rows = list(rows or [])
+    if audit_rows:
+        return {
+            "ready": True,
+            "reason": "promotion_audit_ready",
+            "source": "model_promotion_audit",
+            "table_present": True,
+            "count": int(len(audit_rows)),
+        }
+    table_present = _dashboard_table_exists(con, "model_promotion_audit")
+    reason = "no_promotions_yet" if table_present else _dashboard_table_missing_reason("model_promotion_audit")
+    return {
+        "ready": False,
+        "reason": reason,
+        "source": "model_promotion_audit",
+        "table_present": bool(table_present),
+        "count": 0,
+    }
+
+
+def _dashboard_attach_audit_marker(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    audit = payload.get("audit")
+    if not isinstance(audit, list):
+        return payload
+    if isinstance(payload.get("audit_meta"), dict):
+        return payload
+    if audit:
+        out = dict(payload)
+        marker = _dashboard_audit_marker(None, rows=audit)
+        out["audit_meta"] = marker
+        out["audit_ready"] = True
+        out["audit_reason"] = str(marker.get("reason") or "")
+        return out
+    con = None
+    try:
+        con = _dashboard_db_connect()
+        marker = _dashboard_audit_marker(con, rows=audit)
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_AUDIT_MARKER_FAILED", e, endpoint="promotion_audit_marker")
+        marker = {
+            "ready": False,
+            "reason": "promotion_audit_marker_unavailable",
+            "source": "model_promotion_audit",
+            "table_present": None,
+            "count": int(len(audit)),
+        }
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception as e:
+            _warn_nonfatal("DASHBOARD_SERVER_API_CON_CLOSE_FAILED", e, endpoint="promotion_audit_marker")
+    out = dict(payload)
+    out["audit_meta"] = marker
+    out["audit_ready"] = bool(marker.get("ready"))
+    out["audit_reason"] = str(marker.get("reason") or "")
+    return out
 
 
 def _dashboard_parse_json(value, default=None):
@@ -3981,7 +4198,13 @@ def api_get_market_stress_history(parsed, _ctx=None):
         thresholds = market_stress_thresholds()
 
         if not _dashboard_table_exists(con, "prices"):
-            return {"ok": True, "series": [], "thresholds": thresholds}
+            return _dashboard_empty_table_payload(
+                table_name="prices",
+                table_present=False,
+                empty_reason="no_market_stress_history_yet",
+                series=[],
+                thresholds=thresholds,
+            )
 
         rows = con.execute(
             """
@@ -3996,6 +4219,14 @@ def api_get_market_stress_history(parsed, _ctx=None):
 
         ts_values = [int(r[0]) for r in rows if r and r[0] is not None]
         ts_values.reverse()
+        if not ts_values:
+            return _dashboard_empty_table_payload(
+                table_name="prices",
+                table_present=True,
+                empty_reason="no_market_stress_history_yet",
+                series=[],
+                thresholds=thresholds,
+            )
 
         for ts_ms in ts_values:
             try:
@@ -4016,7 +4247,15 @@ def api_get_market_stress_history(parsed, _ctx=None):
         return {"ok": True, "series": series, "thresholds": thresholds}
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_MARKET_STRESS_HISTORY_FAILED", e, endpoint="api_get_market_stress_history")
-        return {"ok": False, "error": str(e), "series": []}
+        return {
+            "ok": False,
+            "error": str(e),
+            "ready": False,
+            "reason": "market_stress_history_read_failed",
+            "source": "prices",
+            "series": [],
+            "meta": {"ready": False, "reason": "market_stress_history_read_failed", "source": "prices", "count": 0},
+        }
     finally:
         try:
             if con is not None:
@@ -4189,14 +4428,28 @@ def api_get_strategy_metrics(parsed, _ctx=None):
     try:
         con = _dashboard_db_connect()
         if not _dashboard_table_exists(con, "strategy_metrics"):
-            return []
+            return _dashboard_empty_table_payload(
+                table_name="strategy_metrics",
+                table_present=False,
+                empty_reason="no_strategy_metrics_yet",
+                data=[],
+                rows=[],
+                strategies=[],
+            )
 
         cols = set(_dashboard_table_columns(con, "strategy_metrics"))
         strategy_col = "strategy_name" if "strategy_name" in cols else ("strategy" if "strategy" in cols else None)
         ts_col = "ts_ms" if "ts_ms" in cols else None
         metrics_col = "metrics_json" if "metrics_json" in cols else None
         if not strategy_col or not ts_col or not metrics_col:
-            return []
+            return _dashboard_empty_read_payload(
+                reason="strategy_metrics_schema_incomplete",
+                source="strategy_metrics",
+                table_present=True,
+                data=[],
+                rows=[],
+                strategies=[],
+            )
         window_expr = "window_days" if "window_days" in cols else "0 AS window_days"
         rows = con.execute(
             f"""
@@ -4207,6 +4460,15 @@ def api_get_strategy_metrics(parsed, _ctx=None):
             """,
             (int(limit),),
         ).fetchall() or []
+        if not rows:
+            return _dashboard_empty_table_payload(
+                table_name="strategy_metrics",
+                table_present=True,
+                empty_reason="no_strategy_metrics_yet",
+                data=[],
+                rows=[],
+                strategies=[],
+            )
 
         out = []
         for strategy_name, window_days, ts_ms, metrics_json in rows:
@@ -4243,10 +4505,29 @@ def api_get_strategy_metrics(parsed, _ctx=None):
                     strategy_name=str(strategy_name or ""),
                 )
                 continue
+        if not out:
+            return _dashboard_empty_read_payload(
+                reason="strategy_metrics_rows_unreadable",
+                source="strategy_metrics",
+                table_present=True,
+                data=[],
+                rows=[],
+                strategies=[],
+            )
         return out
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_STRATEGY_METRICS_FAILED", e, endpoint="api_get_strategy_metrics")
-        return []
+        return {
+            "ok": False,
+            "error": str(e),
+            "ready": False,
+            "reason": "strategy_metrics_read_failed",
+            "source": "strategy_metrics",
+            "data": [],
+            "rows": [],
+            "strategies": [],
+            "meta": {"ready": False, "reason": "strategy_metrics_read_failed", "source": "strategy_metrics", "count": 0},
+        }
     finally:
         try:
             if con is not None:
@@ -4418,7 +4699,14 @@ def api_get_promotion_audit(parsed, _ctx=None):
     try:
         con = _dashboard_db_connect()
         if not _dashboard_table_exists(con, "model_promotion_audit"):
-            return []
+            return _dashboard_empty_table_payload(
+                table_name="model_promotion_audit",
+                table_present=False,
+                empty_reason="no_promotions_yet",
+                data=[],
+                rows=[],
+                audit=[],
+            )
 
         rows = con.execute(
             """
@@ -4429,6 +4717,15 @@ def api_get_promotion_audit(parsed, _ctx=None):
             """,
             (int(limit),),
         ).fetchall() or []
+        if not rows:
+            return _dashboard_empty_table_payload(
+                table_name="model_promotion_audit",
+                table_present=True,
+                empty_reason="no_promotions_yet",
+                data=[],
+                rows=[],
+                audit=[],
+            )
 
         out = []
         for r in rows:
@@ -4485,7 +4782,17 @@ def api_get_promotion_audit(parsed, _ctx=None):
         return out
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_PROMOTION_AUDIT_FAILED", e, endpoint="api_get_promotion_audit")
-        return []
+        return {
+            "ok": False,
+            "error": str(e),
+            "ready": False,
+            "reason": "promotion_audit_read_failed",
+            "source": "model_promotion_audit",
+            "data": [],
+            "rows": [],
+            "audit": [],
+            "meta": {"ready": False, "reason": "promotion_audit_read_failed", "source": "model_promotion_audit", "count": 0},
+        }
     finally:
         try:
             if con is not None:
@@ -4508,7 +4815,13 @@ def api_get_causal_scores(parsed, _ctx=None):
     try:
         con = _dashboard_db_connect()
         if not _dashboard_table_exists(con, "causal_scores"):
-            return []
+            return _dashboard_empty_table_payload(
+                table_name="causal_scores",
+                table_present=False,
+                empty_reason="no_causal_scores_yet",
+                data=[],
+                rows=[],
+            )
 
         where = []
         params = []
@@ -4542,6 +4855,14 @@ def api_get_causal_scores(parsed, _ctx=None):
             """,
             tuple(params + [int(limit)]),
         ).fetchall() or []
+        if not rows:
+            return _dashboard_empty_table_payload(
+                table_name="causal_scores",
+                table_present=True,
+                empty_reason="no_causal_scores_yet",
+                data=[],
+                rows=[],
+            )
 
         return [
             {
@@ -4560,7 +4881,16 @@ def api_get_causal_scores(parsed, _ctx=None):
         ]
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_CAUSAL_SCORES_FAILED", e, endpoint="api_get_causal_scores")
-        return []
+        return {
+            "ok": False,
+            "error": str(e),
+            "ready": False,
+            "reason": "causal_scores_read_failed",
+            "source": "causal_scores",
+            "data": [],
+            "rows": [],
+            "meta": {"ready": False, "reason": "causal_scores_read_failed", "source": "causal_scores", "count": 0},
+        }
     finally:
         try:
             if con is not None:
@@ -4590,6 +4920,7 @@ from engine.api.api_system import (
     api_get_telemetry_history,
     api_get_execution_barrier,
     api_get_monte_carlo_risk,
+    api_get_allocator_status,
     api_get_alpha_decay,
     api_get_regime_context,
     api_get_regime_history,
@@ -5193,7 +5524,7 @@ def api_get_promotion_status(_parsed=None, _ctx=None):
 def api_get_promotion_explain(_parsed=None, _ctx=None):
     try:
         from engine.api.api_governance import get_promotion_explain as _impl
-        return _impl()
+        return _dashboard_attach_audit_marker(_impl())
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_PROMOTION_EXPLAIN_FAILED", e)
         return {"ok": False, "error": f"promotion_explain_unavailable:{e}"}
@@ -5202,7 +5533,7 @@ def api_get_promotion_explain(_parsed=None, _ctx=None):
 def api_get_governance_summary(_parsed=None, _ctx=None):
     try:
         from engine.api.api_governance import get_governance_summary as _impl
-        return _impl()
+        return _dashboard_attach_audit_marker(_impl())
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_GOVERNANCE_SUMMARY_FAILED", e)
         return {"ok": False, "error": f"governance_summary_unavailable:{e}"}
@@ -5502,6 +5833,35 @@ def api_post_self_heal(_parsed, _body=None, _ctx=None):
 # OPERATOR SUMMARY (Human readable system explanation)
 # ------------------------------------------------------
 
+def _market_session_data_status(parsed=None) -> dict[str, Any]:
+    symbol = _qs_value(parsed, "symbol", "").strip().upper()
+    try:
+        from engine.runtime.price_read_router import fetch_price_rows
+
+        rows = fetch_price_rows(symbol=symbol, limit=1) or []
+        latest = rows[0] if rows else {}
+        latest_ts_ms = int((latest or {}).get("ts_ms") or 0) if latest else 0
+        ready = bool(latest_ts_ms and ((latest or {}).get("price") is not None or (latest or {}).get("px") is not None))
+        return {
+            "data_ready": ready,
+            "data_reason": "ok" if ready else "no_price_rows",
+            "data_symbol": symbol or None,
+            "data_source": str((latest or {}).get("source") or "price_read_router"),
+            "last_price_ts_ms": latest_ts_ms or None,
+            "data_count": int(len(rows)),
+        }
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_MARKET_SESSION_DATA_READY_FAILED", e, endpoint="api_get_market_session")
+        return {
+            "data_ready": False,
+            "data_reason": f"price_read_error:{type(e).__name__}",
+            "data_symbol": symbol or None,
+            "data_source": "price_read_router",
+            "last_price_ts_ms": None,
+            "data_count": 0,
+        }
+
+
 def api_get_market_session(_parsed=None, _ctx=None):
     try:
         now = time.localtime()
@@ -5515,10 +5875,13 @@ def api_get_market_session(_parsed=None, _ctx=None):
         else:
             state = "CLOSED"
 
+        data_status = _market_session_data_status(_parsed)
         return {
             "ok": True,
             "state": state,
+            **data_status,
             "ts_ms": int(time.time() * 1000),
+            "meta": {"status": 200, "data_ready": bool(data_status.get("data_ready"))},
         }
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_MARKET_SESSION_FAILED", e, endpoint="api_get_market_session")
@@ -5682,7 +6045,9 @@ try:
         api_post_data_source_disable,
         api_post_data_source_enable,
         api_post_data_source_account_update,
+        api_post_data_source_populate_now,
         api_post_data_source_test,
+        api_post_data_source_test_save,
         api_post_data_source_update,
     )
 except Exception:
@@ -5694,7 +6059,9 @@ except Exception:
     api_post_data_source_enable = None
     api_post_data_source_disable = None
     api_post_data_source_account_update = None
+    api_post_data_source_populate_now = None
     api_post_data_source_test = None
+    api_post_data_source_test_save = None
 
 try:
     from engine.api.api_broker_config import (
@@ -5742,6 +6109,7 @@ API_HANDLERS = {
     "api_get_execution_barrier": api_get_execution_barrier,
     "api_get_db_health": api_get_db_health,
     "api_get_monte_carlo_risk": api_get_monte_carlo_risk,
+    "api_get_allocator_status": api_get_allocator_status,
     "api_get_alpha_decay": api_get_alpha_decay,
     "api_get_regime_context": api_get_regime_context,
     "api_get_regime_history": api_get_regime_history,
@@ -5794,6 +6162,8 @@ API_HANDLERS = {
     "api_post_data_source_disable": api_post_data_source_disable,
     "api_post_data_source_account_update": api_post_data_source_account_update,
     "api_post_data_source_test": api_post_data_source_test,
+    "api_post_data_source_test_save": api_post_data_source_test_save,
+    "api_post_data_source_populate_now": api_post_data_source_populate_now,
 
     # BROKER CONFIG
     "api_get_broker_config": api_get_broker_config,
@@ -5808,6 +6178,7 @@ API_HANDLERS = {
     "api_get_validation": api_get_validation,
     "api_get_model_diagnostics": api_get_model_diagnostics,
     "api_get_model_registry": api_get_model_registry,
+    "api_get_model_lifecycle": api_get_model_lifecycle,
     "api_get_model_performance_divergence": api_get_model_performance_divergence,
     "api_get_embed_model_eval": api_get_embed_model_eval,
     "api_get_embed_conf_calib": api_get_embed_conf_calib,

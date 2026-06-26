@@ -147,6 +147,26 @@ def test_strict_policy_rejects_missing_secret_file_source(tmp_path: Path) -> Non
     )
 
 
+def test_strict_policy_error_reports_all_invalid_secret_files(tmp_path: Path) -> None:
+    from engine.runtime.secret_sources import format_secret_source_policy_error, secret_source_policy_snapshot
+
+    empty_operator_file = _write_secret_file(tmp_path / "secrets" / "operator_api_token", "")
+    snapshot = secret_source_policy_snapshot(
+        environ=_strict_env(
+            tmp_path,
+            DASHBOARD_API_TOKEN_FILE=str(tmp_path / "secrets" / "missing_dashboard_api_token"),
+            OPERATOR_API_TOKEN_FILE=str(empty_operator_file),
+        ),
+        repo_root=tmp_path,
+        validate_files=True,
+    )
+    message = format_secret_source_policy_error(snapshot)
+
+    assert snapshot["ok"] is False
+    assert "secret_file_invalid:DASHBOARD_API_TOKEN" in message
+    assert "secret_file_invalid:OPERATOR_API_TOKEN" in message
+
+
 def test_strict_policy_rejects_empty_secret_file_source(tmp_path: Path) -> None:
     from engine.runtime.secret_sources import secret_source_policy_snapshot
 

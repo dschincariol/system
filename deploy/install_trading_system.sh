@@ -203,6 +203,10 @@ if is_placeholder_secret "DATA_SOURCE_MASTER_KEY"; then
   set_env_value "DATA_SOURCE_MASTER_KEY" ""
 fi
 ensure_generated_secret_file "$MASTER_KEY_FILE"
+BACKUP_EVIDENCE_KEY_FILE="$DATA_DIR/.backup_evidence_hmac_key"
+set_env_value "BACKUP_EVIDENCE_HMAC_KEY_SECRET" ""
+set_env_value "BACKUP_EVIDENCE_HMAC_KEY_FILE" "$BACKUP_EVIDENCE_KEY_FILE"
+ensure_generated_secret_file "$BACKUP_EVIDENCE_KEY_FILE"
 set_env_value "DASHBOARD_BASE" "http://127.0.0.1:8000"
 ensure_generated_secret "DASHBOARD_API_TOKEN"
 chmod 0600 "$ENV_FILE"

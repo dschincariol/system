@@ -367,7 +367,7 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "BACKUP_EVIDENCE_RTO_S=1800",
             "BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S=120",
             "BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1",
-            "BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key",
+            "BACKUP_EVIDENCE_HMAC_KEY_FILE=../../data/secrets/backup_evidence_hmac_key",
             'TIMESCALE_ARCHIVE_COMMAND=/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
             "DOCKER_LOG_DRIVER=local",
             "DOCKER_LOG_MAX_SIZE=50m",
@@ -461,7 +461,9 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("ensure_compose_env_mount_source TRADING_BACKUP_ROOT", installer)
         self.assertIn("refusing to move storage", installer)
         self.assertIn('set_env_var BACKUP_EVIDENCE_REQUIRE_SIGNATURE "1"', installer)
-        self.assertIn('set_env_var BACKUP_EVIDENCE_HMAC_KEY_FILE "$BACKUP_EVIDENCE_HMAC_KEY_FILE"', installer)
+        self.assertIn('set_env_var BACKUP_EVIDENCE_HMAC_KEY_FILE ""', installer)
+        self.assertIn('set_env_var BACKUP_EVIDENCE_HMAC_KEY_SECRET "backup_evidence_hmac_key"', installer)
+        self.assertIn("systemd-creds encrypt --name=backup_evidence_hmac_key", installer)
         self.assertIn('set_env_var TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP "0"', installer)
         self.assertIn('set_env_var TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL "0"', installer)
         self.assertIn('set_env_var TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP "0"', installer)

@@ -8,10 +8,13 @@ broker connections, or require market-data credentials.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -74,6 +77,14 @@ class ScreenModuleBoundaryIssue:
     source_path: str
     reason: str
     detail: str
+
+
+@dataclass(frozen=True)
+class RouteHandlerRegistrationIssue:
+    method: str
+    path: str
+    handler: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -286,13 +297,16 @@ def _collect_eventsource_paths(text: str, literals: list[_StringLiteral]) -> set
             assignments.append((match.group(1), match.start(), _line_for_offset(text, match.start(3)), path))
 
     out: set[tuple[int, str]] = set()
-    direct_re = re.compile(r"\bnew\s+EventSource\s*\(\s*([`'\"])(/api/.*?)(?<!\\)\1", re.DOTALL)
+    direct_re = re.compile(
+        r"\b(?:new\s+EventSource|apiEventSource)\s*\(\s*([`'\"])(/api/.*?)(?<!\\)\1",
+        re.DOTALL,
+    )
     for match in direct_re.finditer(text):
         path = normalize_endpoint_path(match.group(2))
         if path:
             out.add((_line_for_offset(text, match.start(2)), path))
 
-    indirect_re = re.compile(r"\bnew\s+EventSource\s*\(\s*([A-Za-z_$][\w$]*)")
+    indirect_re = re.compile(r"\b(?:new\s+EventSource|apiEventSource)\s*\(\s*([A-Za-z_$][\w$]*)")
     for match in indirect_re.finditer(text):
         name = match.group(1)
         prior = [row for row in assignments if row[0] == name and row[1] < match.start()]
@@ -410,6 +424,124 @@ def find_unregistered_endpoint_references(
                     path=ref.path,
                     transport=ref.transport,
                     reason="route_not_registered",
+                )
+            )
+    return issues
+
+
+def collect_dashboard_route_snapshot(*, root: Path = ROOT) -> dict[str, object]:
+    code = r"""
+import json
+import os
+
+os.environ.setdefault("TIMESCALE_ENABLED", "0")
+os.environ.setdefault("FEATURE_STORE_ENABLED", "0")
+os.environ.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
+os.environ.setdefault("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
+os.environ.setdefault("DASHBOARD_ROUTE_CONTRACT_INTROSPECTION", "1")
+
+import dashboard_server
+
+def _norm(route):
+    if isinstance(route, dict):
+        return {
+            "method": str(route.get("method") or "").upper(),
+            "path": str(route.get("path") or ""),
+            "handler": str(route.get("handler") or ""),
+        }
+    return {
+        "method": str(route[0] or "").upper(),
+        "path": str(route[1] or ""),
+        "handler": str(route[2] or ""),
+    }
+
+print("__DASHBOARD_ROUTE_SNAPSHOT__" + json.dumps({
+    "route_specs": [_norm(route) for route in dashboard_server.ROUTE_SPECS],
+    "fallback_route_specs": [_norm(route) for route in dashboard_server._FALLBACK_ROUTE_SPECS],
+    "raw_route_specs": [_norm(route) for route in dashboard_server._RAW_ROUTE_SPECS],
+    "api_handler_names": sorted(str(name) for name in dashboard_server.API_HANDLERS),
+    "callable_api_handler_names": sorted(
+        str(name) for name, handler in dashboard_server.API_HANDLERS.items() if callable(handler)
+    ),
+}, sort_keys=True), flush=True)
+"""
+    root = root.resolve()
+    env = dict(os.environ)
+    env.setdefault("TIMESCALE_ENABLED", "0")
+    env.setdefault("FEATURE_STORE_ENABLED", "0")
+    env.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
+    env.setdefault("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
+    env["DASHBOARD_ROUTE_CONTRACT_INTROSPECTION"] = "1"
+    env["ENGINE_MODE"] = "safe"
+    env["EXECUTION_MODE"] = "safe"
+    env["OPERATOR_MODE"] = "safe"
+    env["APP_ENV"] = "test"
+    env["PROD_LOCK"] = "0"
+    for key in ("ENV", "NODE_ENV", "TS_ENV"):
+        env.pop(key, None)
+    with tempfile.TemporaryDirectory(prefix="dashboard-route-contract-") as temp_root:
+        temp_path = Path(temp_root)
+        secrets_dir = temp_path / "secrets"
+        secrets_dir.mkdir()
+        token_file = temp_path / "dashboard_api_token"
+        token_file.write_text("dashboard-route-contract-token", encoding="utf-8")
+        token_file.chmod(0o600)
+        env["DASHBOARD_API_TOKEN_FILE"] = str(token_file)
+        env["TRADING_SECRET_POLICY_REPO_ROOT"] = str(temp_path)
+        env["TS_STORAGE_BACKEND"] = "sqlite"
+        env["TS_SECRETS_PROVIDER"] = "plaintext"
+        env["TS_DEV_SECRETS_DIR"] = str(secrets_dir)
+        env["DB_PATH"] = str(temp_path / "dashboard_route_contract.db")
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    if result.returncode != 0:
+        combined = (result.stderr or result.stdout or "dashboard route snapshot failed").strip()
+        raise RuntimeError(combined)
+    prefix = "__DASHBOARD_ROUTE_SNAPSHOT__"
+    for line in reversed((result.stdout or "").splitlines()):
+        if line.startswith(prefix):
+            return json.loads(line.removeprefix(prefix))
+    raise RuntimeError(
+        "dashboard route snapshot missing from subprocess output:\n"
+        + (result.stdout or "")
+        + "\n"
+        + (result.stderr or "")
+    )
+
+
+def find_route_handler_registration_issues(
+    route_specs: Iterable[object],
+    callable_api_handler_names: Iterable[str],
+) -> list[RouteHandlerRegistrationIssue]:
+    callable_handlers = {str(name) for name in callable_api_handler_names}
+    issues: list[RouteHandlerRegistrationIssue] = []
+    for route in route_specs:
+        method, path = route_key(route)
+        handler = route_handler(route).strip()
+        if not method or not path or not handler:
+            issues.append(
+                RouteHandlerRegistrationIssue(
+                    method=method,
+                    path=path,
+                    handler=handler,
+                    reason="malformed_route_spec",
+                )
+            )
+            continue
+        if handler not in callable_handlers:
+            issues.append(
+                RouteHandlerRegistrationIssue(
+                    method=method,
+                    path=path,
+                    handler=handler,
+                    reason="handler_not_registered",
                 )
             )
     return issues
@@ -591,9 +723,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--list-endpoints", action="store_true")
     parser.add_argument("--list-assets", action="store_true")
+    parser.add_argument(
+        "--route-handlers-only",
+        action="store_true",
+        help="Only validate dashboard ROUTE_SPECS handler registration.",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
+    if args.route_handlers_only:
+        try:
+            route_snapshot = collect_dashboard_route_snapshot(root=root)
+        except Exception as exc:
+            print("Dashboard route contract failed.")
+            print(str(exc))
+            return 1
+        route_handler_issues = find_route_handler_registration_issues(
+            route_snapshot.get("raw_route_specs") or [],
+            route_snapshot.get("callable_api_handler_names") or [],
+        )
+        if route_handler_issues:
+            print("Dashboard route handler registration contract failed.")
+            for issue in route_handler_issues:
+                print(f"{issue.method} {issue.path}: {issue.reason}: {issue.handler}")
+            return 1
+        print(
+            "Dashboard route handler registration contract passed. "
+            f"Routes={len(route_snapshot.get('raw_route_specs') or [])}."
+        )
+        return 0
+
     assets, asset_issues = collect_dashboard_asset_graph(root=root)
     endpoint_refs = collect_dashboard_endpoint_references(root=root)
     syntax_issues = find_js_syntax_issues(
@@ -602,6 +761,16 @@ def main(argv: list[str] | None = None) -> int:
         node_executable=args.node_executable,
     )
     boundary_issues = find_screen_module_boundary_issues(root=root)
+    try:
+        route_snapshot = collect_dashboard_route_snapshot(root=root)
+    except Exception as exc:
+        print("Dashboard route contract failed.")
+        print(str(exc))
+        return 1
+    route_handler_issues = find_route_handler_registration_issues(
+        route_snapshot.get("raw_route_specs") or [],
+        route_snapshot.get("callable_api_handler_names") or [],
+    )
 
     if args.list_assets:
         for path in sorted(assets):
@@ -627,6 +796,12 @@ def main(argv: list[str] | None = None) -> int:
         print("Dashboard screen module boundary contract failed.")
         for issue in boundary_issues:
             print(f"{issue.source_path}: {issue.reason}: {issue.detail}")
+        return 1
+
+    if route_handler_issues:
+        print("Dashboard route handler registration contract failed.")
+        for issue in route_handler_issues:
+            print(f"{issue.method} {issue.path}: {issue.reason}: {issue.handler}")
         return 1
 
     print(

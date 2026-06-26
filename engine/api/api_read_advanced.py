@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 from engine.api.api_read import _table_exists
+from engine.api.degradation import degraded_empty_read, degraded_missing_table_read, is_missing_table_error
 from engine.api.internal_access import db_connect
 from engine.api.redaction import redact_api_payload
 from engine.api.sql_identifiers import require_allowed_table_name, sql_identifier
@@ -1499,9 +1500,15 @@ def get_validation_rows():
         from engine.strategy.validation import get_validation_scores as _get_validation_scores
         return {"ok": True, "rows": _get_validation_scores()}
     except Exception as e:
-        _warn_nonfatal("API_READ_ADVANCED_SOCIAL_FEATURES_FAILED", e)
-        error_payload = {"ok": False, "error": str(e)}
-        return error_payload
+        if is_missing_table_error(e, "validation_scores"):
+            _warn_nonfatal(
+                "API_READ_ADVANCED_VALIDATION_SCORES_TABLE_MISSING",
+                e,
+                once_key="validation_scores_missing",
+            )
+            return degraded_missing_table_read("validation_scores")
+        _warn_nonfatal("API_READ_ADVANCED_VALIDATION_FAILED", e)
+        return {"ok": False, "error": "validation_read_failed", "rows": []}
 
 
 # ----------------------------------------------------------------------
@@ -1535,15 +1542,95 @@ def run_shadow_capital_scores(window_s: int = 86400, regime: str = "global"):
 # Size Policy
 # ----------------------------------------------------------------------
 
+def _size_policy_table_state(con) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "size_policy_present": None,
+        "size_policy_points_present": None,
+        "policy_rows": None,
+    }
+    try:
+        con.execute("SELECT 1 FROM size_policy LIMIT 1").fetchone()
+        state["size_policy_present"] = True
+    except Exception as e:
+        _warn_nonfatal(
+            "API_READ_ADVANCED_SIZE_POLICY_TABLE_STATE_FAILED",
+            e,
+            once_key="size_policy_table_state_probe",
+            table_name="size_policy",
+        )
+        if is_missing_table_error(e, "size_policy"):
+            state["size_policy_present"] = False
+            state["policy_rows"] = 0
+            return state
+        return state
+
+    try:
+        row = con.execute("SELECT COUNT(*) FROM size_policy").fetchone()
+        state["policy_rows"] = int((row or [0])[0] or 0)
+    except Exception:
+        state["policy_rows"] = None
+
+    try:
+        con.execute("SELECT 1 FROM size_policy_points LIMIT 1").fetchone()
+        state["size_policy_points_present"] = True
+    except Exception as e:
+        if is_missing_table_error(e, "size_policy_points"):
+            state["size_policy_points_present"] = False
+
+    return state
+
+
+def _empty_size_policy_payload(reason: str, *, source: str, table_present: bool | None, policy_rows: int | None) -> dict[str, Any]:
+    return degraded_empty_read(
+        reason,
+        source=source,
+        table_present=table_present,
+        count=int(policy_rows or 0),
+        policy=None,
+        points=[],
+    )
+
+
 def get_size_policy():
     from engine.api.internal_access import db_connect as _db_connect
     from engine.strategy.size_policy import load_latest_size_policy
 
     con = _db_connect()
     try:
+        table_state = _size_policy_table_state(con)
         policy = load_latest_size_policy(con)
         if not policy:
-            return {"ok": True, "policy": None, "points": []}
+            if table_state.get("size_policy_present") is False:
+                return _empty_size_policy_payload(
+                    "size_policy_table_missing",
+                    source="size_policy",
+                    table_present=False,
+                    policy_rows=0,
+                )
+            if table_state.get("size_policy_present") is True and int(table_state.get("policy_rows") or 0) <= 0:
+                return _empty_size_policy_payload(
+                    "size_policy_untrained",
+                    source="size_policy",
+                    table_present=True,
+                    policy_rows=0,
+                )
+            if table_state.get("size_policy_points_present") is False:
+                return _empty_size_policy_payload(
+                    "size_policy_points_table_missing",
+                    source="size_policy_points",
+                    table_present=False,
+                    policy_rows=int(table_state.get("policy_rows") or 0),
+                )
+            return _empty_size_policy_payload(
+                "size_policy_not_ready",
+                source="size_policy",
+                table_present=(
+                    bool(table_state.get("size_policy_present"))
+                    if table_state.get("size_policy_present") is not None
+                    else None
+                ),
+                policy_rows=table_state.get("policy_rows"),
+            )
 
         return {
             "ok": True,

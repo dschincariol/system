@@ -38,6 +38,7 @@ from engine.api.system.response import (
 )
 from engine.api.system.route_specs import ROUTE_SPECS_SYSTEM as ROUTE_SPECS_SYSTEM
 from engine.runtime.health import get_health_snapshot, run_preflight, get_readiness_snapshot, get_schema_audit
+from engine.runtime.feed_truth import missing_live_market_credentials_from_sources
 from engine.runtime.ingestion_status import pipeline_health_summary
 from engine.runtime.runtime_meta import meta_get
 from engine.runtime.system_state import compute_system_state
@@ -51,6 +52,18 @@ from engine.strategy.champion_manager import current_competition_snapshot
 
 
 log = logging.getLogger(__name__)
+
+
+def _manager_missing_live_market_credentials() -> list[str]:
+    try:
+        from services.data_source_manager import get_manager
+
+        manager = get_manager()
+        manager.initialize()
+        return missing_live_market_credentials_from_sources(manager.list_sources() or [])
+    except Exception as exc:
+        _warn("api_system.missing_live_market_credentials", exc)
+        return []
 
 
 _HEALTH_CACHE_LOCK = threading.Lock()
@@ -1434,6 +1447,19 @@ def _build_ingestion_snapshot(jobs, health):
 
     running = bool(market.get("running")) or any(bool((row or {}).get("running")) for row in price_daemons.values())
     healthy_providers = int(market.get("healthy_providers") or 0)
+    raw_healthy_providers = int(market.get("raw_healthy_providers") or healthy_providers)
+    simulated_healthy_providers = int(market.get("simulated_healthy_providers") or 0)
+    live_market_data_ok = bool(market.get("live_market_data_ok"))
+    missing_credential_env_vars = [
+        str(name)
+        for name in list(market.get("missing_credential_env_vars") or [])
+        if str(name or "").strip()
+    ]
+    if not missing_credential_env_vars:
+        missing_credential_env_vars = _manager_missing_live_market_credentials()
+    if missing_credential_env_vars:
+        live_market_data_ok = False
+    live_feed_status = "missing_credentials" if missing_credential_env_vars else str(market.get("live_feed_status") or "")
     fresh_rows = int(market.get("fresh_rows") or 0)
     fresh_symbols = int(market.get("fresh_symbols") or 0)
     price_age_ms = int(market.get("price_age_ms") or 0)
@@ -1459,6 +1485,10 @@ def _build_ingestion_snapshot(jobs, health):
         reasons.extend(list(required_tables.get("reasons") or []))
     if healthy_providers <= 0:
         reasons.append("healthy_providers_zero")
+    if raw_healthy_providers > 0 and healthy_providers <= 0 and simulated_healthy_providers > 0:
+        reasons.append("simulated_market_data_not_live")
+    if missing_credential_env_vars:
+        reasons.append("missing_live_market_data_credentials")
     if fresh_rows <= 0:
         reasons.append("fresh_rows_zero")
     if fresh_symbols <= 0:
@@ -1474,6 +1504,7 @@ def _build_ingestion_snapshot(jobs, health):
         running
         and bool(prices.get("ok"))
         and bool(providers.get("ok"))
+        and live_market_data_ok
         and bool(db.get("ok"))
         and bool(schema.get("ok"))
         and bool(required_tables.get("ok", False))
@@ -1501,6 +1532,11 @@ def _build_ingestion_snapshot(jobs, health):
         "status": status,
         "job_visible": bool(ingestion_runtime),
         "healthy_providers": healthy_providers,
+        "raw_healthy_providers": raw_healthy_providers,
+        "simulated_healthy_providers": simulated_healthy_providers,
+        "live_market_data_ok": live_market_data_ok,
+        "live_feed_status": live_feed_status,
+        "missing_credential_env_vars": missing_credential_env_vars,
         "fresh_rows": fresh_rows,
         "fresh_symbols": fresh_symbols,
         "last_price_ts_ms": int(market.get("last_price_ts_ms") or 0),
@@ -1517,6 +1553,11 @@ def _build_ingestion_snapshot(jobs, health):
             "active_child": str(market.get("active_child") or ""),
             "child_pid": int(market.get("child_pid") or 0),
             "healthy_providers": healthy_providers,
+            "raw_healthy_providers": raw_healthy_providers,
+            "simulated_healthy_providers": simulated_healthy_providers,
+            "live_market_data_ok": live_market_data_ok,
+            "live_feed_status": live_feed_status,
+            "missing_credential_env_vars": missing_credential_env_vars,
             "fresh_rows": fresh_rows,
             "fresh_symbols": fresh_symbols,
             "price_age_ms": price_age_ms,
@@ -2598,7 +2639,10 @@ def _build_runtime_health(_parsed, ctx):
     database_health["schema"] = dict(schema or {})
 
     price_ingestion_status = {
-        "ok": bool(prices.get("ok")) and bool(providers.get("ok")),
+        "ok": bool(prices.get("ok")) and bool(providers.get("ok")) and bool(providers.get("live_market_data_ok", providers.get("ok"))),
+        "live_market_data_ok": bool(providers.get("live_market_data_ok", False)),
+        "live_feed_status": str(providers.get("live_feed_status") or prices.get("live_feed_status") or ""),
+        "missing_credential_env_vars": list(providers.get("missing_credential_env_vars") or prices.get("missing_credential_env_vars") or []),
         "prices": dict(prices or {}),
         "providers": dict(providers or {}),
     }
@@ -2749,7 +2793,9 @@ def api_get_competition_view(_parsed, ctx=None):
 
     champions = list(runtime.get("champions") or [])
     challengers = list(runtime.get("challengers") or [])
+    rankings = list(runtime.get("rankings") or runtime.get("model_rankings") or [])
     champion = dict(runtime.get("champion") or {})
+    ranking_champion = dict(runtime.get("ranking_champion") or {})
     capital_plan = dict(runtime.get("capital_plan") or {})
     replay_status = dict(runtime.get("replay_validation_status") or {})
     self_critic = dict(runtime.get("self_critic") or {})
@@ -2759,6 +2805,8 @@ def api_get_competition_view(_parsed, ctx=None):
         "champion_model_name": str(champion.get("model_name") or ""),
         "champion_symbol": str(champion.get("symbol") or ""),
         "champion_horizon_s": int(champion.get("horizon_s") or 0),
+        "top_ranked_model_name": str(ranking_champion.get("model_name") or ""),
+        "rankings": int(len(rankings)),
         "champions": int(len(champions)),
         "challengers": int(len(challengers)),
         "active_symbols": int(len(list(runtime.get("active_symbols") or []))),
@@ -2766,13 +2814,18 @@ def api_get_competition_view(_parsed, ctx=None):
         "critic_blocked_keys": int(len(list(self_critic.get("blocked_keys") or []))),
         "replay_ready": str(replay_status.get("status") or "") == "ready",
         "cycle_status": str(cycle_status.get("status") or "missing"),
+        "status": str(runtime.get("status") or ""),
+        "reason": str(runtime.get("reason") or ""),
     }
 
     return _snapshot_response(
         snapshot,
-        ok=bool(competition_health.get("ok")),
+        ok=bool(runtime.get("ok", True)),
         competition={
             "summary": summary,
+            "status": str(runtime.get("status") or ""),
+            "reason": str(runtime.get("reason") or ""),
+            "rankings": rankings,
             "runtime": runtime,
             "health": competition_health,
         },
@@ -3197,10 +3250,18 @@ def api_get_readiness_evidence(_parsed, ctx=None):
 
     try:
         status = dict(market_data_status() or {})
+        missing_env = list(status.get("missing_credential_env_vars") or []) or _manager_missing_live_market_credentials()
+        live_market_ok = bool(status.get("live_market_data_ok")) and not missing_env
+        live_feed_status = "missing_credentials" if missing_env else str(status.get("live_feed_status") or "")
         provider_telemetry = {
             "ok": bool(status.get("ok")),
             "running": bool(status.get("running")),
             "healthy_providers": int(status.get("healthy_providers") or 0),
+            "raw_healthy_providers": int(status.get("raw_healthy_providers") or 0),
+            "simulated_healthy_providers": int(status.get("simulated_healthy_providers") or 0),
+            "live_market_data_ok": live_market_ok,
+            "live_feed_status": live_feed_status,
+            "missing_credential_env_vars": missing_env,
             "fresh_rows": int(status.get("fresh_rows") or 0),
             "fresh_symbols": int(status.get("fresh_symbols") or 0),
             "last_price_ts_ms": int(status.get("last_price_ts_ms") or 0),
@@ -3324,8 +3385,26 @@ def api_get_runtime_watchdogs(_parsed, ctx=None):
             continue
         restart_counters[name] = int(row.get("restart_count") or 0)
 
+    price_feed_freshness = dict(health.get("prices") or {})
+    watchdogs_ok = bool(
+        price_feed_freshness.get("ok")
+        and not provider_monitor.get("stale")
+        and not metrics_collector.get("stale")
+    )
+    watchdog_reasons = []
+    if not bool(price_feed_freshness.get("ok")):
+        watchdog_reasons.append("price_feed_not_ok")
+    if bool(provider_monitor.get("stale")):
+        watchdog_reasons.append("provider_monitor_stale")
+    if bool(metrics_collector.get("stale")):
+        watchdog_reasons.append("metrics_collector_stale")
+
     out = {
-        "ok": bool(health.get("ok")),
+        "ok": True,
+        "error": None,
+        "watchdogs_ok": watchdogs_ok,
+        "ready": watchdogs_ok,
+        "watchdog_reasons": watchdog_reasons,
         "ts_ms": ts_ms,
         "provider_monitor": {
             "running": bool(provider_monitor.get("running")),
@@ -3341,7 +3420,7 @@ def api_get_runtime_watchdogs(_parsed, ctx=None):
             "restart_count": int(metrics_collector.get("restart_count") or 0),
             "stale": bool(metrics_collector.get("stale")),
         },
-        "price_feed_freshness": dict(health.get("prices") or {}),
+        "price_feed_freshness": price_feed_freshness,
         "pipeline_watchdog_state": {
             "ingestion_runtime": {
                 "running": bool(ingestion_runtime.get("running")),
@@ -3358,12 +3437,8 @@ def api_get_runtime_watchdogs(_parsed, ctx=None):
         "ingestion_freshness": dict(health.get("ingestion_freshness") or {}),
         "job_restart_counters": restart_counters,
         "job_summary": dict(health.get("job_summary") or {}),
+        "meta": {"status": 200, "ready": watchdogs_ok},
     }
-    out["ok"] = bool(
-        out["price_feed_freshness"].get("ok")
-        and not out["provider_monitor"].get("stale")
-        and not out["metrics_collector"].get("stale")
-    )
     return out
 
 
@@ -3646,6 +3721,9 @@ def api_get_provider_telemetry(_parsed, ctx=None):
     snapshot = _build_system_snapshot(_parsed, ctx)
     try:
         status = market_data_status()
+        missing_env = list(status.get("missing_credential_env_vars") or []) or _manager_missing_live_market_credentials()
+        live_market_ok = bool(status.get("live_market_data_ok")) and not missing_env
+        live_feed_status = "missing_credentials" if missing_env else str(status.get("live_feed_status") or "")
         lifecycle = {}
         try:
             lifecycle = ((snapshot.get("health") or {}).get("health") or {}).get("lifecycle") or {}
@@ -3658,6 +3736,11 @@ def api_get_provider_telemetry(_parsed, ctx=None):
             "active_child": str(status.get("active_child") or ""),
             "child_pid": int(status.get("child_pid") or 0),
             "healthy_providers": int(status.get("healthy_providers") or 0),
+            "raw_healthy_providers": int(status.get("raw_healthy_providers") or 0),
+            "simulated_healthy_providers": int(status.get("simulated_healthy_providers") or 0),
+            "live_market_data_ok": live_market_ok,
+            "live_feed_status": live_feed_status,
+            "missing_credential_env_vars": missing_env,
             "fresh_rows": int(status.get("fresh_rows") or 0),
             "fresh_symbols": int(status.get("fresh_symbols") or 0),
             "last_price_ts_ms": int(status.get("last_price_ts_ms") or 0),

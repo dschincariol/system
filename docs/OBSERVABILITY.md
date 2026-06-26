@@ -54,7 +54,7 @@ This document records the observability surfaces that are present in the reposit
 | `GET /api/execution/barrier` | Whether the execution pipeline and real trading are currently allowed, and why. |
 | `GET /api/operator/service_status` | Aggregated engine and service status summary. |
 | `GET /api/operator/provider_telemetry` | Current feed/provider freshness and runtime correlation details. |
-| `GET /api/operator/runtime_watchdogs` | Heartbeat and freshness watchdog state for critical jobs. |
+| `GET /api/operator/runtime_watchdogs` | Heartbeat and freshness watchdog state for critical jobs; `ok` reflects response success and `watchdogs_ok` reflects operational watchdog health. |
 | `GET /api/operator/support_snapshot` | Repair-oriented evidence bundle for humans and tooling. |
 | `GET /api/telemetry` and `GET /api/telemetry/history` | Telemetry APIs exposed by `engine/api/api_system.py`. |
 
@@ -113,6 +113,14 @@ space payload emits a new alert. A rising `pg_stat_archiver.failed_count` or
 recent recovered `last_failed_wal` becomes a `STORAGE_WAL_WARNING`; unrecovered
 archive failure, excessive `pg_wal` bytes/`.ready` backlog, or critical WAL
 free space remains `CRIT`.
+
+The dashboard alert queue preserves these backend alert rows but presents them
+as lifecycle-aware incidents: WARN/HIGH/CRIT are actionable alarms, INFO is a
+notification, acknowledgements remain unresolved until a resolution event is
+recorded, shelving shows expiry/remaining time, and repeated similar rows are
+collapsed into parent incidents. Persisted backend `incident_id` values are not
+required yet; the frontend groups by lifecycle family, affected entity, horizon
+bucket, and rule/message signature.
 
 `/api/health.storage_wal_guards.storage_placement.targets[*]` is the operator
 proof surface for placement. For GO, each high-volume target should show

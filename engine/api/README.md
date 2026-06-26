@@ -26,7 +26,7 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
 - [api_read_advanced.py](api_read_advanced.py)
   Large advanced read-only data surface (model diagnostics, temporal eval, portfolio backtest/snapshot, rolling/by-symbol/by-confidence execution metrics, social features/regimes/blocks, validation rows, shadow-capital scoring, size policy, recent decisions, and decision-detail drilldowns). It is not a route module: it has no `ROUTE_SPECS` and no `api_*` handlers, instead exporting 18 public `get_*`/`run_*` accessors (plus internal `_` helpers) that are lazily imported by the thin route handlers in [api_ops_handlers.py](api_ops_handlers.py) and the dashboard aggregator [api_dashboard_reads.py](api_dashboard_reads.py).
 - [api_write.py](api_write.py)
-  Mutating APIs, including alert acknowledgement, shelving, resolution, job-history writes, and promotion guard toggles.
+  Mutating APIs, including alert acknowledgement, shelving, resolution, job-history writes, and promotion guard toggles. Alert acknowledgement, shelving, and resolution require an existing parent alert and return `404 not_found` without lifecycle/audit rows for unknown ids.
 - [api_dashboard_reads.py](api_dashboard_reads.py)
   Dashboard-specific read aggregation.
 - [feature_visibility.py](feature_visibility.py)
@@ -82,15 +82,36 @@ The shared HTTP transport maps expected business refusals to 4xx responses inste
 
 Unexpected handler exceptions still return 500 with `error=internal_server_error`, `reason_code=handler_exception`, and a safe message that does not echo exception text to the client.
 
+Reasoned degraded read payloads are different from refusals and faults. A read handler may return HTTP 200 with `ok=false` plus `reason`, `reason_code`, `reasons`, or `reason_codes` when it has valid data or an honest empty/degraded state such as warmup or no feed. The transport preserves that reason and does not stamp `error=request_failed`; unreasoned `ok=false` responses are still normalized as request failures.
+
+Empty optional read surfaces must also be diagnosable when they return `ok=true`.
+Promotion audit, relevance stats, market-stress history, strategy metrics, causal
+scores, and size policy return their normal empty collection/object plus
+`ready:false`, `reason`, `source`, `table_present`, and matching `meta.*` fields
+when the source is missing or not populated yet. `table_present:false` means the
+source table is absent; `table_present:true` with a `no_*_yet` or
+`*_untrained` reason means the table exists but has no usable rows. Populated
+responses keep their established data shape.
+
+## Dashboard Copilot Contract
+
+`POST /api/copilot/ask` is read-only and advisory. A blank or missing `question` is a client input error and returns HTTP 422 with `error=missing_question`, `reason_code=missing_question`, a helpful `answer`, and suggested dashboard panels to review.
+
+The copilot model endpoint is optional. When `COPILOT_LLM_ENDPOINT` is not configured, the endpoint returns HTTP 200 with `ok=false`, `error=null`, `reason_code=copilot_llm_unconfigured`, and a fallback answer/actions instead of surfacing a dashboard 500. If a configured model endpoint cannot provide an answer, the endpoint returns a structured HTTP 503 with `error=copilot_llm_unavailable` and the same operator-safe fallback guidance.
+
+Unexpected handler exceptions are not treated as degraded reads. They continue through the shared transport failure path and return HTTP 500 with `error=internal_server_error`, `reason_code=handler_exception`, and a safe exception type only.
+
 ## Market Candle Contract
 
 `GET /api/market/candles` is the canonical live chart history endpoint for dashboard and terminal pro charts. Query parameters are `symbol`, `tf`, `limit`, and `max_points`.
 
 `limit` is normalized to `10..5000` and caps the number of newest candles kept after tick aggregation. The storage read may fetch more raw rows than the final candle count, but bounded SQLite and Timescale quote queries apply their row limit to the newest eligible rows first and then return rows in ascending timestamp order before candle building. This preserves dense-symbol recency without changing the frontend contract.
 
-Quote history readers are schema-adaptive. SQLite/local snapshots may expose either `ts_ms` or `time`; Timescale price sidecars use canonical `price_quotes."time"` / `price_quotes_raw."time"` / `price_ticks."time"` columns. The read router projects the selected timestamp to API `ts_ms`, keeps Timescale filters/order clauses on `"time"` when that is the physical column, and falls back from `price_quotes` to `price_quotes_raw`, `price_ticks`, then legacy `prices` rows. `prices` has `price`/`px` rather than `last`/`volume`, so the router maps `COALESCE(price, px)` to `last` and returns `null` volume for that fallback. Readers should not require a physical `ts_ms` column on Timescale quote relations.
+Quote history readers are schema-adaptive. SQLite/local snapshots may expose either `ts_ms` or `time`; Timescale price sidecars use canonical `price_quotes."time"` / `price_quotes_raw."time"` / `price_ticks."time"` columns. The read router projects the selected timestamp to API `ts_ms`, keeps Timescale filters/order clauses on `"time"` when that is the physical column, and falls back from `price_quotes` to `price_quotes_raw`, `price_ticks`, then legacy `prices` rows. When the SQLite-shaped fallback is backed by Postgres storage, it must emit Postgres timestamp predicates and ordering rather than SQLite-only `strftime()` / `typeof()` expressions. `prices` has `price`/`px` rather than `last`/`volume`, so the router maps `COALESCE(price, px)` to `last` and returns `null` volume for that fallback. Readers should not require a physical `ts_ms` column on Timescale quote relations.
 
-`max_points` is an optional presentation cap. When supplied, it is normalized to `50..20000`; when omitted, it defaults to the normalized `limit`. If the post-`limit` candle array still exceeds `max_points`, the API downsamples the ascending array and always includes the newest candle. Responses keep `candles` ascending by `ts_ms`; `meta.limit`, `meta.max_points`, `meta.fetch_limit`, and `meta.order` expose the effective bounds and ordering.
+The Timescale candle read path uses the shared runtime psycopg pool hygiene contract: failed quote queries are rolled back and the direct read-router pool checks/resets connections before reuse. The endpoint must surface the originating read error in logs rather than allowing a later request to inherit `InFailedSqlTransaction` from a poisoned pooled connection.
+
+`max_points` is an optional presentation cap. When supplied, it is normalized to `50..20000`; when omitted, it defaults to the normalized `limit`. If the normal recency window has no rows but persisted history exists, the endpoint fetches the latest bounded rows so charts still render real OHLCV candles and sets `meta.stale_fallback=true`. If the post-`limit` candle array still exceeds `max_points`, the API downsamples the ascending array and always includes the newest candle. Responses keep `candles` ascending by `ts_ms`; `meta.limit`, `meta.max_points`, `meta.fetch_limit`, `meta.order`, and `meta.stale_fallback` expose the effective bounds, ordering, and stale-history fallback.
 
 The dashboard and terminal pro-chart VWAP overlay is a client-side loaded-window VWAP, not a session VWAP. It accumulates `close * volume` and volume over only the candles currently loaded from this endpoint and subsequent stream updates; the accumulator does not reset at trading-session boundaries. Do not relabel it as session VWAP unless the API contract first carries reliable symbol asset-class, exchange timezone, and session-boundary metadata and the production indicator accumulator resets on those boundaries.
 
@@ -138,6 +159,22 @@ The main surfaces are:
 - service-status and trading-readiness summaries
 
 These payloads are consumed by the dashboard, the local operator server, and the bounded operator AI sidecar.
+`GET /api/operator/runtime_watchdogs` uses the standard HTTP response envelope:
+top-level `ok` and `error` describe request/envelope success. Watchdog health is
+reported separately as `watchdogs_ok`, `ready`, and `watchdog_reasons`, so a
+valid HTTP 200 watchdog snapshot does not look like a failed request when feeds
+are stale or empty.
+
+Operator route names are canonicalized as snake_case on the Python dashboard
+API. Existing camelCase operator-console routes remain compatibility aliases
+where the browser sidecar already depended on them:
+
+- `GET /api/operator/bootstrap_status` and `GET /api/operator/bootstrapStatus`
+- `GET /api/operator/institutional_check` and `GET /api/operator/institutionalCheck`
+- `POST /api/operator/clear_last_error` and `POST /api/operator/clearLastError`
+
+Both `clear_last_error` forms clear the same in-memory job `last_error` state and
+share the same low-severity mutation audit metadata.
 
 ## Self-Repair Contract
 
@@ -153,6 +190,26 @@ Self-repair is mounted from `engine/api/api_self_repair.py`, not from
 time that these routes resolve to `engine.api.api_self_repair`. `api_system.py`
 keeps compatibility exports for direct callers, but its `ROUTE_SPECS_SYSTEM`
 remains read-only for health, state, readiness, telemetry, and diagnostics.
+`POST /api/system/repair_schema` and `POST /api/repair_schema` are guarded twice:
+the HTTP transport requires typed confirmation before dispatch, and
+`api_post_repair_schema` itself requires `REPAIR_SCHEMA` plus
+`consequence_ack=true` before importing or running the schema repair job.
+
+## Response Refusal Contract
+
+Expected operator refusals use 4xx statuses and keep `meta.status` aligned with
+the outer HTTP status. Confirmation refusals, including
+`POST /api/operator/execution_arm`, return 422. Notification test input errors
+such as `unknown_channel` return 400, while configuration refusals such as
+`channel_not_configured` return 422 without sending an external notification.
+
+## Market Session Contract
+
+`GET /api/market/session` reports the exchange-clock state in `state` and price
+availability separately in `data_ready`, `data_reason`, `data_symbol`, and
+`last_price_ts_ms`. During an open market with no readable price rows, the
+endpoint returns `state:"OPEN"` and `data_ready:false` rather than implying chart
+data is available.
 
 ## Alpha Decay Chart Contract
 
@@ -296,7 +353,7 @@ Sensitive GET routes require `X-API-Token` in production/live or remote-bind dep
 The dashboard-owned `GET /api/operator/ping` bridge is intentionally public like health/liveness and proxies the operator sidecar ping with a bounded timeout. If the sidecar is unavailable, it returns a structured 503 with `reason_code=operator_sidecar_unreachable`.
 
 Confirmed high-impact mutations are listed in the transport confirmation
-registry. Emergency stop, runtime stop/restart, guarded job starts/stops,
+registry. Emergency stop, operator start/bootstrap, runtime stop/restart, guarded job starts/stops,
 pipeline runs, terminal orders, data-source destructive changes, broker
 activation, repair/schema actions, guided bootstrap, and feed restarts require
 server-side confirmation in production transport code before handlers run. The
@@ -305,6 +362,18 @@ confirmation payload includes the typed token, `action_id`, actor,
 confirmation method/hold metadata where supplied. `api_mutation` audit records
 carry the same confirmation context, with consequence text hashed rather than
 logged verbatim.
+
+Dashboard-owned `POST /api/operator/start` and `POST /api/operator/bootstrap`
+are non-live orchestration routes. Empty or incomplete payloads are rejected by
+the transport with `422 confirmation_required` before handler execution; valid
+calls must include `action_id=operator.start` with `START_OPERATOR` or
+`action_id=operator.bootstrap` with `BOOTSTRAP_OPERATOR` plus
+`consequence_ack`, actor, source surface, and reason. The handlers run behind a
+bounded request timeout and failed orchestrations surface a top-level domain
+error/reason such as `start_failed:ingestion_runtime`, `preflight_failed`, or
+`bootstrap_timeout` rather than `request_failed`. Start/bootstrap responses
+include `real_trading_allowed`, defaulting fail-closed to `false` if the
+execution barrier cannot be read.
 
 ## Job Catalog Contract
 

@@ -205,6 +205,19 @@ def _required_pg_credential_names() -> List[str]:
         else:
             master_refs = _secret_ref_names("DATA_SOURCE_MASTER_KEY_SECRET", "TRADING_MASTER_KEY_SECRET")
             names.extend(master_refs or ["master_key"])
+    if (
+        _env_truthy("BACKUP_EVIDENCE_REQUIRE_SIGNATURE")
+        or _env_truthy("PREFLIGHT_REQUIRE_BACKUP_EVIDENCE")
+        or _runtime_mode_name() == "live"
+    ):
+        if _env_value_present("BACKUP_EVIDENCE_HMAC_KEY_FILE", "BACKUP_EVIDENCE_SIGNING_KEY_FILE"):
+            pass
+        else:
+            backup_refs = _secret_ref_names(
+                "BACKUP_EVIDENCE_HMAC_KEY_SECRET",
+                "BACKUP_EVIDENCE_SIGNING_KEY_SECRET",
+            )
+            names.extend(backup_refs or ["backup_evidence_hmac_key"])
     return list(dict.fromkeys(names))
 
 

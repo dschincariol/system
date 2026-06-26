@@ -103,6 +103,30 @@ sudo -u trading DATA_SOURCE_MASTER_KEY_FILE=/var/lib/trading/.data_source_master
 sudo rm -f /var/lib/trading/master_key.next
 ```
 
+## Backup Evidence HMAC Key Rotation
+
+Systemd production hosts use `BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key`
+and load `/etc/credstore.encrypted/backup_evidence_hmac_key.cred` into both the
+backup-evidence timer and production preflight. Install or replace that
+credential with:
+
+```bash
+tmp="$(mktemp)"
+openssl rand -hex 32 > "$tmp"
+sudo install -d -o root -g root -m 0700 /etc/credstore.encrypted
+sudo systemd-creds encrypt --name=backup_evidence_hmac_key \
+  "$tmp" /etc/credstore.encrypted/backup_evidence_hmac_key.cred
+rm -f "$tmp"
+sudo chown root:root /etc/credstore.encrypted/backup_evidence_hmac_key.cred
+sudo chmod 0400 /etc/credstore.encrypted/backup_evidence_hmac_key.cred
+sudo systemctl restart trading-backup-evidence.service trading-prod-preflight.service
+```
+
+Compose deployments rotate the file referenced by
+`BACKUP_EVIDENCE_HMAC_KEY_FILE` and then recreate the services that mount the
+Docker secret. Direct non-Compose file sources must be readable by the service
+process and mode `0600`; do not use group-readable runtime secret files.
+
 ## Postgres Role Password Rotation
 
 1. Pick one role: `app`, `ingest`, or `reader`.

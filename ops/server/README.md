@@ -154,9 +154,10 @@ The focused installer deploys the backup scripts, backup evidence timers,
 `/var/backups/trading` layout, PostgreSQL archive settings, and the evidence
 environment entries consumed by live preflight.
 It creates `/etc/trading/backup_evidence.hmac.key` when missing, preserves an
-existing key, sets it to `root:trading 0640`, and writes
-`BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1` plus
-`BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key` to
+existing key for one-shot evidence generation, installs the matching encrypted
+systemd credential as `/etc/credstore.encrypted/backup_evidence_hmac_key.cred`,
+and writes `BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1` plus
+`BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key` to
 `/etc/trading/trading.env`.
 It also writes check-only evidence defaults for the recurring timer:
 `TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=0`,
@@ -184,7 +185,10 @@ primary group `trading`, set `TS_BACKUP_READ_GROUP=trading`, and publish
 evidence as `0640`, so the service can enumerate the `0750 70:trading` backup
 tree while non-group readers cannot.
 
-Manual key creation uses the same ownership contract:
+Manual file-backed key creation is supported for explicit one-shot runs. Do not
+use this group-readable file as the strict runtime source; production runtime
+and preflight should consume the encrypted `backup_evidence_hmac_key`
+credential.
 
 ```bash
 sudo groupadd --system trading 2>/dev/null || true
@@ -192,6 +196,12 @@ sudo install -d -o root -g trading -m 0750 /etc/trading
 openssl rand -hex 32 | sudo tee /etc/trading/backup_evidence.hmac.key >/dev/null
 sudo chown root:trading /etc/trading/backup_evidence.hmac.key
 sudo chmod 0640 /etc/trading/backup_evidence.hmac.key
+sudo install -d -o root -g root -m 0700 /etc/credstore.encrypted
+sudo systemd-creds encrypt --name=backup_evidence_hmac_key \
+  /etc/trading/backup_evidence.hmac.key \
+  /etc/credstore.encrypted/backup_evidence_hmac_key.cred
+sudo chown root:root /etc/credstore.encrypted/backup_evidence_hmac_key.cred
+sudo chmod 0400 /etc/credstore.encrypted/backup_evidence_hmac_key.cred
 ```
 
 Verify the signed evidence path after install or key rotation:
@@ -202,18 +212,12 @@ sudo -u postgres env \
   BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key \
   /opt/trading/ops/backup/backup_restore_evidence.sh
 
-sudo -u trading env \
-  ENGINE_MODE=live \
-  PREFLIGHT_REQUIRE_BACKUP_EVIDENCE=1 \
-  BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1 \
-  BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key \
-  /opt/trading/venv/bin/python /opt/trading/app/engine/runtime/prod_preflight.py --json
+sudo bash /opt/trading/app/ops/server/run_prod_preflight.sh
 ```
 
-For rotation, write a new key file with the same owner and mode, update
-`BACKUP_EVIDENCE_HMAC_KEY_FILE`, restart the preflight/runtime service or
-remount the compose secret, run the evidence job, and keep the old key until the
-new signed evidence passes preflight.
+For rotation, replace the encrypted `backup_evidence_hmac_key` credential,
+restart the backup evidence and preflight/runtime services, run the evidence
+job, and keep the old key until the new signed evidence passes preflight.
 
 ## Deployment Layout
 

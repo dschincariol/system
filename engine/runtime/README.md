@@ -25,6 +25,10 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
   setup SQL while a connection-local marker proves the current schema is already
   installed. Wrapper-executed `SET search_path`, `RESET`, or `DISCARD` SQL
   invalidates that marker so the next checkout repairs the session before use.
+- [pg_connection_hygiene.py](pg_connection_hygiene.py)
+  Shared psycopg transaction-state helpers used by runtime pools and direct
+  read-router pools to detect non-idle connections, roll them back before reuse,
+  and log rollback failures with transaction-status context.
 - [storage_sqlite.py](storage_sqlite.py)
   Test-only SQLite backend. Its schema bootstrap has a single reachable `_base_schema()` path, and compatibility helpers now call through a locked `storage_pg` helper wrapper instead of cloning runtime function code.
   This is a bounded first slice of the storage-backend rearchitecture: `_PG_COMPAT_HELPER_NAMES` is still a documented migration shim, not the final backend-neutral repository layer.
@@ -38,7 +42,11 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
   boundaries, SQL repair, schema initialization, validation, and migrations stay
   in `storage_sqlite.py`.
 - [locks.py](locks.py)
-  Cross-process job locks and `job_history` persistence.
+  Cross-process job locks and `job_history` persistence. In SQLite safe/test
+  runs, `job_locks` and `job_heartbeats` may be routed through the separate
+  liveness database, but `job_history` is regular runtime state: writes use the
+  main runtime database and read-only history readers must use the same runtime
+  read connection so dashboard history matches `/api/db/health`.
 - [runtime_meta.py](runtime_meta.py)
   Shared metadata store used for diagnostics and boot progress.
 - [job_registry.py](job_registry.py)
@@ -216,6 +224,8 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
 - Strict or supervised runtimes require `DB_PATH` to be explicitly set and absolute before normalization, but file-shaped legacy values are normalized by `db_guard.resolve_db_path()` to their parent data directory after that gate passes.
 - When Postgres is unavailable, acquisition failures are surfaced as storage readiness `degraded` or `unavailable`, API storage payloads return retryable 503-style metadata where possible, and startup/preflight gates block readiness instead of silently falling back to SQLite.
 - Runtime Postgres access uses one Python driver stack: psycopg 3.x. `storage_pool.py`, `storage_pg.py`, the Timescale/price sidecars, read routers, migration validation, and dependency readiness probes must use `psycopg`/`psycopg_pool`; `psycopg2` and `psycopg2-binary` are intentionally not part of the runtime dependency profile.
+- Runtime psycopg pools must never return a connection to service while it is inside an open or aborted transaction. `storage_pool.py`, `price_read_router.py`, `telemetry_read_router.py`, and `storage_pg_prices.py` configure pool `check`/`reset` callbacks and perform explicit release-path rollbacks before `putconn()`. If rollback fails, the connection is closed/discarded instead of being reused. `storage_pg.py` logs the originating SQL failure with SQLSTATE, transaction status, and a parameter-free statement summary so later `InFailedSqlTransaction` symptoms can be traced to the first abort.
+- Postgres-backed `storage_pg.py` still accepts bounded SQLite compatibility probes used by read adapters, including quoted `PRAGMA table_info("...")`, `sqlite_master` lookups, and `SELECT sqlite_version()`. Query adapters must avoid sending SQLite-only expressions such as `strftime()` through psycopg when the compatibility connection is backed by Postgres.
 - Timescale telemetry and price read routers use module-level lazy `psycopg_pool.ConnectionPool` instances keyed by read role, DSN, schema, pool size, and timeout/application settings. They memoize parsed env config behind an env/password-source fingerprint and honor the existing `TIMESCALE_POOL_*` and `TIMESCALE_PRICES_POOL_*` config families instead of opening a fresh Postgres connection per dashboard/operator read. High-frequency telemetry, dashboard price, and market candle reads are coalesced through sub-second in-process `state_cache` entries; SSE market streams still read live on their polling cadence. Router close hooks empty all read pools during tests and process shutdown.
 - Python tests default to `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temporary `DB_PATH` through `engine/runtime/test_isolation.py` and `tests/conftest.py`. Pytest also installs `engine/runtime/test_network_isolation.py`, which blocks DNS and non-local sockets by default while allowing loopback and Unix-domain sockets for hermetic local servers. Tests that need real Postgres should opt into the `requires_postgres` marker and a reachable local `TS_PG_DSN`; Redis tests should use `requires_redis` with a local `TS_REDIS_URL`. The CI production-backend gate sets `TS_PRODUCTION_BACKEND_TESTS=1` so test isolation preserves the explicit local Postgres/Redis targets instead of scrubbing them back to SQLite; local reproduction is documented in [../../docs/PRODUCTION_BACKEND_CI.md](../../docs/PRODUCTION_BACKEND_CI.md).
 - Tests that intentionally call live broker, market-data, or public internet services must be marked `@pytest.mark.live_network` and run with `TRADING_TEST_ALLOW_LIVE_NETWORK=1`. Normal pytest and PR CI deselect `live_network` tests, and unmarked non-local network calls fail with `NetworkBlockedError` before DNS resolution or socket connection.
@@ -225,7 +235,7 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
 
 - Host-side Codex/sim-paper imports load the repo-local `.env`. Host DSNs must use host-resolvable targets such as `127.0.0.1` for Postgres/Timescale, Redis, and MinIO. Do not use Compose-only service names such as `timescaledb`, `redis`, `minio`, or role names such as `ts_app` in `.env` when the process runs on the host.
 - Compose containers get their runtime env from `deploy/compose/.env` plus `docker-compose.stack.yml`. Inside containers, DSNs must use Compose service names such as `timescaledb`, `redis`, and `minio`, and secret files must be mounted at `/run/secrets/*`.
-- Production-like local sim envs must keep credentials out of DSNs and URLs. Use passwordless connection strings plus file-backed secrets: `TS_PG_PASSWORD_FILE` for `TS_PG_DSN`/`TIMESCALE_DSN`/`TIMESCALE_PRICES_DSN`, `REDIS_PASSWORD_FILE` or `TS_REDIS_PASSWORD_FILE` for Redis URLs, `DASHBOARD_API_TOKEN_FILE`, `OPERATOR_API_TOKEN_FILE`, and `OBJECT_STORE_ACCESS_KEY_FILE`/`OBJECT_STORE_SECRET_KEY_FILE` for MinIO/object storage.
+- Production-like local sim envs must keep credentials out of DSNs and URLs. Use passwordless connection strings plus file-backed secrets: `TS_PG_PASSWORD_FILE` for `TS_PG_DSN`/`TIMESCALE_DSN`/`TIMESCALE_PRICES_DSN`, `REDIS_PASSWORD_FILE` or `TS_REDIS_PASSWORD_FILE` for Redis URLs, `DASHBOARD_API_TOKEN_FILE`, `OPERATOR_API_TOKEN_FILE`, and `OBJECT_STORE_ACCESS_KEY_FILE`/`OBJECT_STORE_SECRET_KEY_FILE` for MinIO/object storage. For `default_pg_dsn()` and passwordless Postgres DSNs/URLs, systemd `LoadCredential` values, including explicit `*_PASSWORD_SECRET` names, remain preferred when `CREDENTIALS_DIRECTORY` is present. Non-systemd local/container starts skip unavailable systemd Postgres secret lookups, fall back to the configured `TS_PG_PASSWORD_FILE`/`TIMESCALE_PASSWORD_FILE` path without warning noise, and raise one actionable `SecretNotAvailable` only when no Postgres password source resolves.
 - Startup preflight calls `engine.runtime.dsn_context.dsn_context_snapshot()` through `live_trading_preflight`. The snapshot reports only env keys, hostnames, ports, and reason codes. It blocks strict/prod/supervised starts when a configured DSN is for the wrong context or the hostname is not resolvable, and it never returns raw DSN values.
 - `TRADING_DSN_CONTEXT=host|container` can force context detection for diagnostics/tests. Auto-detection uses `DASHBOARD_BIND_CONTEXT`, container marker envs, and container marker files.
 

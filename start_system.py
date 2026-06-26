@@ -520,6 +520,97 @@ def _log_startup_validation(stage: str, snapshot: Optional[Dict[str, Any]], *, l
         _log_swallowed("STARTUP_HEALTH_VALIDATION_FLUSH_FAILED", error=str(e), stage=str(stage), attempt=int(attempt))
 
 
+_FALSE_STARTUP_VALUES = {"0", "false", "no", "off", "disabled"}
+_TRUE_STARTUP_VALUES = {"1", "true", "yes", "on", "enabled"}
+_FEEDLESS_SAFE_HEALTH_MARKERS = (
+    "awaiting_first_price_tick",
+    "first_price",
+    "health_not_ok",
+    "market_data",
+    "price",
+    "prices",
+    "warmup",
+    "warming_up",
+)
+
+
+def _env_value(name: str) -> str:
+    return str(os.environ.get(str(name), "") or "").strip()
+
+
+def _is_false_env(name: str) -> bool:
+    return _env_value(name).lower() in _FALSE_STARTUP_VALUES
+
+
+def _is_true_env(name: str) -> bool:
+    return _env_value(name).lower() in _TRUE_STARTUP_VALUES
+
+
+def _safe_no_credential_startup_mode(mode: str) -> bool:
+    """Return true only for the local safe posture where feedless serving is allowed."""
+
+    normalized_mode = str(mode or "").strip().lower() or _env_value("ENGINE_MODE").lower() or "safe"
+    if normalized_mode != "safe":
+        return False
+    for key in ("ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE"):
+        value = _env_value(key).lower()
+        if value and value not in {"safe", "paper"}:
+            return False
+    if _is_false_env("DISABLE_LIVE_EXECUTION"):
+        return False
+    broker = (_env_value("BROKER") or _env_value("BROKER_NAME")).lower()
+    if broker and broker not in {"sim", "safe", "paper", "mock"}:
+        return False
+    live_provider_flags = (
+        "IBKR_ENABLED",
+        "ALPACA_ENABLED",
+        "TRADIER_ENABLED",
+        "POLYGON_REST_ENABLED",
+        "POLYGON_WS_ENABLED",
+    )
+    return not any(_is_true_env(key) for key in live_provider_flags)
+
+
+def _safe_feedless_startup_health_allowed(
+    *,
+    mode: str,
+    validation: Optional[Dict[str, Any]] = None,
+    exc: Optional[BaseException] = None,
+) -> bool:
+    if not _safe_no_credential_startup_mode(str(mode)):
+        return False
+
+    snap = dict(validation or {})
+    blocking = [
+        str(item or "").strip()
+        for item in list(snap.get("blocking_gates") or snap.get("blocking_checks") or [])
+        if str(item or "").strip()
+    ]
+    critical_missing = [
+        str(item or "").strip()
+        for item in list(snap.get("critical_systems_missing") or [])
+        if str(item or "").strip()
+    ]
+    if blocking or critical_missing:
+        return False
+
+    lifecycle_state = str(snap.get("lifecycle_state") or snap.get("status") or "").strip().upper()
+    first_tick = str(snap.get("first_price_ts_ms") or "").strip()
+    prices_known_bad = snap.get("prices_ok") is False
+    if lifecycle_state in {"WARMING_UP", "DEGRADED"} and not first_tick:
+        return True
+    if prices_known_bad and not first_tick:
+        return True
+
+    text_parts: List[str] = []
+    for key in ("reasons", "health_reasons", "notes"):
+        text_parts.extend(str(item or "") for item in list(snap.get(key) or []))
+    if exc is not None:
+        text_parts.append(str(exc))
+    text = " ".join(text_parts).lower()
+    return bool(text and any(marker in text for marker in _FEEDLESS_SAFE_HEALTH_MARKERS))
+
+
 def _await_startup_health(*, mode: str, timeout_s: float) -> Dict[str, Any]:
     from engine.runtime.health import get_health_snapshot
 
@@ -562,6 +653,11 @@ def _await_startup_health(*, mode: str, timeout_s: float) -> Dict[str, Any]:
         validation["health_snapshot_ts_ms"] = int(health.get("ts_ms") or 0)
         validation["system_stage"] = str(health.get("system_stage") or "")
         validation["data_flow_ok"] = bool(health.get("data_flow_ok"))
+        lifecycle = dict(health.get("lifecycle") or {})
+        validation["health_status"] = str(health.get("status") or "")
+        validation["lifecycle_state"] = str(lifecycle.get("state") or "")
+        validation["first_price_ts_ms"] = str(lifecycle.get("first_price_ts_ms") or "")
+        validation["prices_ok"] = bool((health.get("prices") or {}).get("ok"))
 
         _persist_startup_validation(validation, stage="poll", attempt=attempt, timeout_s=timeout_s)
 
@@ -588,6 +684,28 @@ def _await_startup_health(*, mode: str, timeout_s: float) -> Dict[str, Any]:
         if time.time() >= deadline:
             break
         time.sleep(float(_STARTUP_HEALTH_POLL_S))
+
+    if _safe_feedless_startup_health_allowed(mode=str(mode), validation=last_validation):
+        degraded_validation = dict(last_validation)
+        degraded_validation["ok"] = True
+        degraded_validation["safe_mode_feedless_degraded"] = True
+        reasons = list(degraded_validation.get("reasons") or [])
+        if "safe_mode_feedless_degraded_serving" not in reasons:
+            reasons.append("safe_mode_feedless_degraded_serving")
+        degraded_validation["reasons"] = reasons
+        _persist_startup_validation(degraded_validation, stage="safe_degraded", attempt=attempt, timeout_s=timeout_s)
+        _log_startup_validation("safe_degraded", degraded_validation, level="warning", attempt=attempt, timeout_s=timeout_s)
+        try:
+            from engine.runtime.lifecycle_state import DEGRADED, set_state
+
+            set_state(DEGRADED, "safe_mode_feedless_startup_health_degraded")
+        except Exception as degraded_err:
+            _log_swallowed(
+                "STARTUP_HEALTH_SAFE_DEGRADED_STATE_FAILED",
+                error=str(degraded_err),
+                mode=str(mode),
+            )
+        return degraded_validation
 
     _persist_startup_validation(last_validation, stage="failed", attempt=attempt, timeout_s=timeout_s)
     _log_startup_validation("failed", last_validation, level="error", attempt=attempt, timeout_s=timeout_s)
@@ -2185,6 +2303,40 @@ def _request_dashboard_runtime_stop(reason: str) -> None:
 
 def _handle_late_startup_health_validation_failure(exc: BaseException, *, mode: str, scope: str) -> None:
     reason = f"late_startup_health_validation_failed:{type(exc).__name__}:{exc}"
+    latest_validation = dict(_STARTUP_TRACE.get("startup_health_validation") or {})
+    if _safe_feedless_startup_health_allowed(mode=str(mode), validation=latest_validation, exc=exc):
+        os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+        os.environ["STARTUP_HEALTH_SAFE_MODE_FEEDLESS_DEGRADED"] = reason[:2000]
+        _record_phase(
+            "STARTUP_HEALTH",
+            status="degraded",
+            detail="safe_mode_feedless_degraded_serving",
+            extra={
+                "mode": str(mode),
+                "scope": str(scope),
+                "execution_disabled": True,
+                "safe_mode_feedless_degraded": True,
+                "reason": reason[:2000],
+            },
+        )
+        _meta_set_json(
+            "startup_health_safe_mode_feedless_degraded",
+            {
+                "ok": True,
+                "mode": str(mode),
+                "scope": str(scope),
+                "reason": reason,
+                "ts_ms": int(time.time() * 1000),
+            },
+        )
+        try:
+            from engine.runtime.lifecycle_state import DEGRADED, set_state
+
+            set_state(DEGRADED, "safe_mode_feedless_startup_health_degraded")
+        except Exception as degraded_err:
+            _log_swallowed("STARTUP_HEALTH_SAFE_DEGRADED_STATE_FAILED", error=str(degraded_err), reason=reason)
+        return
+
     os.environ["DISABLE_LIVE_EXECUTION"] = "1"
     os.environ["KILL_SWITCH_GLOBAL"] = "1"
     os.environ["STARTUP_HEALTH_LATE_FAILURE"] = reason[:2000]

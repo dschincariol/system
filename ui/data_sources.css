@@ -6,20 +6,10 @@
 */
 
 :root {
-  --bg: #07111f;
-  --panel: rgba(9, 19, 33, 0.92);
-  --panel-strong: rgba(7, 14, 24, 0.98);
-  --panel-soft: rgba(15, 29, 49, 0.92);
-  --text: #edf4ff;
-  --muted: #8ba1bc;
-  --line: rgba(139, 161, 188, 0.18);
-  --accent: #47c1ff;
-  --accent-2: #84f7d3;
-  --ok: #2ec27e;
-  --warn: #ffbe5c;
-  --err: #ff6b7d;
-  --radius: 18px;
-  --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+  --panel-strong: color-mix(in srgb, var(--surface-panel) 96%, transparent);
+  --panel-soft: color-mix(in srgb, var(--surface-card) 88%, transparent);
+  --radius: var(--radius-2xl);
+  --shadow: var(--shadow-deep);
 }
 
 * {
@@ -33,12 +23,12 @@ body {
 
 body {
   margin: 0;
-  font-family: "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-sans);
   color: var(--text);
   background:
-    radial-gradient(circle at top left, rgba(71, 193, 255, 0.18), transparent 28%),
-    radial-gradient(circle at top right, rgba(132, 247, 211, 0.12), transparent 24%),
-    linear-gradient(180deg, #08111d, #050a12 65%, #04070d);
+    radial-gradient(circle at top left, var(--status-info-bg), transparent 28%),
+    radial-gradient(circle at top right, var(--status-ok-bg), transparent 24%),
+    linear-gradient(180deg, var(--surface-page), var(--surface-panel-muted) 65%, var(--surface-page-deep));
 }
 
 .shell {
@@ -104,8 +94,8 @@ body {
 }
 
 .btn {
-  background: linear-gradient(135deg, var(--accent), #2a87ff);
-  color: #04101f;
+  background: linear-gradient(135deg, var(--accent), var(--action-primary));
+  color: var(--text-inverse);
 }
 
 .btn-secondary {
@@ -115,9 +105,9 @@ body {
 }
 
 .btn-danger {
-  background: rgba(255, 107, 125, 0.14);
-  color: #ffd7dd;
-  border: 1px solid rgba(255, 107, 125, 0.28);
+  background: var(--status-crit-bg);
+  color: var(--status-crit);
+  border: 1px solid var(--status-crit);
 }
 
 .btn:hover,
@@ -159,6 +149,22 @@ body {
 
 .session-card {
   margin-bottom: 18px;
+}
+
+.context-card {
+  margin-bottom: 18px;
+}
+
+.context-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.context-note {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .session-grid {
@@ -206,7 +212,7 @@ body {
 }
 
 .flash-error {
-  color: #ffd4db;
+  color: var(--status-crit);
 }
 
 .populate-evidence-block .evidence-list {
@@ -407,7 +413,7 @@ tbody tr:hover {
 }
 
 tbody tr.is-active {
-  background: rgba(71, 193, 255, 0.08);
+  background: var(--status-info-bg);
 }
 
 .pill {
@@ -422,21 +428,21 @@ tbody tr.is-active {
 }
 
 .pill.ok {
-  color: #c8ffe6;
-  background: rgba(46, 194, 126, 0.12);
-  border-color: rgba(46, 194, 126, 0.24);
+  color: var(--status-ok);
+  background: var(--status-ok-bg);
+  border-color: var(--status-ok);
 }
 
 .pill.warn {
-  color: #ffe7b8;
-  background: rgba(255, 190, 92, 0.12);
-  border-color: rgba(255, 190, 92, 0.24);
+  color: var(--status-warn);
+  background: var(--status-warn-bg);
+  border-color: var(--status-warn);
 }
 
 .pill.err {
-  color: #ffd4db;
-  background: rgba(255, 107, 125, 0.12);
-  border-color: rgba(255, 107, 125, 0.24);
+  color: var(--status-crit);
+  background: var(--status-crit-bg);
+  border-color: var(--status-crit);
 }
 
 .pill.dim {
@@ -446,9 +452,9 @@ tbody tr.is-active {
 }
 
 .pill.fx {
-  color: #d9f4ff;
-  background: rgba(71, 193, 255, 0.12);
-  border-color: rgba(71, 193, 255, 0.30);
+  color: var(--status-info);
+  background: var(--status-info-bg);
+  border-color: var(--status-info);
 }
 
 .fx-test-result .evidence-list {
@@ -516,6 +522,16 @@ tbody tr.is-active {
 
 .test-result-block {
   grid-column: 1 / -1;
+}
+
+.live-feed-warning {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--status-warn);
+  border-radius: 8px;
+  background: var(--status-warn-bg);
+  color: var(--status-warn);
+  overflow-wrap: anywhere;
 }
 
 .evidence-list,
@@ -731,18 +747,18 @@ input[type="checkbox"] {
 
 .field-error {
   min-height: 15px;
-  color: #ffd4db;
+  color: var(--status-crit);
   font-size: 11px;
   line-height: 1.35;
 }
 
 .editor-field.has-error {
-  border-color: rgba(255, 107, 125, 0.46);
+  border-color: var(--status-crit);
 }
 
 input.is-invalid {
-  border-color: rgba(255, 107, 125, 0.66);
-  box-shadow: 0 0 0 2px rgba(255, 107, 125, 0.12);
+  border-color: var(--status-crit);
+  box-shadow: 0 0 0 2px var(--status-crit-bg);
 }
 
 .schema-note {
@@ -761,8 +777,104 @@ input.is-invalid {
   font-size: 13px;
 }
 
+.uiState {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 112px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text);
+}
+
+.uiState--compact {
+  min-height: 0;
+  padding: 10px 12px;
+}
+
+.uiStateIcon {
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 900;
+  font-family: var(--font-mono);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.uiState--degraded .uiStateIcon {
+  color: var(--status-warn);
+  border-color: var(--status-warn);
+  background: var(--status-warn-bg);
+}
+
+.uiState--error .uiStateIcon {
+  color: var(--status-crit);
+  border-color: var(--status-crit);
+  background: var(--status-crit-bg);
+}
+
+.uiState--ok .uiStateIcon {
+  color: var(--status-ok);
+  border-color: var(--status-ok);
+  background: var(--status-ok-bg);
+}
+
+.uiStateBody {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.uiStateTitle {
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.uiStateMessage,
+.uiStateMeta {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.uiStateDetails {
+  margin-top: 8px;
+}
+
+.uiStateDetails summary {
+  cursor: pointer;
+  color: var(--muted);
+  user-select: none;
+}
+
+.uiStateRaw {
+  margin: 8px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--text);
+}
+
+.evidence-technical-details {
+  margin-top: 6px;
+}
+
 .mono {
-  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-family: var(--font-mono);
 }
 
 .advanced-block {

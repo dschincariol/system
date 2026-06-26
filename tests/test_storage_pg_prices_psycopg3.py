@@ -63,6 +63,8 @@ def test_price_storage_uses_psycopg3_connection_pool(monkeypatch: pytest.MonkeyP
     assert pool.kwargs["max_size"] == 2
     assert pool.kwargs["kwargs"]["connect_timeout"] == 1
     assert pool.kwargs["kwargs"]["application_name"] == "unit-price-storage"
+    assert pool.kwargs["check"] is storage_pg_prices._check_price_storage_connection
+    assert pool.kwargs["reset"] is storage_pg_prices._reset_price_storage_connection
     assert pool.kwargs["open"] is False
     assert pool.open_calls == [(True, 0.2)]
     assert pool.close_calls == [0.2]
@@ -1079,7 +1081,7 @@ def test_failed_price_storage_connection_rolls_back_and_discards(monkeypatch: py
 
     assert pool.get_timeout == 0.2
     assert conn.autocommit is False
-    assert conn.rollbacks == 1
+    assert conn.rollbacks >= 1
     assert conn.closed is True
     assert pool.returned is conn
     assert statements[-1] == "SELECT 1"

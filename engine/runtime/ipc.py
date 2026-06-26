@@ -20,6 +20,7 @@ from engine.runtime.startup_write_gate import should_defer_noncritical_startup_w
 from engine.runtime.storage import connect_ro, init_db, run_write_txn
 from engine.runtime.metrics import emit_counter, emit_gauge
 from engine.runtime.tracing import trace_event
+from engine.runtime.feed_truth import annotate_provider_map_liveness
 
 
 log = get_logger("runtime.ipc")
@@ -552,6 +553,19 @@ def market_data_status(max_age_ms: Optional[int] = None, con=None, *, emit_telem
         "owner": str(snap.get("owner") or ""),
         "last_seq": int(snap.get("last_seq") or 0),
     }
+    truth = annotate_provider_map_liveness(
+        out.get("providers") or {},
+        missing_credential_env_vars=state.get("missing_credential_env_vars") or [],
+    )
+    raw_healthy_providers = int(out.get("healthy_providers") or 0)
+    out["providers"] = truth["providers"]
+    out["raw_healthy_providers"] = int(raw_healthy_providers or truth["raw_healthy_providers"])
+    out["healthy_providers"] = int(truth["live_healthy_providers"])
+    out["live_healthy_providers"] = int(truth["live_healthy_providers"])
+    out["simulated_healthy_providers"] = int(truth["simulated_healthy_providers"])
+    out["missing_credential_env_vars"] = list(truth["missing_credential_env_vars"])
+    out["live_market_data_ok"] = bool(truth["live_market_data_ok"] and int(out.get("fresh_rows") or 0) > 0)
+    out["live_feed_status"] = str(truth["live_feed_status"] or "degraded")
 
     if emit_telemetry:
         try:

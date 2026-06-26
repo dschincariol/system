@@ -76,6 +76,7 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertIn("Environment=TS_SECRETS_PROVIDER=systemd-creds", unit)
         self.assertIn("Environment=DASHBOARD_API_TOKEN_SECRET=dashboard_api_token", unit)
         self.assertIn("Environment=OPERATOR_API_TOKEN_SECRET=operator_api_token", unit)
+        self.assertIn("Environment=BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key", unit)
         self.assertIn("Environment=PREFLIGHT_REQUIRE_CPU_POWER_POLICY=1", unit)
         self.assertIn("Environment=PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1", unit)
         self.assertIn(
@@ -98,6 +99,10 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
             "LoadCredentialEncrypted=operator_api_token:/etc/credstore.encrypted/operator_api_token.cred",
             unit,
         )
+        self.assertIn(
+            "LoadCredentialEncrypted=backup_evidence_hmac_key:/etc/credstore.encrypted/backup_evidence_hmac_key.cred",
+            unit,
+        )
         self.assertIn("ExecStart=/opt/trading/venv/bin/python engine/runtime/prod_preflight.py --json", unit)
         self.assertIn("ReadWritePaths=/var/lib/trading /var/backups/trading", unit)
         self.assertIn("ProtectSystem=strict", unit)
@@ -115,7 +120,7 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertIn("check_memory_pressure_assets", verify)
         self.assertIn("check_prod_preflight_runner", verify)
         self.assertIn(
-            "redis_password object_store_secret_key dashboard_api_token operator_api_token",
+            "redis_password object_store_secret_key dashboard_api_token operator_api_token backup_evidence_hmac_key",
             (REPO_ROOT / "ops/server/credstore/install.sh").read_text(encoding="utf-8"),
         )
         self.assertIn("--property=\"LoadCredentialEncrypted=pg_password_app:${CREDSTORE_DIR}/pg_password_app.cred\"", runner)
@@ -132,8 +137,13 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
             "--property=\"LoadCredentialEncrypted=operator_api_token:${CREDSTORE_DIR}/operator_api_token.cred\"",
             runner,
         )
+        self.assertIn(
+            "--property=\"LoadCredentialEncrypted=backup_evidence_hmac_key:${CREDSTORE_DIR}/backup_evidence_hmac_key.cred\"",
+            runner,
+        )
         self.assertIn("DASHBOARD_API_TOKEN_SECRET=dashboard_api_token", runner)
         self.assertIn("OPERATOR_API_TOKEN_SECRET=operator_api_token", runner)
+        self.assertIn("BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key", runner)
         self.assertIn("TS_SECRETS_PROVIDER=systemd-creds", runner)
         self.assertNotIn('if [ -r "$PROVIDER_ENV" ]', runner)
         self.assertIn("engine/runtime/prod_preflight.py --json", runner)
@@ -237,6 +247,45 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         finally:
             try:
                 (cred_dir / "pg_password_app").unlink()
+                cred_dir.rmdir()
+            except OSError:
+                pass
+
+    def test_signed_backup_evidence_requires_systemd_hmac_credential(self) -> None:
+        data_root = Path.cwd()
+        cred_dir = data_root / "prod_preflight_backup_evidence_creds"
+        cred_dir.mkdir(exist_ok=True)
+        try:
+            (cred_dir / "pg_password_app").write_text("test-password", encoding="utf-8")
+            (cred_dir / "backup_evidence_hmac_key").write_text("test-hmac-key", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "TS_SECRETS_PROVIDER": "systemd-creds",
+                    "CREDENTIALS_DIRECTORY": str(cred_dir),
+                    "DB_PATH": str(data_root),
+                    "BACKUP_EVIDENCE_REQUIRE_SIGNATURE": "1",
+                    "BACKUP_EVIDENCE_HMAC_KEY_SECRET": "backup_evidence_hmac_key",
+                    "TS_CREDENTIAL_AUDIT_ENABLED": "0",
+                },
+                clear=True,
+            ):
+                prod_preflight = _reload_module()
+                notes, errors, snapshot = prod_preflight._production_provisioning_gate()
+
+            self.assertEqual(errors, [])
+            self.assertIn("credential source ok provider=systemd-creds names=pg_password_app,backup_evidence_hmac_key", notes)
+            self.assertEqual(
+                snapshot["credentials"]["required_names"],
+                ["pg_password_app", "backup_evidence_hmac_key"],
+            )
+        finally:
+            for name in ("pg_password_app", "backup_evidence_hmac_key"):
+                try:
+                    (cred_dir / name).unlink()
+                except OSError:
+                    pass
+            try:
                 cred_dir.rmdir()
             except OSError:
                 pass

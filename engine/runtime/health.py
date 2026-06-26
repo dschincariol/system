@@ -40,6 +40,7 @@ from engine.runtime.storage import (
 )
 from engine.runtime.lifecycle_state import get_state as _lc_get_state, WARMING_UP as _WARMING_UP, LIVE as _LIVE, DEGRADED as _DEGRADED
 from engine.runtime.ingestion_status import get_pipeline_status, get_all_pipeline_statuses, pipeline_health_summary
+from engine.runtime.feed_truth import classify_market_data_liveness
 from engine.runtime.metrics import emit_gauge
 from engine.runtime.observability import get_component_health_snapshot
 from engine.runtime.telemetry_read_router import fetch_event_log_summary, fetch_provider_health_rows
@@ -2921,6 +2922,11 @@ def _check_prices(ctx: HealthSnapshotContext) -> None:
             source = str(row[1] or "")
             age_s = (now_ms - last_ts_ms) / 1000.0
             fresh = bool(age_s < effective_prices_max_age_s)
+            truth = classify_market_data_liveness(
+                provider_name=source,
+                ok=fresh,
+                simulated=source.lower() == "simulated",
+            )
             out["prices"] = {
                 "ok": fresh,
                 "status": "fresh" if fresh else "stale",
@@ -2930,6 +2936,9 @@ def _check_prices(ctx: HealthSnapshotContext) -> None:
                 "last_ts_ms": last_ts_ms,
                 "source": source,
                 "simulated": source.lower() == "simulated",
+                "live_market_data_ok": bool(truth.get("live_market_data_ok")),
+                "live_feed_status": str(truth.get("live_feed_status") or ""),
+                "live_feed_reason": str(truth.get("live_feed_reason") or ""),
             }
         else:
             out["prices"] = {
@@ -2941,6 +2950,9 @@ def _check_prices(ctx: HealthSnapshotContext) -> None:
                 "last_ts_ms": None,
                 "source": "",
                 "simulated": False,
+                "live_market_data_ok": False,
+                "live_feed_status": "missing",
+                "live_feed_reason": "live_market_data_not_proven",
             }
     except Exception as e:
         _warn("health.prices", e)
@@ -2954,6 +2966,9 @@ def _check_prices(ctx: HealthSnapshotContext) -> None:
             "last_ts_ms": None,
             "source": "",
             "simulated": False,
+            "live_market_data_ok": False,
+            "live_feed_status": "error",
+            "live_feed_reason": "price_health_error",
         }
     _trace_section("prices", section_started, ok=bool((out.get("prices") or {}).get("ok")))
 
@@ -3519,21 +3534,64 @@ def _check_provider_health(ctx: HealthSnapshotContext) -> None:
             except Exception as e:
                 _warn("health.providers.derived_from_prices", e)
 
+        raw_healthy_n = 0
+        live_healthy_n = 0
+        simulated_healthy_n = 0
+        missing_env_vars: List[str] = []
+        for provider_name, provider_info in list(providers.items()):
+            if not isinstance(provider_info, dict):
+                continue
+            raw_ok = bool(provider_info.get("ok"))
+            if raw_ok:
+                raw_healthy_n += 1
+            row_missing = [
+                str(name)
+                for name in list(provider_info.get("missing_credential_env_vars") or [])
+                if str(name or "").strip()
+            ]
+            missing_env_vars.extend(row_missing)
+            truth = classify_market_data_liveness(
+                provider_name=provider_name,
+                ok=raw_ok,
+                simulated=bool(provider_info.get("simulated")),
+                missing_credential_env_vars=row_missing,
+            )
+            provider_info["raw_ok"] = raw_ok
+            provider_info.update(truth)
+            provider_info["ok"] = bool(truth.get("live_market_data_ok"))
+            if bool(truth.get("live_market_data_ok")):
+                live_healthy_n += 1
+            elif raw_ok and bool(truth.get("simulated")):
+                simulated_healthy_n += 1
+        missing_env_vars = list(dict.fromkeys(missing_env_vars))
+
         out["providers"] = {
-            "ok": healthy_n > 0,
-            "healthy": healthy_n,
+            "ok": live_healthy_n > 0 and not missing_env_vars,
+            "healthy": live_healthy_n,
+            "raw_healthy": raw_healthy_n,
+            "simulated_healthy": simulated_healthy_n,
             "total": len(providers),
             "active_provider": str(meta_get("price_provider_active", "") or ""),
             "by_provider": providers,
+            "live_market_data_ok": live_healthy_n > 0 and not missing_env_vars,
+            "live_feed_status": "live" if live_healthy_n > 0 and not missing_env_vars else (
+                "missing_credentials" if missing_env_vars else ("simulated" if simulated_healthy_n > 0 else "degraded")
+            ),
+            "missing_credential_env_vars": missing_env_vars,
         }
     except Exception as e:
         _warn("health.providers", e)
         out["providers"] = {
             "ok": False,
             "healthy": 0,
+            "raw_healthy": 0,
+            "simulated_healthy": 0,
             "total": 0,
             "active_provider": "",
             "by_provider": {},
+            "live_market_data_ok": False,
+            "live_feed_status": "error",
+            "missing_credential_env_vars": [],
         }
     _trace_section(
         "providers",

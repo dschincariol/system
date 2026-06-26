@@ -24,6 +24,11 @@ from engine.runtime.state_cache import cache_get_or_load
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.telemetry_read_router import fetch_provider_health_rows
+from engine.runtime.feed_truth import (
+    annotate_provider_map_liveness,
+    classify_market_data_liveness,
+    missing_live_market_credentials_from_sources,
+)
 
 LOG = get_logger("engine.api.api_read")
 _WARNED_KEYS = set()
@@ -77,6 +82,22 @@ def _table_cols(con, name: str):
             e,
             warn_key=f"table_cols:{name}",
             table=str(name),
+        )
+        return []
+
+
+def _feed_missing_live_market_credentials() -> list[str]:
+    try:
+        from services.data_source_manager import get_manager
+
+        manager = get_manager()
+        manager.initialize()
+        return missing_live_market_credentials_from_sources(manager.list_sources() or [])
+    except Exception as e:
+        _warn_nonfatal(
+            "API_READ_FEED_MISSING_MARKET_CREDENTIALS_FAILED",
+            e,
+            warn_key="feed_missing_market_credentials",
         )
         return []
 
@@ -867,7 +888,20 @@ def get_feed_status():
                         }
                     )
 
-            healthy_providers = len([p for p in providers if p.get("ok")])
+            missing_credential_env_vars = _feed_missing_live_market_credentials()
+            provider_map = {
+                str(row.get("provider") or f"provider_{idx}"): row
+                for idx, row in enumerate(providers)
+                if isinstance(row, dict)
+            }
+            provider_truth = annotate_provider_map_liveness(
+                provider_map,
+                missing_credential_env_vars=missing_credential_env_vars,
+            )
+            providers = list((provider_truth.get("providers") or {}).values())
+            healthy_providers = int(provider_truth.get("live_healthy_providers") or 0)
+            raw_healthy_providers = int(provider_truth.get("raw_healthy_providers") or 0)
+            simulated_healthy_providers = int(provider_truth.get("simulated_healthy_providers") or 0)
             stale_providers = len([p for p in providers if (p.get("age_s") is not None and p.get("age_s") > 120.0)])
             price_freshness = {
                 "ok": False,
@@ -878,6 +912,10 @@ def get_feed_status():
                 "max_age_s": float(os.environ.get("HEALTH_PRICES_MAX_AGE_S", "120") or 120.0),
                 "source": "",
                 "simulated": False,
+                "live_market_data_ok": False,
+                "live_feed_status": "missing",
+                "live_feed_reason": "live_market_data_not_proven",
+                "missing_credential_env_vars": missing_credential_env_vars,
             }
             if _table_exists(con, "prices"):
                 try:
@@ -898,6 +936,12 @@ def get_feed_status():
                     source = str(row[1] or "")
                     age_s = round((now_ms - last_ts_ms) / 1000.0, 1)
                     fresh = bool(age_s < max_age_s)
+                    truth = classify_market_data_liveness(
+                        provider_name=source,
+                        ok=fresh,
+                        simulated=source.lower() == "simulated",
+                        missing_credential_env_vars=missing_credential_env_vars,
+                    )
                     price_freshness = {
                         "ok": fresh,
                         "status": "fresh" if fresh else "stale",
@@ -907,6 +951,10 @@ def get_feed_status():
                         "max_age_s": max_age_s,
                         "source": source,
                         "simulated": source.lower() == "simulated",
+                        "live_market_data_ok": bool(truth.get("live_market_data_ok")),
+                        "live_feed_status": str(truth.get("live_feed_status") or ""),
+                        "live_feed_reason": str(truth.get("live_feed_reason") or ""),
+                        "missing_credential_env_vars": missing_credential_env_vars,
                     }
 
             return {
@@ -915,12 +963,18 @@ def get_feed_status():
                 "summary": {
                     "providers_total": len(providers),
                     "providers_healthy": healthy_providers,
+                    "providers_raw_healthy": raw_healthy_providers,
+                    "providers_simulated_healthy": simulated_healthy_providers,
                     "providers_stale": stale_providers,
                     "jobs_total": len(feed_jobs),
                     "price_status": price_freshness["status"],
                     "price_source": price_freshness["source"],
+                    "live_feed_status": price_freshness["live_feed_status"],
                 },
                 "price_freshness": price_freshness,
+                "live_market_data_ok": bool(price_freshness.get("live_market_data_ok")),
+                "live_feed_status": str(price_freshness.get("live_feed_status") or ""),
+                "missing_credential_env_vars": missing_credential_env_vars,
                 "providers": providers,
                 "jobs": feed_jobs,
             }

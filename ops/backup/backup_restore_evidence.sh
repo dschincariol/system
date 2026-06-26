@@ -174,11 +174,10 @@ backup_evidence_signing_key_state() {
     printf 'available\n'
     return 0
   fi
-  local name path saw_file=0
+  local name path secret_name cred_dir provider
   for name in BACKUP_EVIDENCE_HMAC_KEY_FILE BACKUP_EVIDENCE_SIGNING_KEY_FILE; do
     path="${!name:-}"
     [ -n "$path" ] || continue
-    saw_file=1
     if [ ! -e "$path" ]; then
       printf 'missing_file\n'
       return 0
@@ -198,9 +197,47 @@ backup_evidence_signing_key_state() {
     printf 'available\n'
     return 0
   done
-  if [ "$saw_file" -eq 0 ]; then
-    printf 'missing\n'
+  cred_dir="${CREDENTIALS_DIRECTORY:-}"
+  for name in BACKUP_EVIDENCE_HMAC_KEY_SECRET BACKUP_EVIDENCE_SIGNING_KEY_SECRET; do
+    secret_name="${!name:-}"
+    [ -n "$secret_name" ] || continue
+    if [ -z "$cred_dir" ]; then
+      printf 'missing_file\n'
+      return 0
+    fi
+    path="${cred_dir}/${secret_name}"
+    if [ ! -e "$path" ]; then
+      printf 'missing_file\n'
+      return 0
+    fi
+    if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+      printf 'unreadable\n'
+      return 0
+    fi
+    if [ ! -s "$path" ]; then
+      printf 'empty\n'
+      return 0
+    fi
+    printf 'available\n'
     return 0
+  done
+  provider="${TS_SECRETS_PROVIDER:-}"
+  if [ -n "$cred_dir" ] || [ -n "$provider" ]; then
+    for secret_name in backup_evidence_hmac_key BACKUP_EVIDENCE_HMAC_KEY backup_evidence_signing_key; do
+      [ -n "$cred_dir" ] || break
+      path="${cred_dir}/${secret_name}"
+      [ -e "$path" ] || continue
+      if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+        printf 'unreadable\n'
+        return 0
+      fi
+      if [ ! -s "$path" ]; then
+        printf 'empty\n'
+        return 0
+      fi
+      printf 'available\n'
+      return 0
+    done
   fi
   printf 'missing\n'
 }
@@ -1356,6 +1393,42 @@ def signing_key():
         if value:
             return value.encode("utf-8"), f"file:{name}"
         return None, f"empty:{name}"
+
+    def credential_value(secret_name):
+        cred_dir = (os.environ.get("CREDENTIALS_DIRECTORY") or "").strip()
+        if not cred_dir or not secret_name:
+            return None, "missing"
+        path = Path(cred_dir) / secret_name
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None, "missing"
+        except Exception:
+            return None, "unreadable"
+        if value:
+            return value.encode("utf-8"), "available"
+        return None, "empty"
+
+    for name in ("BACKUP_EVIDENCE_HMAC_KEY_SECRET", "BACKUP_EVIDENCE_SIGNING_KEY_SECRET"):
+        secret_name = (os.environ.get(name) or "").strip()
+        if not secret_name:
+            continue
+        value, state = credential_value(secret_name)
+        if value:
+            return value, f"secret:{name}"
+        if state == "unreadable":
+            return None, f"unreadable:{name}"
+        if state == "empty":
+            return None, f"empty:{name}"
+        return None, f"missing:{name}"
+
+    if (os.environ.get("CREDENTIALS_DIRECTORY") or os.environ.get("TS_SECRETS_PROVIDER") or "").strip():
+        for secret_name in ("backup_evidence_hmac_key", "BACKUP_EVIDENCE_HMAC_KEY", "backup_evidence_signing_key"):
+            value, state = credential_value(secret_name)
+            if value:
+                return value, "provider:backup_evidence_hmac_key"
+            if state in {"unreadable", "empty"}:
+                return None, f"{state}:backup_evidence_hmac_key"
     return None, "missing"
 
 

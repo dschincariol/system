@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import types
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
@@ -276,6 +277,191 @@ def test_high_impact_mutation_rejects_missing_confirmation_with_valid_token(tmp_
             assert body["required_token"] == "KILL"
 
 
+def test_operator_start_and_bootstrap_reject_empty_body_before_handler(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+    calls: list[str] = []
+
+    handler_cls = _build_handler(
+        routes=[
+            ("POST", "/api/operator/start", "start"),
+            ("POST", "/api/operator/bootstrap", "bootstrap"),
+        ],
+        handlers={
+            "start": lambda _parsed=None, _body=None, _ctx=None: calls.append("start") or {"ok": True},
+            "bootstrap": lambda _parsed=None, _body=None, _ctx=None: calls.append("bootstrap") or {"ok": True},
+        },
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        for path, action_id, required_token in [
+            ("/api/operator/start", "operator.start", "START_OPERATOR"),
+            ("/api/operator/bootstrap", "operator.bootstrap", "BOOTSTRAP_OPERATOR"),
+        ]:
+            try:
+                _post_json(f"{base_url}{path}", token=token, body={})
+                raise AssertionError(f"{path} unexpectedly succeeded")
+            except HTTPError as exc:
+                body = json.loads(exc.read().decode("utf-8"))
+                assert exc.code == 422
+                assert body["error"] == "confirmation_required"
+                assert body["action_id"] == action_id
+                assert body["required_token"] == required_token
+                assert "confirmation" in body["required_fields"]
+                assert "action_id" in body["required_fields"]
+                assert "consequence_ack" in body["required_fields"]
+
+    assert calls == []
+
+
+def test_operator_start_failure_maps_nested_supervisor_error() -> None:
+    from engine.api.api_operator_handlers import api_post_operator_start
+
+    def _start_impl(mode: str) -> dict:
+        return {
+            "ok": False,
+            "mode": mode,
+            "steps": [
+                {
+                    "id": "start",
+                    "label": "Deterministic start",
+                    "ok": False,
+                    "details": '{"errors":["start_failed:ingestion_runtime:process exited rc=1"]}',
+                }
+            ],
+            "result": {
+                "ok": False,
+                "errors": ["start_failed:ingestion_runtime:process exited rc=1"],
+            },
+        }
+
+    payload = api_post_operator_start(
+        None,
+        {"mode": "safe"},
+        {"_operator_start_impl": _start_impl, "OPERATOR_START_REQUEST_TIMEOUT_S": 1.0},
+    )
+
+    assert payload["ok"] is False
+    assert payload["error"] == "start_failed:ingestion_runtime"
+    assert payload["reason"] == "start_failed:ingestion_runtime:process exited rc=1"
+    assert payload["meta"]["status"] == 503
+
+
+def test_operator_start_preflight_failure_surfaces_reason() -> None:
+    from engine.api.api_operator_handlers import api_post_operator_start
+
+    payload = api_post_operator_start(
+        None,
+        {"mode": "safe"},
+        {
+            "_operator_start_impl": lambda _mode: {
+                "ok": False,
+                "mode": "safe",
+                "error": "preflight_failed",
+                "steps": [
+                    {
+                        "id": "preflight",
+                        "label": "Preflight",
+                        "ok": False,
+                        "details": "prices too stale (SAFE blocked)",
+                    }
+                ],
+            },
+            "OPERATOR_START_REQUEST_TIMEOUT_S": 1.0,
+        },
+    )
+
+    assert payload["ok"] is False
+    assert payload["error"] == "preflight_failed"
+    assert payload["reason"] == "prices too stale (SAFE blocked)"
+    assert payload["meta"]["status"] == 422
+
+
+def test_operator_start_dashboard_handler_rejects_live_mode_before_execution() -> None:
+    from engine.api.api_operator_handlers import api_post_operator_start
+
+    called = False
+
+    def _start_impl(_mode: str) -> dict:
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    payload = api_post_operator_start(None, {"mode": "live"}, {"_operator_start_impl": _start_impl})
+
+    assert called is False
+    assert payload["ok"] is False
+    assert payload["error"] == "live_mode_not_supported"
+    assert payload["meta"]["status"] == 403
+
+
+def test_operator_start_safe_response_keeps_real_trading_disallowed() -> None:
+    from engine.api.api_operator_handlers import api_post_operator_start
+
+    payload = api_post_operator_start(
+        None,
+        {"mode": "safe"},
+        {
+            "_operator_start_impl": lambda _mode: {"ok": True, "mode": "safe", "result": {"ok": True}},
+            "API_HANDLERS": {
+                "api_get_execution_barrier": lambda _parsed=None, _ctx=None: {
+                    "ok": False,
+                    "execution_barrier": {
+                        "mode": "safe",
+                        "allowed": False,
+                        "real_trading_allowed": False,
+                        "reason": "disable_live_execution_env",
+                    },
+                }
+            },
+            "OPERATOR_START_REQUEST_TIMEOUT_S": 1.0,
+        },
+    )
+
+    assert payload["ok"] is True
+    assert payload["mode"] == "safe"
+    assert payload["real_trading_allowed"] is False
+    assert payload["execution_barrier"]["mode"] == "safe"
+    assert payload["execution_barrier"]["real_trading_allowed"] is False
+
+
+def test_operator_bootstrap_handler_timeout_is_bounded_and_named(monkeypatch) -> None:
+    import engine.api.api_operator_handlers as handlers
+
+    class SlowOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def run(self, _mode: str) -> dict:
+            time.sleep(0.5)
+            return {"ok": True}
+
+    monkeypatch.setattr(handlers, "StartupOrchestrator", SlowOrchestrator)
+    started = time.perf_counter()
+    payload = handlers.api_post_operator_bootstrap(
+        None,
+        {"mode": "safe"},
+        {
+            "JOBS": object(),
+            "SUPERVISOR": object(),
+            "API_HANDLERS": {"api_get_health": lambda _parsed=None, _ctx=None: {"ok": False}},
+            "OPERATOR_BOOTSTRAP_REQUEST_TIMEOUT_S": 0.05,
+        },
+    )
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.3
+    assert payload["ok"] is False
+    assert payload["error"] == "bootstrap_timeout"
+    assert payload["timed_out"] is True
+    assert payload["meta"]["status"] == 504
+
+
 def test_high_impact_mutation_rejects_wrong_confirmation_token(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ENV", "prod")
     monkeypatch.setenv("ENGINE_MODE", "safe")
@@ -540,6 +726,146 @@ def test_localhost_fallback_requires_explicit_safe_dev_mode(tmp_path: Path, monk
         )
         assert status == 200
         assert body["ok"] is True
+
+
+def test_data_sources_auth_posture_matches_loopback_read_and_mutation_auth(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.delenv("DASHBOARD_HOST", raising=False)
+    monkeypatch.delenv("TRADING_NETWORK_MODE", raising=False)
+    token = "data-sources-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+
+    from routes import data_sources_routes
+
+    class _FakeManager:
+        def initialize(self):
+            return None
+
+        def get_runtime_snapshot(self):
+            return {"jobs": {}, "desired_ingestion_jobs": []}
+
+        def get_desired_ingestion_jobs(self):
+            return []
+
+        def attach_runtime_states_to_sources(self, sources, **_kwargs):
+            return list(sources or [])
+
+        def list_sources(self):
+            return []
+
+        def list_source_templates(self):
+            return []
+
+        def list_provider_accounts(self):
+            return []
+
+        def list_provider_account_templates(self):
+            return []
+
+    monkeypatch.setattr(data_sources_routes, "get_manager", lambda: _FakeManager())
+    handler_cls = _build_handler(
+        routes=[
+            ("GET", "/api/data_sources", "get_data_sources"),
+            ("POST", "/api/data_sources/test", "test_data_source"),
+        ],
+        handlers={
+            "get_data_sources": data_sources_routes.api_get_data_sources,
+            "test_data_source": lambda _parsed=None, _body=None, _ctx=None: {"ok": True},
+        },
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        status, _headers, body = _get_json(f"{base_url}/api/data_sources")
+        assert status == 200
+        assert body["ok"] is True
+        auth = body["auth"]
+        assert "token_required" not in auth
+        assert auth["mutation_token_required"] is True
+        assert auth["actor_required"] is True
+        assert auth["read_open_on_loopback"] is True
+        assert auth["sensitive_read_token_required"] is False
+        assert auth["read_token_required_on_lan"] is True
+
+        try:
+            _post_json(f"{base_url}/api/data_sources/test", body={"source_key": "polygon"})
+            raise AssertionError("data-source POST unexpectedly allowed no-token access")
+        except HTTPError as exc:
+            denied = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 401
+            assert denied["error"] == "unauthorized"
+
+
+def test_data_sources_get_requires_token_when_lan_bind_is_configured(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.setenv("TRADING_NETWORK_MODE", "lan")
+    monkeypatch.setenv("DASHBOARD_HOST", "0.0.0.0")
+    token = "data-sources-lan-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+
+    from routes import data_sources_routes
+
+    class _FakeManager:
+        def initialize(self):
+            return None
+
+        def get_runtime_snapshot(self):
+            return {"jobs": {}, "desired_ingestion_jobs": []}
+
+        def get_desired_ingestion_jobs(self):
+            return []
+
+        def attach_runtime_states_to_sources(self, sources, **_kwargs):
+            return list(sources or [])
+
+        def list_sources(self):
+            return []
+
+        def list_source_templates(self):
+            return []
+
+        def list_provider_accounts(self):
+            return []
+
+        def list_provider_account_templates(self):
+            return []
+
+    monkeypatch.setattr(data_sources_routes, "get_manager", lambda: _FakeManager())
+    handler_cls = _build_handler(
+        routes=[("GET", "/api/data_sources", "get_data_sources")],
+        handlers={"get_data_sources": data_sources_routes.api_get_data_sources},
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        try:
+            _get_json(f"{base_url}/api/data_sources")
+            raise AssertionError("LAN data-source GET unexpectedly allowed no-token access")
+        except HTTPError as exc:
+            denied = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 401
+            assert denied["error"] == "unauthorized"
+
+        status, _headers, body = _get_json(f"{base_url}/api/data_sources", token=token)
+        assert status == 200
+        auth = body["auth"]
+        assert auth["sensitive_read_token_required"] is True
+        assert auth["read_open_on_loopback"] is False
+        assert auth["read_token_required_on_loopback"] is True
+        assert auth["read_token_required_on_lan"] is True
+        assert "dashboard_host=0.0.0.0" in auth["remote_bind_reasons"]
 
 
 def test_operator_self_repair_rejects_missing_confirmation_with_valid_token(tmp_path: Path, monkeypatch) -> None:

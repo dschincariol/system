@@ -51,6 +51,7 @@ class ValidateRepoContractTests(unittest.TestCase):
                 "ruff-static-release-gate",
                 "docs",
                 "ui-asset-refs",
+                "dashboard-route-contract",
                 "dependency-lock",
                 "noop-guard",
                 "storage-route-audit",
@@ -64,6 +65,7 @@ class ValidateRepoContractTests(unittest.TestCase):
                 "ruff-static-release-gate",
                 "docs",
                 "ui-asset-refs",
+                "dashboard-route-contract",
                 "dependency-lock",
                 "noop-guard",
                 "storage-route-audit",
@@ -111,6 +113,17 @@ class ValidateRepoContractTests(unittest.TestCase):
             dependency_call[1],
             ["python-bin", "tools/validate_dependency_lock.py", "--strict"],
         )
+
+    def test_validate_repo_runs_dashboard_route_contract(self) -> None:
+        exit_code, calls, _, root = self._run_main()
+
+        self.assertEqual(exit_code, 0)
+        route_contract_call = next(call for call in calls if call[0] == "dashboard-route-contract")
+        self.assertEqual(
+            route_contract_call[1],
+            ["python-bin", "tools/check_dashboard_ui_contract.py", "--route-handlers-only"],
+        )
+        self.assertEqual(route_contract_call[2]["PYTHONPATH"], str(root))
 
     def test_validate_repo_runs_pyright_money_path_gate(self) -> None:
         exit_code, calls, _, root = self._run_main()

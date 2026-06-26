@@ -18,6 +18,7 @@
    - applyTerminalOverlays({ overlays, markers, equitySeries })
 */
 
+import { apiEventSource, apiFetch } from "../api_client.js";
 import { renderChartAccessibility } from "../chart_a11y.js";
 import {
   addSeriesCompat,
@@ -449,7 +450,7 @@ export async function startLiveMarketChart(opts) {
   let src = [];
   try {
     const url = `/api/market/candles?symbol=${encodeURIComponent(sym)}&tf=${encodeURIComponent(tf2)}&limit=1200&max_points=1200`;
-    const r = await fetch(url, { cache: "no-store" });
+    const r = await apiFetch(url, { cache: "no-store" });
     const j = await _readJsonResponse(r, url);
     if (j && j.ok && Array.isArray(j.candles)) {
       src = j.candles.map(c => ({
@@ -586,7 +587,7 @@ export async function startLiveMarketChart(opts) {
     _clearRetry();
 
     try {
-      const es = new EventSource(url);
+      const es = apiEventSource(url);
       _LIVE.es = es;
       _LIVE.streamConnected = true;
 

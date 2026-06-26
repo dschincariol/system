@@ -122,10 +122,13 @@ def _sqlite_connection(con) -> bool:
 
 def _add_column_if_missing(con, table: str, column_def: str) -> None:
     try:
+        name = str(column_def).split()[0]
         if _sqlite_connection(con):
+            rows = con.execute(f"PRAGMA table_info({table})").fetchall() or []
+            if any(str(row[1]) == name for row in rows):
+                return
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
         else:
-            name = str(column_def).split()[0]
             rest = str(column_def)[len(name):].strip()
             con.execute(f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS {name} {rest}")
     except Exception as e:
@@ -219,12 +222,49 @@ def _write_alert_lifecycle_event(con, *, alert_id: int, state: str, actor: str, 
     )
 
 
+def _missing_alert_response(alert_id: int) -> dict[str, Any]:
+    return {"ok": False, "error": "not_found", "alert_id": int(alert_id), "meta": {"status": 404}}
+
+
+def _is_missing_alerts_table_error(error: BaseException) -> bool:
+    text = str(error or "").lower()
+    name = type(error).__name__.lower()
+    return (
+        "no such table: alerts" in text
+        or 'relation "alerts" does not exist' in text
+        or "relation 'alerts' does not exist" in text
+        or ("undefinedtable" in name and "alerts" in text)
+    )
+
+
+def _alert_exists(con, alert_id: int) -> bool:
+    try:
+        row = con.execute("SELECT 1 FROM alerts WHERE id = ? LIMIT 1", (int(alert_id),)).fetchone()
+        return bool(row)
+    except Exception as e:
+        if _is_missing_alerts_table_error(e):
+            _warn_nonfatal(
+                "API_WRITE_ALERT_EXISTS_TABLE_MISSING",
+                e,
+                warn_key="alert_exists_table_missing",
+                alert_id=int(alert_id),
+            )
+            return False
+        raise
+
+
 def ack_alert(alert_id: int, who: str = "", source: str = "", reason: str = "", timeout_ms: int | None = None):
+    alert_key = int(alert_id)
     now_ms = _now_ms()
     ttl_ms = int(timeout_ms) if timeout_ms is not None else _env_int("ALERT_ACK_TIMEOUT_MS", 30 * 60 * 1000, minimum=60_000)
     expires_ts_ms = int(now_ms) + int(ttl_ms)
+    result: dict[str, Any] = {}
 
     def _txn(con):
+        nonlocal result
+        if not _alert_exists(con, alert_key):
+            result = _missing_alert_response(alert_key)
+            return
         _ensure_alert_lifecycle_schema(con)
         # Alert acknowledgements are persisted as explicit write-side records
         # rather than mutating the original alert row.
@@ -241,7 +281,7 @@ def ack_alert(alert_id: int, who: str = "", source: str = "", reason: str = "", 
               reason=excluded.reason
             """,
             (
-                int(alert_id),
+                alert_key,
                 int(now_ms),
                 str(who or ""),
                 str(source or ""),
@@ -251,16 +291,17 @@ def ack_alert(alert_id: int, who: str = "", source: str = "", reason: str = "", 
         )
         _write_alert_lifecycle_event(
             con,
-            alert_id=int(alert_id),
+            alert_id=alert_key,
             state="acknowledged",
             actor=str(who or ""),
             reason=str(reason or ""),
             source=str(source or ""),
             detail={"expires_ts_ms": int(expires_ts_ms), "timeout_ms": int(ttl_ms)},
         )
+        result = {"ok": True, "alert_id": alert_key, "acked_ts_ms": now_ms, "expires_ts_ms": expires_ts_ms}
 
     run_write_txn(_txn)
-    return {"ok": True, "alert_id": int(alert_id), "acked_ts_ms": now_ms, "expires_ts_ms": expires_ts_ms}
+    return result
 
 
 def shelve_alert(
@@ -284,12 +325,16 @@ def shelve_alert(
         if requested_duration <= 0:
             return {"ok": False, "error": "shelve_expiry_required", "meta": {"status": 422}}
         expiry = now_ms + requested_duration
+    alert_key = int(alert_id)
     result: dict[str, Any] = {}
 
     def _txn(con):
         nonlocal result
+        if not _alert_exists(con, alert_key):
+            result = _missing_alert_response(alert_key)
+            return
         _ensure_alert_lifecycle_schema(con)
-        normalized_severity = _alert_effective_severity(con, int(alert_id), severity)
+        normalized_severity = _alert_effective_severity(con, alert_key, severity)
         if normalized_severity == "CRIT" and not _env_bool("ALERT_SHELVE_ALLOW_CRIT", False):
             result = {"ok": False, "error": "critical_shelving_blocked", "severity": normalized_severity, "meta": {"status": 422}}
             return
@@ -321,7 +366,7 @@ def shelve_alert(
               detail_json=excluded.detail_json
             """,
             (
-                int(alert_id),
+                alert_key,
                 int(now_ms),
                 int(expiry),
                 str(who or ""),
@@ -333,7 +378,7 @@ def shelve_alert(
         )
         _write_alert_lifecycle_event(
             con,
-            alert_id=int(alert_id),
+            alert_id=alert_key,
             state="shelved",
             actor=str(who or ""),
             reason=str(reason or ""),
@@ -342,7 +387,7 @@ def shelve_alert(
         )
         result = {
             "ok": True,
-            "alert_id": int(alert_id),
+            "alert_id": alert_key,
             "shelved_ts_ms": now_ms,
             "expires_ts_ms": int(expiry),
             "severity": normalized_severity,
@@ -353,9 +398,15 @@ def shelve_alert(
 
 
 def resolve_alert(alert_id: int, who: str = "", reason: str = "", source: str = ""):
+    alert_key = int(alert_id)
     now_ms = _now_ms()
+    result: dict[str, Any] = {}
 
     def _txn(con):
+        nonlocal result
+        if not _alert_exists(con, alert_key):
+            result = _missing_alert_response(alert_key)
+            return
         _ensure_alert_lifecycle_schema(con)
         con.execute(
             """
@@ -365,7 +416,7 @@ def resolve_alert(alert_id: int, who: str = "", reason: str = "", source: str = 
             ON CONFLICT(alert_id) DO NOTHING
             """,
             (
-                int(alert_id),
+                alert_key,
                 int(now_ms),
                 str(who or ""),
                 str(reason or ""),
@@ -374,15 +425,16 @@ def resolve_alert(alert_id: int, who: str = "", reason: str = "", source: str = 
         )
         _write_alert_lifecycle_event(
             con,
-            alert_id=int(alert_id),
+            alert_id=alert_key,
             state="resolved",
             actor=str(who or ""),
             reason=str(reason or ""),
             source=str(source or ""),
         )
+        result = {"ok": True, "alert_id": alert_key, "resolved_ts_ms": now_ms}
 
     run_write_txn(_txn)
-    return {"ok": True, "alert_id": int(alert_id), "resolved_ts_ms": now_ms}
+    return result
 
 # ============================================================
 # JOB HISTORY

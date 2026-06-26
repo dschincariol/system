@@ -278,10 +278,37 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
     : Math.max(0, Number(priceFreshness.age_s) * 1000);
   const priceFreshnessSource = String(priceFreshness.source || "").trim();
   const priceFreshnessStatus = String(priceFreshness.status || "").trim();
+  const liveFeedStatus = String(
+    priceFreshness.live_feed_status
+    || (feedStatus && feedStatus.live_feed_status)
+    || ingestion.live_feed_status
+    || providerTelemetry.live_feed_status
+    || ""
+  ).trim();
+  const hasLiveMarketFlag = Object.prototype.hasOwnProperty.call(priceFreshness, "live_market_data_ok")
+    || Object.prototype.hasOwnProperty.call(asObject(feedStatus), "live_market_data_ok")
+    || Object.prototype.hasOwnProperty.call(ingestion, "live_market_data_ok")
+    || Object.prototype.hasOwnProperty.call(providerTelemetry, "live_market_data_ok");
+  const liveMarketDataOk = hasLiveMarketFlag
+    ? (
+      priceFreshness.live_market_data_ok === true
+      || (feedStatus && feedStatus.live_market_data_ok === true)
+      || ingestion.live_market_data_ok === true
+      || providerTelemetry.live_market_data_ok === true
+    )
+    : null;
+  const missingCredentialEnvVars = asArray(
+    priceFreshness.missing_credential_env_vars
+    || (feedStatus && feedStatus.missing_credential_env_vars)
+    || ingestion.missing_credential_env_vars
+    || providerTelemetry.missing_credential_env_vars
+  ).map((name) => String(name || "").trim()).filter(Boolean);
   const priceFreshnessLabel = safeJoin([
     priceFreshnessStatus || (priceFreshness.ok === true ? "fresh" : priceFreshness.ok === false ? "stale" : ""),
     priceFreshnessSource ? `source ${priceFreshnessSource}` : "",
     priceFreshness.simulated ? "simulated" : "",
+    liveFeedStatus ? `live ${liveFeedStatus}` : "",
+    missingCredentialEnvVars.length ? `missing ${missingCredentialEnvVars.join(", ")}` : "",
   ]);
 
   const healthyProviders = numOrNull(providerTelemetry.healthy_providers)
@@ -312,7 +339,9 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
   const pipelineTone = !isFulfilled(settled.ingestion)
     ? "dim"
     : (ingestion.ok ? "ok" : ingestion.running ? "warn" : "bad");
-  const providersTone = healthyProviders == null
+  const providersTone = liveMarketDataOk === false
+    ? "warn"
+    : healthyProviders == null
     ? "dim"
     : (healthyProviders <= 0
       ? "bad"
@@ -344,6 +373,13 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
   }
   if (!isFulfilled(settled.featureVisibility)) {
     healthNotes.push("structured document and graph feature visibility unavailable");
+  }
+  if (liveMarketDataOk === false) {
+    healthNotes.push(
+      missingCredentialEnvVars.length
+        ? `market data not live: missing ${missingCredentialEnvVars.join(", ")}`
+        : `market data not live: ${liveFeedStatus || "simulated or fallback feed"}`
+    );
   }
 
   const pipelineSummary = asObject(ingestion.summary);
@@ -438,7 +474,9 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
       },
       {
         id: "dataFreshnessPill",
-        tone: priceFreshnessStatus === "stale"
+        tone: liveMarketDataOk === false
+          ? "warn"
+          : priceFreshnessStatus === "stale"
           ? "warn"
           : priceFreshnessStatus === "missing" || priceFreshnessStatus === "error"
             ? "bad"
@@ -447,6 +485,8 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
           priceFreshnessStatus ? `prices ${priceFreshnessStatus}` : "price age",
           priceFreshnessSource ? `source ${priceFreshnessSource}` : "",
           priceFreshness.simulated ? "sim" : "",
+          liveMarketDataOk === false && liveFeedStatus ? liveFeedStatus : "",
+          liveMarketDataOk === false && missingCredentialEnvVars.length ? `missing ${missingCredentialEnvVars.join(", ")}` : "",
           formatAgeMs(priceAgeMs),
         ]),
         staleAgeMs: priceAgeMs,

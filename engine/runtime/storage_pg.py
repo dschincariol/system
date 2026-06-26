@@ -35,6 +35,7 @@ from engine.runtime.storage_pool import (
     release,
     storage_readiness_snapshot,
 )
+from engine.runtime.pg_connection_hygiene import transaction_status_name
 
 LOGGER = logging.getLogger(__name__)
 STORAGE_BACKEND_NAME = "postgres"
@@ -311,13 +312,15 @@ class StorageConnection:
             return synthetic
         cur = self._raw.cursor()
         on_close = self._track_cursor(cur)
+        normalized = str(sql or "")
         try:
             normalized = _normalize_sql(sql, self._raw)
             note_connection_session_state_sql(self._raw, normalized)
             cur.execute(normalized, _normalize_params(params))
             lastrowid = self._record_lastrowid(normalized, cur)
             return StorageCursor(cur, lastrowid=lastrowid, on_close=on_close)
-        except Exception:
+        except Exception as exc:
+            _log_sql_execution_failure(normalized, exc, self._raw, operation="execute")
             try:
                 cur.close()
             finally:
@@ -327,10 +330,13 @@ class StorageConnection:
     def executemany(self, sql: str, seq_of_params: Iterable[Any]):
         cur = self._raw.cursor()
         on_close = self._track_cursor(cur)
+        normalized = str(sql or "")
         try:
-            cur.executemany(_normalize_sql(sql, self._raw), [_normalize_params(params) for params in seq_of_params])
+            normalized = _normalize_sql(sql, self._raw)
+            cur.executemany(normalized, [_normalize_params(params) for params in seq_of_params])
             return StorageCursor(cur, on_close=on_close)
-        except Exception:
+        except Exception as exc:
+            _log_sql_execution_failure(normalized, exc, self._raw, operation="executemany")
             try:
                 cur.close()
             finally:
@@ -665,23 +671,33 @@ def _last_insert_id(raw, sql: str, cursor) -> int:
         return 0
 
 
+def _sqlite_compat_identifier(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1].replace('""', '"')
+    return text
+
+
 def _synthetic_cursor(con: StorageConnection, sql: str, params: Any = None) -> StorageCursor | None:
     text = str(sql or "").strip()
     if re.match(r"SELECT\s+last_insert_rowid\(\)\s*;?$", text, re.IGNORECASE):
         return StorageCursor(None, [(int(con._lastrowid or 0),)], ("last_insert_rowid",), lastrowid=con._lastrowid)
+    if re.match(r"SELECT\s+sqlite_version\(\)\s*;?$", text, re.IGNORECASE):
+        return StorageCursor(None, [("3.40.0-postgres-compat",)], ("sqlite_version",))
     if re.match(r"PRAGMA\s+quick_check\s*;?$", text, re.IGNORECASE):
         return StorageCursor(None, [("ok",)], ("quick_check",))
     if re.match(r"PRAGMA\s+database_list\s*;?$", text, re.IGNORECASE):
         db_identity = str(os.environ.get("DB_PATH") or DB_PATH)
         return StorageCursor(None, [(0, "main", db_identity)], ("seq", "name", "file"))
-    match = re.match(r"PRAGMA\s+index_list\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)\s*;?$", text, re.IGNORECASE)
+    ident_pattern = r'(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_]*)'
+    match = re.match(rf"PRAGMA\s+index_list\(\s*(?P<table>{ident_pattern})\s*\)\s*;?$", text, re.IGNORECASE)
     if match:
-        table = match.group("table")
+        table = _sqlite_compat_identifier(match.group("table"))
         rows = _pg_index_list(con, table)
         return StorageCursor(None, rows, ("seq", "name", "unique", "origin", "partial"))
-    match = re.match(r"PRAGMA\s+table_info\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)\s*;?$", text, re.IGNORECASE)
+    match = re.match(rf"PRAGMA\s+table_info\(\s*(?P<table>{ident_pattern})\s*\)\s*;?$", text, re.IGNORECASE)
     if match:
-        table = match.group("table")
+        table = _sqlite_compat_identifier(match.group("table"))
         rows = _pg_table_info(con, table)
         return StorageCursor(None, rows, ("cid", "name", "type", "notnull", "dflt_value", "pk"))
     if "sqlite_master" in text.lower():
@@ -1033,6 +1049,23 @@ def _pg_error_code(exc: BaseException) -> str:
         if candidate:
             return str(candidate)
     return ""
+
+
+def _sql_log_summary(sql: str) -> str:
+    text = re.sub(r"\s+", " ", str(sql or "")).strip()
+    return text[:500] if text else "<empty>"
+
+
+def _log_sql_execution_failure(sql: str, exc: BaseException, raw: Any, *, operation: str) -> None:
+    LOGGER.warning(
+        "POSTGRES_SQL_EXECUTION_FAILED operation=%s error_type=%s sqlstate=%s transaction_status=%s sql=%s",
+        str(operation or "execute"),
+        type(exc).__name__,
+        _safe_log_identifier(_pg_error_code(exc)),
+        transaction_status_name(raw),
+        _sql_log_summary(sql),
+        exc_info=True,
+    )
 
 
 def run_write_txn(
@@ -1639,7 +1672,10 @@ _PG_REQUIRED_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-_PG_REQUIRED_INDEXES: tuple[str, ...] = ("idx_alert_lifecycle_events_alert_ts",)
+_PG_REQUIRED_INDEXES: tuple[str, ...] = (
+    "idx_alert_lifecycle_events_alert_ts",
+    "uq_events_event_key_ts_ms",
+)
 
 
 def _current_expected_schema_version() -> int:
@@ -2292,6 +2328,7 @@ def put_normalized_event(event: dict[str, Any], con: StorageConnection | None = 
                     "events",
                     row,
                     conflict_column="event_key",
+                    conflict_columns=("event_key", "ts_ms"),
                     returning_id=True,
                     con=db,
                 )

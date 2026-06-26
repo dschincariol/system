@@ -1,5 +1,9 @@
+import importlib
+import json
+import os
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -266,6 +270,64 @@ class OptionsDataQualityTests(unittest.TestCase):
         self.assertEqual(payload["raw_payload"]["event_kind"], "options_data_quality_degraded")
         self.assertEqual(payload["derived_features"]["options_event_kind"], "options_data_quality_degraded")
         self.assertEqual(recording.protected_writes, [])
+
+    def test_degradation_event_writes_against_runtime_events_schema(self):
+        report = {
+            "ts_ms": NOW_MS,
+            "available": True,
+            "ok": False,
+            "degraded": True,
+            "coverage_fraction": 0.25,
+            "fresh_underlyings": 1,
+            "universe_underlyings": 4,
+            "reason_codes": ["coverage_below_min"],
+            "thresholds": {"min_coverage": 0.75},
+            "iv_sanity": {"iv_negative_rows": 0, "iv_absurd_rows": 0, "zero_greeks_rows": 0},
+            "completeness_failures": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "options_dq.sqlite"
+            env = {
+                "DB_PATH": str(db_path),
+                "TS_STORAGE_BACKEND": "sqlite",
+                "TIMESCALE_ENABLED": "0",
+                "SQLITE_LIVENESS_DB_ENABLED": "0",
+                "SQLITE_LIVENESS_QUEUE_ENABLED": "0",
+                "FEATURE_STORE_ENABLED": "0",
+                "FEATURE_STORE_INIT_ON_STARTUP": "0",
+            }
+            with mock.patch.dict(os.environ, env):
+                storage = importlib.reload(importlib.import_module("engine.runtime.storage"))
+                importlib.reload(importlib.import_module("engine.data.options_features"))
+                storage.init_db()
+                odq._LAST_DQ_DEGRADATION_EVENT_TS_MS = 0
+
+                result = odq.emit_options_data_quality_degradation_event(report, now_ms=NOW_MS)
+
+                self.assertEqual(result.get("events"), 1, result)
+                con = sqlite3.connect(str(db_path))
+                try:
+                    row = con.execute(
+                        """
+                        SELECT raw_payload, derived_features, source_id, event_key
+                        FROM events
+                        WHERE event_type='options'
+                        """
+                    ).fetchone()
+                finally:
+                    con.close()
+                storage.close_pooled_connections()
+
+            importlib.reload(importlib.import_module("engine.runtime.storage"))
+            importlib.reload(importlib.import_module("engine.data.options_features"))
+
+        self.assertIsNotNone(row)
+        raw_payload = json.loads(str(row[0] or "{}"))
+        derived_features = json.loads(str(row[1] or "{}"))
+        self.assertEqual(raw_payload["event_kind"], "options_data_quality_degraded")
+        self.assertEqual(derived_features["options_event_kind"], "options_data_quality_degraded")
+        self.assertTrue(str(row[2]).startswith("options_data_quality:options_data_quality_degraded:"))
+        self.assertTrue(str(row[3]).startswith("options:options_data_quality_degraded:"))
 
 
 if __name__ == "__main__":

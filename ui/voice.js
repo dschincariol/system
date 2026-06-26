@@ -22,6 +22,7 @@
     - window._lastAlerts array exists (you have it)
 */
 
+import { apiFetch } from "./api_client.js";
 import { normalizeSeverity } from "./alerts.js";
 
 const VOICE_CAPS = {
@@ -164,7 +165,7 @@ async function _askLLMFallback(userText) {
   if (!VOICE_LLM_ENDPOINT) return null;
 
   try {
-    const res = await fetch(VOICE_LLM_ENDPOINT, {
+    const res = await apiFetch(VOICE_LLM_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       cache: "no-store",

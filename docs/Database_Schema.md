@@ -379,6 +379,11 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `weather_forecast_region_daily` | Hypertable | time=run_ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `weather_provider_health` | Hypertable | time=ts_ms; chunk=1 day; compress=14 days; retain=180 days; segmentby=none | medium | recent operational time windows | operational health metric stream; append-mostly and dashboarded by time |
 
+Weather read endpoints probe these tables with the runtime storage
+`table_exists` helper before selecting. Missing weather tables return HTTP 200
+with `ready:false`, an explicit `reason`, and an empty or zero-filled payload
+instead of surfacing database `OperationalError` exceptions.
+
 ### `symbols` FX Instrument Metadata
 
 FX-02 makes `engine.data.fx_instrument.parse_fx_symbol` and

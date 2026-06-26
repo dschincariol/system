@@ -6,6 +6,7 @@
   the rest of the dashboard to endpoint-specific parsing.
 */
 
+import { apiFetch } from "./api_client.js";
 import { esc, escapeHTML, fmtTime } from "./utils.js";
 
 const FETCH_TIMEOUT_MS = 15000;
@@ -26,7 +27,7 @@ async function _fetchWithTimeout(path, options = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(new Error(`fetch_timeout:${path}`)), FETCH_TIMEOUT_MS);
   try {
-    return await fetch(path, {
+    return await apiFetch(path, {
       ...options,
       signal: controller.signal,
     });

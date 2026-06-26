@@ -6,6 +6,8 @@
   diagnostic payload for export or triage.
 */
 
+import { apiFetch } from "./api_client.js";
+
 export async function buildSnapshotBundle({
   OPERATOR_MODE = null,
   EXPERT_UNLOCK = false,
@@ -128,7 +130,7 @@ export async function buildSnapshotBundle({
 
       let res;
       try {
-        res = await fetch(url, { cache: "no-store", signal: controller.signal });
+        res = await apiFetch(url, { cache: "no-store", signal: controller.signal });
       } finally {
         clearTimeout(timeoutId);
       }

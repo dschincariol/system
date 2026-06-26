@@ -586,6 +586,7 @@ _INIT_SENTINEL_TABLES = (
     "runtime_meta",
     "schema_version",
     "schema_migrations",
+    "events",
     "predictions",
     "alerts",
     "prediction_history",
@@ -614,6 +615,10 @@ _INIT_SENTINEL_TABLES = (
     "price_feed_lock",
     "price_provider_health",
     "net_after_cost_labels",
+    "model_weather_effect",
+    "weather_alerts",
+    "weather_forecast_region_daily",
+    "weather_provider_health",
 )
 
 _INIT_SENTINEL_INDEXES = (
@@ -642,6 +647,23 @@ _INIT_SENTINEL_INDEXES = (
 )
 
 _INIT_SENTINEL_COLUMNS = {
+    "events": (
+        "ts_ms",
+        "timestamp",
+        "event_type",
+        "symbol",
+        "source",
+        "title",
+        "body",
+        "url",
+        "importance_score",
+        "raw_payload",
+        "derived_features",
+        "meta_json",
+        "source_id",
+        "dedupe_hash",
+        "event_key",
+    ),
     "alerts": ("prediction_id", "model_name", "model_id", "model_version", "event_id"),
     "decision_log": ("prev_hash", "row_hash", "component_vector"),
     "prediction_history": ("confidence_raw", "prediction_strength", "model_id", "model_version"),
@@ -1153,6 +1175,7 @@ class StorageConnection(sqlite3.Connection):
         self._allow_managed_rollback = False
         self._suppress_manual_transaction_control = False
         self._write_lock_owned = False
+        self._closed = False
 
     def _acquire_write_lock(self) -> None:
         if not bool(self._write_lock_owned):
@@ -1321,6 +1344,8 @@ class StorageConnection(sqlite3.Connection):
             self._allow_managed_rollback = False
 
     def close(self) -> None:  # type: ignore[override]
+        if bool(getattr(self, "_closed", False)):
+            return
         if (
             bool(getattr(self, "in_transaction", False))
             and _active_write_connection() is self
@@ -1336,6 +1361,7 @@ class StorageConnection(sqlite3.Connection):
         try:
             sqlite3.Connection.close(self)
         finally:
+            self._closed = True
             self._release_write_lock()
 
     @contextmanager
@@ -1969,9 +1995,13 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
           title TEXT,
           body TEXT,
           url TEXT,
-          event_key TEXT,
           importance_score REAL,
-          meta_json TEXT
+          raw_payload TEXT,
+          derived_features TEXT,
+          meta_json TEXT,
+          source_id TEXT,
+          dedupe_hash TEXT,
+          event_key TEXT
         );
 
         CREATE TABLE IF NOT EXISTS labels (
@@ -2664,6 +2694,27 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_event_log_ts ON event_log(ts_ms);
         """
     )
+    _ensure_columns(
+        con,
+        "events",
+        (
+            "ts_ms",
+            "timestamp",
+            "event_type",
+            "symbol",
+            "source",
+            "title",
+            "body",
+            "url",
+            "importance_score",
+            "raw_payload",
+            "derived_features",
+            "meta_json",
+            "source_id",
+            "dedupe_hash",
+            "event_key",
+        ),
+    )
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_event_key_ts_ms ON events(event_key, ts_ms)")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_model_best_params_model_family_symbol ON model_best_params(model_family, symbol)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_model_hparam_registry_family_ts ON model_hyperparameter_registry(model_family, ts DESC)")
@@ -3023,6 +3074,85 @@ def _ensure_insider_transactions_schema(con: sqlite3.Connection) -> None:
 def _ensure_congressional_trades_schema(con: sqlite3.Connection) -> None:
     """CREATE TABLE IF NOT EXISTS congressional_trades (...);"""
     _create_table(con, "congressional_trades", ("id", *_CONGRESSIONAL_TRADE_COLUMNS), (("source_trade_id",),))
+
+
+def _ensure_weather_schema(con: sqlite3.Connection) -> None:
+    # storage-route-audit: allow - centralized init_db schema creation under _INIT_LOCK.
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS model_weather_effect (
+          key_type TEXT NOT NULL,
+          key TEXT NOT NULL,
+          horizon_s INTEGER NOT NULL,
+          regime TEXT NOT NULL DEFAULT 'global',
+          ts_ms INTEGER NOT NULL,
+          base_rmse REAL,
+          wx_rmse REAL,
+          rmse_delta REAL,
+          base_dir_acc REAL,
+          wx_dir_acc REAL,
+          dir_acc_delta REAL,
+          base_spearman REAL,
+          wx_spearman REAL,
+          spearman_delta REAL,
+          n_eval INTEGER NOT NULL,
+          PRIMARY KEY (key_type, key, horizon_s, regime, ts_ms)
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_wx_effect_lookup
+          ON model_weather_effect(key_type, key, horizon_s, regime, ts_ms);
+
+        CREATE TABLE IF NOT EXISTS weather_alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          alert_id TEXT NOT NULL,
+          issued_ts INTEGER NOT NULL,
+          effective_ts INTEGER,
+          expires_ts INTEGER,
+          event TEXT,
+          severity TEXT,
+          urgency TEXT,
+          certainty TEXT,
+          area_desc TEXT,
+          polygon_geojson TEXT,
+          affected_regions TEXT,
+          headline TEXT,
+          description TEXT,
+          source_uri TEXT,
+          UNIQUE(provider, alert_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_wx_alerts_time
+          ON weather_alerts(provider, issued_ts);
+
+        CREATE TABLE IF NOT EXISTS weather_forecast_region_daily (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          region_id TEXT NOT NULL,
+          run_ts INTEGER NOT NULL,
+          day_ts INTEGER NOT NULL,
+          temp_mean_c REAL,
+          hdd65 REAL,
+          cdd65 REAL,
+          wind_mean_mps REAL,
+          precip_sum_mm REAL,
+          spread REAL,
+          source_uri TEXT,
+          UNIQUE(provider, region_id, run_ts, day_ts)
+        );
+        CREATE INDEX IF NOT EXISTS idx_wx_region_lookup
+          ON weather_forecast_region_daily(provider, region_id, day_ts, run_ts);
+
+        CREATE TABLE IF NOT EXISTS weather_provider_health (
+          ts_ms INTEGER NOT NULL,
+          provider TEXT NOT NULL,
+          ok INTEGER NOT NULL,
+          latency_ms INTEGER,
+          error TEXT,
+          PRIMARY KEY (provider, ts_ms)
+        );
+        CREATE INDEX IF NOT EXISTS idx_weather_provider_health_ts
+          ON weather_provider_health(ts_ms);
+        """
+    )
 
 
 def _ensure_prices_schema(con: sqlite3.Connection) -> None:
@@ -4503,6 +4633,7 @@ def _base_schema(con: sqlite3.Connection) -> None:
     _ensure_options_chain_v2_schema(con)
     _ensure_insider_transactions_schema(con)
     _ensure_congressional_trades_schema(con)
+    _ensure_weather_schema(con)
     _create_table(
         con,
         "news_event_features",
@@ -5037,6 +5168,24 @@ _REQUIRED_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "entity_id",
         "correlation_id",
         "payload_json",
+    ),
+    "events": (
+        "id",
+        "ts_ms",
+        "timestamp",
+        "event_type",
+        "symbol",
+        "source",
+        "title",
+        "body",
+        "url",
+        "importance_score",
+        "raw_payload",
+        "derived_features",
+        "meta_json",
+        "source_id",
+        "dedupe_hash",
+        "event_key",
     ),
     "event_log_state": ("namespace", "state_key", "state_value", "updated_ts_ms", "payload_json"),
     "prediction_history": (

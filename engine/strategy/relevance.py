@@ -10,7 +10,8 @@ import os
 import time
 import threading
 
-from engine.runtime.failure_diagnostics import failure_response
+from engine.api.degradation import degraded_empty_read, is_missing_table_error
+from engine.runtime.failure_diagnostics import failure_response, log_failure
 from engine.runtime.logging import get_logger
 
 # -------------            -- ------------------------------------------------------
@@ -30,6 +31,82 @@ _relevance_cache = {
     "value": None,
 }
 LOG = get_logger("strategy.relevance")
+
+
+def _labels_table_state() -> dict:
+    state = {"table_present": None, "usable_rows": None}
+    con = None
+    try:
+        from engine.api.internal_access import db_connect
+
+        con = db_connect(readonly=True)
+        try:
+            con.execute("SELECT 1 FROM labels LIMIT 1").fetchone()
+            state["table_present"] = True
+        except Exception as e:
+            log_failure(
+                LOG,
+                event="strategy_relevance_labels_table_state_probe_failed",
+                code="STRATEGY_RELEVANCE_LABELS_TABLE_STATE_PROBE_FAILED",
+                message=str(e),
+                error=e,
+                level=logging.WARNING,
+                component="engine.strategy.relevance",
+                include_health=False,
+                persist=False,
+            )
+            if is_missing_table_error(e, "labels"):
+                state["table_present"] = False
+                state["usable_rows"] = 0
+                return state
+            return state
+
+        try:
+            row = con.execute("SELECT COUNT(*) FROM labels WHERE impact_z IS NOT NULL").fetchone()
+            state["usable_rows"] = int((row or [0])[0] or 0)
+        except Exception:
+            state["usable_rows"] = None
+    except Exception as e:
+        log_failure(
+            LOG,
+            event="strategy_relevance_labels_table_state_failed",
+            code="STRATEGY_RELEVANCE_LABELS_TABLE_STATE_FAILED",
+            message=str(e),
+            error=e,
+            level=logging.WARNING,
+            component="engine.strategy.relevance",
+            include_health=False,
+            persist=False,
+        )
+        return state
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception:
+            LOG.debug("relevance_labels_table_state_close_failed", exc_info=True)
+    return state
+
+
+def _empty_relevance_stats_payload(*, cached: bool, stats: object) -> dict:
+    table_state = _labels_table_state()
+    table_present = table_state.get("table_present")
+    usable_rows = table_state.get("usable_rows")
+    if table_present is False:
+        reason = "labels_table_missing"
+    elif table_present is True and int(usable_rows or 0) <= 0:
+        reason = "relevance_stats_no_labels_yet"
+    else:
+        reason = "relevance_stats_empty"
+    return degraded_empty_read(
+        reason,
+        source="labels",
+        table_present=(bool(table_present) if table_present is not None else None),
+        count=0,
+        cached=bool(cached),
+        stats=stats if isinstance(stats, dict) else {},
+        usable_label_rows=usable_rows,
+    )
 
 
 def _compute_relevance_stats_with_timeout(timeout_s: float):
@@ -82,10 +159,13 @@ def get_relevance_stats():
         _relevance_cache["value"] is not None
         and (now - _relevance_cache["ts"]) < RELEVANCE_STATS_CACHE_TTL_S
     ):
+        cached_stats = _relevance_cache["value"]
+        if not cached_stats:
+            return _empty_relevance_stats_payload(cached=True, stats=cached_stats)
         return {
             "ok": True,
             "cached": True,
-            "stats": _relevance_cache["value"],
+            "stats": cached_stats,
         }
 
     try:
@@ -94,6 +174,8 @@ def get_relevance_stats():
         )
         _relevance_cache["value"] = stats
         _relevance_cache["ts"] = now
+        if not stats:
+            return _empty_relevance_stats_payload(cached=False, stats=stats)
         return {
             "ok": True,
             "cached": False,

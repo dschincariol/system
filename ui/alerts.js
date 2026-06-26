@@ -208,6 +208,340 @@ export function severityAtLeast(value, minimum) {
   return minRank > 0 && severityRank(value) >= minRank;
 }
 
+const ALERT_STALE_THRESHOLDS_MS = Object.freeze({
+  CRIT: 15 * 60 * 1000,
+  HIGH: 15 * 60 * 1000,
+  WARN: 60 * 60 * 1000,
+  INFO: 4 * 60 * 60 * 1000,
+});
+
+const ALERT_LIFECYCLE_SORT_RANK = Object.freeze({
+  retriggered: 6,
+  active: 5,
+  stale: 4,
+  acknowledged: 3,
+  shelved: 2,
+  resolved: 1,
+});
+
+function _finitePositiveMs(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function _alertAgeMs(alert, nowMs) {
+  const ts = _finitePositiveMs(alert && (alert.ts_ms ?? alert.ts));
+  return ts == null ? null : Math.max(0, Number(nowMs) - ts);
+}
+
+function _alertExplicitlyStale(alert) {
+  if (!alert || typeof alert !== "object") return false;
+  if (alert.stale === true || alert.is_stale === true || alert.freshness_stale === true) return true;
+  const freshness = String(
+    alert.freshness ||
+    alert.freshness_state ||
+    alert.data_freshness ||
+    alert.health_state ||
+    ""
+  ).trim().toLowerCase();
+  return freshness === "stale" || freshness === "expired";
+}
+
+function _alertStaleThresholdMs(alert) {
+  const explicit = _finitePositiveMs(
+    alert && (
+      alert.stale_after_ms ??
+      alert.max_age_ms ??
+      alert.freshness_max_age_ms ??
+      (alert.max_age_s != null ? Number(alert.max_age_s) * 1000 : null)
+    )
+  );
+  if (explicit != null) return explicit;
+  return ALERT_STALE_THRESHOLDS_MS[normalizeSeverity(alert && alert.severity)] || ALERT_STALE_THRESHOLDS_MS.INFO;
+}
+
+export function formatAlertDurationMs(ms) {
+  const n = Math.max(0, Number(ms) || 0);
+  if (n < 60_000) return `${Math.max(0, Math.round(n / 1000))}s`;
+  if (n < 3_600_000) return `${Math.round(n / 60_000)}m`;
+  if (n < 86_400_000) return `${Math.round(n / 3_600_000)}h`;
+  return `${Math.round(n / 86_400_000)}d`;
+}
+
+export function alertAffectedEntity(row) {
+  const alert = normalizeAlert(row) || {};
+  const value =
+    alert.symbol ||
+    _pickAlertValue(alert, ["entity", "affected_entity", "component", "service", "source", "scope"]) ||
+    "SYSTEM";
+  return String(value || "SYSTEM").trim().toUpperCase() || "SYSTEM";
+}
+
+export function alertLifecycleState(row, nowMs = Date.now()) {
+  const alert = normalizeAlert(row) || {};
+  const resolved = alert.status === "resolved" || alert.resolved === true;
+  const ageMs = _alertAgeMs(alert, nowMs);
+  const stale = !resolved && (
+    _alertExplicitlyStale(alert) ||
+    (ageMs != null && ageMs >= _alertStaleThresholdMs(alert))
+  );
+  const policy = alert.notification_policy && typeof alert.notification_policy === "object"
+    ? alert.notification_policy
+    : {};
+  const shelved = !resolved && !!alert.shelved && !alert.shelve_expired;
+  const suppressed = !resolved && !!(policy.suppressed || shelved || alert.suppressed);
+  const actionability = normalizeSeverity(alert.severity) === "INFO" ? "notification" : "alarm";
+
+  if (resolved) {
+    return {
+      key: "resolved",
+      label: "Resolved",
+      tone: "ok",
+      actionability: "closed",
+      ageMs,
+      stale: false,
+      suppressed: true,
+      description: alert.resolved_reason ? `Resolved: ${alert.resolved_reason}` : "Resolved",
+    };
+  }
+  if (alert.shelve_expired) {
+    return {
+      key: "retriggered",
+      label: "Shelving expired",
+      tone: normalizeSeverity(alert.severity) === "CRIT" ? "crit" : "high",
+      actionability,
+      ageMs,
+      stale,
+      suppressed: false,
+      description: "Shelving expired while the alert was still unresolved.",
+    };
+  }
+  if (shelved) {
+    const remaining = Number(alert.shelve_expires_ts_ms || 0) - Number(nowMs || Date.now());
+    return {
+      key: "shelved",
+      label: "Shelved, unresolved",
+      tone: "warn",
+      actionability,
+      ageMs,
+      stale,
+      suppressed,
+      expiresTsMs: _finitePositiveMs(alert.shelve_expires_ts_ms),
+      remainingMs: Number.isFinite(remaining) ? Math.max(0, remaining) : null,
+      description: `Shelved until ${alert.shelve_expires_ts_ms ? fmtTime(alert.shelve_expires_ts_ms) : "expiry unavailable"}.`,
+    };
+  }
+  if (alert.ack_expired || alert.retriggered || alert.lifecycle_state === "retriggered") {
+    return {
+      key: "retriggered",
+      label: "Re-triggered",
+      tone: normalizeSeverity(alert.severity) === "CRIT" ? "crit" : "high",
+      actionability,
+      ageMs,
+      stale,
+      suppressed,
+      description: "Acknowledgement expired while the alert remained unresolved.",
+    };
+  }
+  if (alert.acked) {
+    const remaining = Number(alert.ack_expires_ts_ms || 0) - Number(nowMs || Date.now());
+    return {
+      key: "acknowledged",
+      label: "Acknowledged, unresolved",
+      tone: "warn",
+      actionability,
+      ageMs,
+      stale,
+      suppressed,
+      expiresTsMs: _finitePositiveMs(alert.ack_expires_ts_ms),
+      remainingMs: Number.isFinite(remaining) ? Math.max(0, remaining) : null,
+      description: "Acknowledged only; this is not resolved.",
+    };
+  }
+  if (stale) {
+    return {
+      key: "stale",
+      label: "Stale active",
+      tone: severityAtLeast(alert.severity, "HIGH") ? "high" : "warn",
+      actionability,
+      ageMs,
+      stale: true,
+      suppressed,
+      description: "Alert evidence is stale while unresolved.",
+    };
+  }
+  return {
+    key: "active",
+    label: "Active",
+    tone: cellColor(alert).key,
+    actionability,
+    ageMs,
+    stale: false,
+    suppressed,
+    description: "Active unresolved alert.",
+  };
+}
+
+export function defaultAlertRecommendedAction(row, nowMs = Date.now()) {
+  const alert = normalizeAlert(row) || {};
+  const state = alertLifecycleState(alert, nowMs);
+  if (state.key === "resolved") return "No action: resolution recorded";
+  if (state.key === "shelved") {
+    const remaining = state.remainingMs == null ? "expiry unavailable" : `${formatAlertDurationMs(state.remainingMs)} remaining`;
+    return `Shelved only; re-check before expiry (${remaining})`;
+  }
+  if (state.key === "acknowledged") return "Acknowledged only; verify it clears or resolve after root cause fix";
+  if (state.key === "retriggered") return "Act now: escalation resumed before resolution";
+  if (state.key === "stale") return "Refresh evidence, then resolve or escalate";
+  if (normalizeSeverity(alert.severity) === "CRIT") return "Act now; pause affected path if needed";
+  if (normalizeSeverity(alert.severity) === "HIGH") return "Investigate before adding risk";
+  if (normalizeSeverity(alert.severity) === "WARN") return "Review and watch for repeats";
+  return "Informational; observe unless it repeats";
+}
+
+function _alertMessageSignature(alert) {
+  const raw = String(alert.message || alert.event_title || alert.reason || "alert")
+    .toLowerCase()
+    .replace(/[0-9a-f]{8,}/g, "#")
+    .replace(/\d+(\.\d+)?/g, "#")
+    .replace(/[^a-z0-9_#]+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return raw || "alert";
+}
+
+function _alertHorizonBucket(alert) {
+  const s = Number(alert.horizon_s);
+  if (!Number.isFinite(s) || s <= 0) return "h:none";
+  if (s <= 120) return "h:1m";
+  if (s <= 900) return "h:5m";
+  if (s <= 7200) return "h:1h";
+  return "h:4h";
+}
+
+export function alertIncidentGroupKey(row, nowMs = Date.now()) {
+  const alert = normalizeAlert(row) || {};
+  const state = alertLifecycleState(alert, nowMs);
+  const lifecycleFamily = state.key === "resolved" ? "resolved" : "open";
+  const rule = String(
+    _pickAlertValue(alert, ["incident_id", "rule_id", "alert_type", "event_type", "type"]) ||
+    _alertMessageSignature(alert)
+  ).trim().toLowerCase();
+  return [
+    lifecycleFamily,
+    alertAffectedEntity(alert),
+    _alertHorizonBucket(alert),
+    rule,
+  ].join("|");
+}
+
+function _alertSortScore(alert, nowMs) {
+  const state = alertLifecycleState(alert, nowMs);
+  return (
+    (ALERT_LIFECYCLE_SORT_RANK[state.key] || 0) * 1000 +
+    severityRank(alert.severity) * 100 +
+    (state.actionability === "alarm" ? 10 : 0)
+  );
+}
+
+function _sortAlertsForIncidents(a, b, nowMs) {
+  const scoreDelta = _alertSortScore(b, nowMs) - _alertSortScore(a, nowMs);
+  if (scoreDelta !== 0) return scoreDelta;
+  return Number(b.ts_ms || b.ts || 0) - Number(a.ts_ms || a.ts || 0);
+}
+
+export function buildAlertIncidentGroups(rows, nowMs = Date.now()) {
+  const groups = new Map();
+  for (const raw of rows || []) {
+    const alert = normalizeAlert(raw);
+    if (!alert) continue;
+    const key = alertIncidentGroupKey(alert, nowMs);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        alerts: [],
+        parent: null,
+        severity: "INFO",
+        entity: alertAffectedEntity(alert),
+        title: alert.message || alert.event_title || "Alert",
+        latestTsMs: 0,
+      });
+    }
+    const group = groups.get(key);
+    group.alerts.push(alert);
+    if (severityRank(alert.severity) > severityRank(group.severity)) group.severity = alert.severity;
+    group.latestTsMs = Math.max(group.latestTsMs, Number(alert.ts_ms || alert.ts || 0));
+  }
+
+  return Array.from(groups.values())
+    .map((group) => {
+      group.alerts.sort((a, b) => _sortAlertsForIncidents(a, b, nowMs));
+      group.parent = group.alerts[0] || null;
+      group.count = group.alerts.length;
+      group.hiddenCount = Math.max(0, group.count - 1);
+      group.lifecycle = alertLifecycleState(group.parent, nowMs);
+      group.title = group.parent
+        ? (group.parent.message || group.parent.event_title || group.title || "Alert")
+        : (group.title || "Alert");
+      return group;
+    })
+    .sort((a, b) => {
+      const parentDelta = _sortAlertsForIncidents(a.parent || {}, b.parent || {}, nowMs);
+      if (parentDelta !== 0) return parentDelta;
+      if (b.count !== a.count) return b.count - a.count;
+      return Number(b.latestTsMs || 0) - Number(a.latestTsMs || 0);
+    });
+}
+
+export function summarizeAlertLifecycleCounts(rows, nowMs = Date.now()) {
+  const summary = {
+    total: 0,
+    open: 0,
+    alarms: 0,
+    notifications: 0,
+    crit: 0,
+    high: 0,
+    warn: 0,
+    info: 0,
+    acknowledged: 0,
+    shelved: 0,
+    suppressed: 0,
+    stale: 0,
+    resolved: 0,
+    grouped_incidents: 0,
+    flood_groups: 0,
+  };
+  const normalized = [];
+  for (const raw of rows || []) {
+    const alert = normalizeAlert(raw);
+    if (!alert) continue;
+    normalized.push(alert);
+    summary.total += 1;
+    const sev = normalizeSeverity(alert.severity);
+    if (sev === "CRIT") summary.crit += 1;
+    else if (sev === "HIGH") summary.high += 1;
+    else if (sev === "WARN") summary.warn += 1;
+    else summary.info += 1;
+
+    const state = alertLifecycleState(alert, nowMs);
+    if (state.key === "resolved") {
+      summary.resolved += 1;
+      continue;
+    }
+    summary.open += 1;
+    if (state.actionability === "alarm") summary.alarms += 1;
+    else summary.notifications += 1;
+    if (state.key === "acknowledged") summary.acknowledged += 1;
+    if (state.key === "shelved") summary.shelved += 1;
+    if (state.suppressed) summary.suppressed += 1;
+    if (state.stale) summary.stale += 1;
+  }
+  const groups = buildAlertIncidentGroups(normalized, nowMs);
+  summary.grouped_incidents = groups.length;
+  summary.flood_groups = groups.filter((group) => Number(group.count || 0) > 1).length;
+  return summary;
+}
+
 export function cellColor(r) {
   const alert = normalizeAlert(r);
   const tokenKey =
@@ -389,11 +723,10 @@ export function renderIncidentQueue(host, rows, opts) {
   if (!host) return;
   host.innerHTML = "";
 
-  const list = (Array.isArray(rows) ? rows : [])
-    .map((row) => normalizeAlert(row))
-    .filter(Boolean);
+  const nowMs = opts && Number.isFinite(Number(opts.nowMs)) ? Number(opts.nowMs) : Date.now();
+  const groups = buildAlertIncidentGroups(rows, nowMs);
 
-  if (!list.length) {
+  if (!groups.length) {
     host.innerHTML =
       `<div class="small" style="color:var(--muted);">
         No alerts in the selected window.
@@ -401,40 +734,59 @@ export function renderIncidentQueue(host, rows, opts) {
     return;
   }
 
-  list
-    .slice()
-    .sort((a, b) => {
-      const sa = severityRank(a.severity);
-      const sb = severityRank(b.severity);
-      if (sb !== sa) return sb - sa;
-      return Number(b.ts_ms) - Number(a.ts_ms);
-    })
+  groups
     .slice(0, 18)
-    .forEach(r => {
+    .forEach(group => {
+      const r = group.parent;
+      if (!r) return;
       const ts = Number(r.ts);
       const ageMin = Number.isFinite(ts)
-        ? Math.max(0, Math.floor((Date.now() - ts) / 60000))
+        ? Math.max(0, Math.floor((nowMs - ts) / 60000))
         : null;
 
       const c = cellColor(r);
       const title = r.message || r.event_title || "Alert";
-      const symbolMeta = r.symbol ? `<span class="pill dim mono">${esc(r.symbol)}</span>` : "";
+      const state = alertLifecycleState(r, nowMs);
+      const entity = alertAffectedEntity(r);
+      const action = defaultAlertRecommendedAction(r, nowMs);
+      const symbolMeta = entity ? `<span class="pill dim mono">Entity ${esc(entity)}</span>` : "";
       const timeMeta = Number.isFinite(ts) ? `<span class="pill dim mono">${esc(fmtTime(ts))}</span>` : "";
-      const ageMeta = ageMin == null ? "" : `<span class="pill dim">${ageMin}m ago</span>`;
+      const ageMeta = ageMin == null
+        ? "<span class=\"pill dim\">Freshness unknown</span>"
+        : `<span class="pill dim">${ageMin}m ago${state.stale ? " • stale" : ""}</span>`;
       const horizonMeta = r.horizon_s != null && String(r.horizon_s).trim() !== ""
         ? `<span class="pill dim">h=${esc(String(r.horizon_s))}s</span>`
+        : "";
+      const groupMeta = group.count > 1
+        ? `<span class="pill dim" title="Similar alerts collapsed into this parent incident">${esc(String(group.count))} related</span>`
+        : "";
+      const actionabilityMeta = `<span class="pill dim">${state.actionability === "notification" ? "Notification" : "Alarm"}</span>`;
+      const stateMeta = `<span class="${statusPillClasses(state.tone, "incidentState")}" data-state="${esc(state.key)}">${esc(state.label)}</span>`;
+      const shelfMeta = state.key === "shelved" && state.remainingMs != null
+        ? `<span class="pill dim">shelf ${esc(formatAlertDurationMs(state.remainingMs))} left</span>`
         : "";
 
       const item = document.createElement("div");
       item.className = "incidentItem";
+      item.dataset.alertId = String(r.id || "");
       item.dataset.sev = r.status === "resolved" ? "OK" : String(r.severity || "INFO").toUpperCase();
       item.dataset.status = c.key;
+      item.dataset.lifecycle = state.key;
+      item.dataset.groupCount = String(group.count || 1);
+      item.dataset.actionability = state.actionability;
       item.tabIndex = 0;
+      item.setAttribute(
+        "aria-label",
+        `${state.actionability === "notification" ? "Notification" : "Alarm"} ${r.status === "resolved" ? "resolved" : r.severity}, ${entity}, ${state.label}, ${title}. ${action}`
+      );
       item.innerHTML = `
         <div class="incidentTop">
           <span class="${statusPillClasses(c.key, "incidentSeverity")}" data-status="${esc(c.key)}" aria-label="${esc(statusAriaLabel(c.key, r.status === "resolved" ? "RESOLVED" : r.severity))}">
             ${r.status === "resolved" ? "RESOLVED" : r.severity}
           </span>
+          ${actionabilityMeta}
+          ${stateMeta}
+          ${groupMeta}
           <div class="incidentTitle">
             ${escapeHTML(title)}
           </div>
@@ -444,17 +796,22 @@ export function renderIncidentQueue(host, rows, opts) {
           ${timeMeta}
           ${horizonMeta}
           ${ageMeta}
+          ${shelfMeta}
+        </div>
+        <div class="incidentSub incidentAction">
+          <span class="pill dim">Recommended action</span>
+          <span>${escapeHTML(action)}</span>
         </div>
       `;
 
       item.addEventListener("click", () => {
-        if (opts?.onOpen) opts.onOpen(r);
+        if (opts?.onOpen) opts.onOpen(r, group);
       });
       item.addEventListener("keydown", (event) => {
         if (!event) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          if (opts?.onOpen) opts.onOpen(r);
+          if (opts?.onOpen) opts.onOpen(r, group);
         }
       });
 

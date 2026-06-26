@@ -44,6 +44,16 @@ Safe runtimes with no configured market-data feed do not exit when
 serving, while execution gates continue to block because the runtime is not
 `LIVE`.
 
+The startup-health thread and operator supervision use the same safe-mode
+contract. In `ENGINE_MODE=EXECUTION_MODE=OPERATOR_MODE=safe`, with live
+execution disabled and no live broker/feed enabled, a missing first price tick
+is recorded as `safe_mode_feedless_degraded_serving` instead of requesting
+dashboard shutdown. The operator treats a reachable `WARMING_UP` or `DEGRADED`
+dashboard with no first tick as supervision-ready for the current safe startup
+attempt, so the attempt is not counted as a pre-healthy crash loop. Structural
+startup gate failures still fail closed, and live/shadow modes still stop on
+late startup-health validation failure.
+
 The legacy ignored paths remain ignored so older local runs do not become git
 noise:
 

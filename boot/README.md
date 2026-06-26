@@ -14,6 +14,27 @@ Supported platform: Linux only.
   Browser UI for operator controls, bootstrap diagnostics, service health, and guided recovery actions.
   It links operators into the main dashboard, repair tooling, and newer control-plane surfaces such as the Data Sources Control Center and terminal.
 
+## Operator Console Visual Contract
+
+The operator console is styled as the same dark command-center appliance surface
+as the dashboard, terminal, data-source, and mobile UIs. `operator_ui.html`
+loads [../ui/base.css](../ui/base.css) for shared semantic status tokens and
+uses [../ui/state_presenter.js](../ui/state_presenter.js) for loading, empty,
+degraded, error, and technical-detail states while keeping page-local CSS for
+the sidecar-specific layout.
+
+- Use the shared `--status-ok`, `--status-warn`, `--status-crit`, and
+  `--status-info` tokens for pills, dots, issue badges, summaries, and
+  degraded/error states.
+- Keep high-impact controls visually distinct: emergency/factory-reset actions
+  use the critical double-border treatment; restart/stop/update actions remain
+  neutral; read/refresh actions stay low-emphasis.
+- Keep operator-readable degraded/error copy primary. Raw backend payloads,
+  stack details, and route diagnostics belong only under explicit
+  `Technical details` disclosures.
+- Preserve keyboard focus states on buttons, links, inputs, selects, and
+  disclosure summaries.
+
 ## Data Source Configuration Boundary
 
 The operator layer is no longer a second source-configuration system.
@@ -65,11 +86,29 @@ Sidecar audit records are appended to
 `var/tmp/operator/operator_confirmation_audit.jsonl` by default, with sensitive
 values redacted or hashed.
 
+`POST /api/operator/start` and `POST /api/operator/bootstrap` are guarded
+state-changing start paths, not read-style diagnostics. Empty payloads are
+rejected with `422 confirmation_required` before any start/bootstrap work runs.
+Non-live start requires `action_id=operator.start`, `START_OPERATOR`,
+`consequence_ack`, actor/source, and reason. Direct bootstrap requires
+`action_id=operator.bootstrap`, `BOOTSTRAP_OPERATOR`, `consequence_ack`,
+actor/source, and reason; the sidecar proxies it to the dashboard with a
+bounded timeout. Start waits for bind/health/telemetry only inside
+`OPERATOR_START_REQUEST_TIMEOUT_MS` and returns named top-level failures such as
+`preflight_failed`, `bind_timeout`, `backend_unhealthy`, or `start_timeout`
+instead of a generic request failure.
+
 ## Operator Bridge And Snapshot Auth
 
 The canonical operator control service is the Node sidecar on port `4001`; the dashboard bridge exists for same-origin browser access. Dashboard `/api/operator/ping` is intentional and public like liveness. Sensitive support snapshots are not public: direct sidecar access requires `X-Operator-Token`, and the sidecar-to-dashboard support-snapshot proxy also needs a configured dashboard API token via `DASHBOARD_API_TOKEN`, `DASHBOARD_API_TOKEN_FILE`, or the configured secret provider. Missing sidecar auth returns `operator_forbidden` with `reason_code=operator_token_required`; missing downstream dashboard auth for the snapshot proxy returns `operator_dashboard_auth_required` without printing token values.
 
+The `/operator/` dashboard bridge proxies HTTP API calls only. Browser telemetry uses the sidecar WebSocket at `/ws/operator` directly on the operator origin because the Python dashboard handler is not a WebSocket proxy. The proxied browser asks `/operator/ws_ticket` for a short-lived dashboard-authenticated ticket and sends it as a `Sec-WebSocket-Protocol` marker; the sidecar validates the ticket signature, expiry, and `Origin` before accepting the stream. Raw operator-token subprotocol/query auth remains accepted only for direct sidecar access and backward-compatible tooling.
+
 Dashboard health, readiness, barrier, and snapshot proxy calls use bounded timeouts. Dashboard unreachability is reported as degraded proxy metadata (`dashboard_unreachable`, `request_timeout`, or `timed_out=true`) rather than blocking operator readiness indefinitely.
+
+`/api/operator/proxy/health` remains as a compatibility same-origin bridge to dashboard `/api/health` and is validated against the health payload contract (`ok`, `ts_ms`, and object `db`). System-state routes such as `/api/operator/proxy/system_state` use the separate canonical system-state contract.
+
+The browser operator UI presents health, market, strategy, trading, and service-control failures through designed loading, empty, degraded, and error states. Backend payloads and stack details remain available under explicit `Technical details` disclosures, but raw JSON, stack traces, credential/env names, and internal route diagnostics should not be rendered as primary operator copy.
 
 ## Maintenance Guidance
 
@@ -79,6 +118,9 @@ Dashboard health, readiness, barrier, and snapshot proxy calls use bounded timeo
 - Treat process cleanup and stale launcher state as first-class Linux process-management concerns.
 - Keep the operator as a control/proxy layer, not a second business-logic runtime.
   Operator routes should delegate to dashboard/runtime APIs or process controls rather than reimplement trading logic locally.
+- Keep operator API route names snake_case when adding new endpoints.
+  Existing camelCase routes may remain as browser compatibility aliases, but they
+  should share the same handler as the snake_case route.
 - Keep the operator out of provider credential ownership.
   Source credentials and source-specific settings should be managed through the Data Sources Control Center, not new `.env` edit paths.
 - Keep AI repair flows guarded.

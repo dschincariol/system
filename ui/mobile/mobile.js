@@ -16,6 +16,7 @@ import {
   summarizeEmergencyResult,
 } from "./mobile_helpers.mjs";
 import { summarizeRuntimeStatus } from "../runtime_status_summary.js";
+import { apiFetch } from "../api_client.js";
 import { statusAriaLabel, statusToken } from "../utils.js";
 
 const ENDPOINTS = Object.freeze({
@@ -115,7 +116,7 @@ async function fetchJson(path, options = {}) {
     if (options.body !== undefined && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
-    const res = await fetch(path, {
+    const res = await apiFetch(path, {
       ...options,
       headers,
       cache: "no-store",

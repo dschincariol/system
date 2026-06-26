@@ -155,6 +155,101 @@ def _json_dumps(v: Any) -> str:
     return json.dumps(_json_sanitize(v), separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
+def _table_columns_or_none(con, table_name: str) -> Optional[set[str]]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except Exception:
+        return None
+    return {str(row[1] or "").strip() for row in (rows or []) if row and len(row) > 1}
+
+
+def _alter_add_column_if_missing(con, table_name: str, column_name: str, ddl: str) -> None:
+    columns = _table_columns_or_none(con, table_name)
+    if columns is None or str(column_name) in columns:
+        return
+    con.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+
+
+def _ensure_model_competition_rankings_schema(con) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_competition_rankings (
+          ranking_scope TEXT NOT NULL DEFAULT 'global',
+          model_name TEXT NOT NULL,
+          rank INTEGER NOT NULL,
+          net_pnl REAL NOT NULL DEFAULT 0,
+          return_pct REAL NOT NULL DEFAULT 0,
+          max_drawdown REAL NOT NULL DEFAULT 0,
+          win_rate REAL,
+          trade_count INTEGER NOT NULL DEFAULT 0,
+          wins INTEGER NOT NULL DEFAULT 0,
+          losses INTEGER NOT NULL DEFAULT 0,
+          last_trade_ts_ms INTEGER,
+          source TEXT NOT NULL DEFAULT 'trade_attribution_ledger',
+          updated_ts_ms INTEGER NOT NULL DEFAULT 0,
+          metrics_json TEXT,
+          PRIMARY KEY (ranking_scope, model_name)
+        )
+        """
+    )
+    for column_name, ddl in (
+        ("ranking_scope", "TEXT NOT NULL DEFAULT 'global'"),
+        ("model_name", "TEXT NOT NULL DEFAULT ''"),
+        ("rank", "INTEGER NOT NULL DEFAULT 0"),
+        ("net_pnl", "REAL NOT NULL DEFAULT 0"),
+        ("return_pct", "REAL NOT NULL DEFAULT 0"),
+        ("max_drawdown", "REAL NOT NULL DEFAULT 0"),
+        ("win_rate", "REAL"),
+        ("trade_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("wins", "INTEGER NOT NULL DEFAULT 0"),
+        ("losses", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_trade_ts_ms", "INTEGER"),
+        ("source", "TEXT NOT NULL DEFAULT 'trade_attribution_ledger'"),
+        ("updated_ts_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("metrics_json", "TEXT"),
+    ):
+        _alter_add_column_if_missing(con, "model_competition_rankings", column_name, ddl)
+    try:
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_model_competition_rankings_scope_rank
+              ON model_competition_rankings(ranking_scope, rank ASC, model_name ASC)
+            """
+        )
+    except Exception as e:
+        _warn_nonfatal("CHAMPION_MANAGER_RANKINGS_INDEX_CREATE_FAILED", e)
+
+
+def _commit_schema_normalization(con, *, context: str) -> None:
+    if not bool(getattr(con, "in_transaction", False)):
+        return
+    if bool(getattr(con, "_managed_write_active", False)):
+        return
+    try:
+        con.commit()
+    except Exception as e:
+        _warn_nonfatal(
+            "CHAMPION_MANAGER_SCHEMA_NORMALIZATION_COMMIT_FAILED",
+            e,
+            context=str(context),
+        )
+        raise
+
+
+def _ensure_competition_read_schema(
+    con,
+    *,
+    champion_assignments: bool = True,
+    rankings: bool = True,
+    context: str = "competition_read",
+) -> None:
+    if champion_assignments:
+        CompetitionRepository(con).ensure_champion_assignments_schema()
+    if rankings:
+        _ensure_model_competition_rankings_schema(con)
+    _commit_schema_normalization(con, context=context)
+
+
 def _json_sanitize(v: Any) -> Any:
     if isinstance(v, float):
         return v if math.isfinite(v) else None
@@ -777,6 +872,12 @@ def _copy_candidate_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def _load_all_champions() -> List[Dict[str, Any]]:
     con = connect()
     try:
+        _ensure_competition_read_schema(
+            con,
+            champion_assignments=True,
+            rankings=False,
+            context="load_all_champions",
+        )
         rows = con.execute(
             """
             SELECT scope, symbol, horizon_s, model_name, challenger_name, regime, state, assigned_ts_ms, updated_ts_ms, meta_json
@@ -828,6 +929,12 @@ def _clear_champion_assignment(*, scope: str, symbol: str, horizon_s: int, con) 
 def get_champion_assignment(scope: str, symbol: str, horizon_s: int = 0) -> Dict[str, Any]:
     con = connect()
     try:
+        _ensure_competition_read_schema(
+            con,
+            champion_assignments=True,
+            rankings=False,
+            context="get_champion_assignment",
+        )
         return CompetitionRepository(con).get_champion_assignment(
             scope=str(scope),
             symbol=str(symbol),
@@ -1073,10 +1180,18 @@ def get_model_competition_rankings(limit: int = 25, ranking_scope: str = "global
     init_db()
     con = connect()
     try:
+        _ensure_competition_read_schema(
+            con,
+            champion_assignments=False,
+            rankings=True,
+            context="get_model_competition_rankings",
+        )
+        columns = _table_columns_or_none(con, "model_competition_rankings") or set()
+        legacy_score_expr = "score" if "score" in columns else "NULL"
         rows = con.execute(
-            """
+            f"""
             SELECT rank, model_name, net_pnl, return_pct, max_drawdown, win_rate, trade_count,
-                   wins, losses, last_trade_ts_ms, source, updated_ts_ms, metrics_json
+                   wins, losses, last_trade_ts_ms, source, updated_ts_ms, metrics_json, {legacy_score_expr}
             FROM model_competition_rankings
             WHERE ranking_scope=?
             ORDER BY rank ASC, model_name ASC
@@ -1087,14 +1202,15 @@ def get_model_competition_rankings(limit: int = 25, ranking_scope: str = "global
         out = []
         for row in rows:
             metrics = _safe_json_dict(row[12])
+            score = _safe_float(metrics.get("score"), _safe_float(row[13], 0.0))
             out.append(
-                    {
-                        "rank": _safe_int(row[0], 0),
-                        "model_name": str(row[1] or ""),
-                        "score": _safe_float(metrics.get("score"), 0.0),
-                        "net_pnl": _safe_float(row[2], 0.0),
-                        "return_pct": _safe_float(row[3], 0.0),
-                        "max_drawdown": _safe_float(row[4], 0.0),
+                {
+                    "rank": _safe_int(row[0], 0),
+                    "model_name": str(row[1] or ""),
+                    "score": float(score),
+                    "net_pnl": _safe_float(row[2], 0.0),
+                    "return_pct": _safe_float(row[3], 0.0),
+                    "max_drawdown": _safe_float(row[4], 0.0),
                     "win_rate": (None if row[5] is None else _safe_float(row[5], 0.0)),
                     "trade_count": _safe_int(row[6], 0),
                     "wins": _safe_int(row[7], 0),
@@ -1127,6 +1243,12 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
     with _COMPETITION_LOCK:
         con = connect()
         try:
+            _ensure_competition_read_schema(
+                con,
+                champion_assignments=False,
+                rankings=True,
+                context="recompute_model_rankings",
+            )
             ranking_rows: Dict[str, Dict[str, Any]] = {}
             score_rows = con.execute(
                 """
@@ -1406,9 +1528,15 @@ def current_competition_snapshot(active_symbols: Optional[List[str]] = None) -> 
     # durable champion assignments with fresher runtime artifacts such as
     # rankings, replay validation, self-critic status, and capital allocation.
     rankings_snapshot = _safe_json_dict(meta_get("competition_rankings", "") or "{}")
+    ranking_scope = str(rankings_snapshot.get("ranking_scope") or "global").strip() or "global"
     ranking_rows = list(rankings_snapshot.get("rows") or [])
     ranking_champion = dict(rankings_snapshot.get("champion") or {})
     ranking_challengers = list(rankings_snapshot.get("challengers") or [])
+    if not ranking_rows:
+        ranking_rows = get_model_competition_rankings(limit=100, ranking_scope=ranking_scope)
+        if ranking_rows:
+            ranking_champion = dict(ranking_champion or ranking_rows[0])
+            ranking_challengers = list(ranking_challengers or ranking_rows[1:])
 
     champions = _load_all_champions()
     champion = get_champion_assignment(
@@ -1430,12 +1558,20 @@ def current_competition_snapshot(active_symbols: Optional[List[str]] = None) -> 
     cycle_status = _safe_json_dict(meta_get("competition_cycle_status", "") or "{}")
     attribution_completeness = _safe_json_dict(meta_get("attribution_completeness", "") or "{}")
     post_commit_actions = get_competition_post_commit_status()
+    has_competition_data = bool(champion or champions or ranking_rows)
+    reason = "" if has_competition_data else "no_competition_data"
+    status = "ready" if has_competition_data else "empty"
 
     snap = {
         "ok": True,
+        "status": status,
+        "reason": reason,
+        "degraded": bool(not has_competition_data),
         "champion": champion,
         "champions": champions,
+        "ranking_champion": ranking_champion,
         "challengers": ranking_challengers,
+        "rankings": ranking_rows,
         "model_rankings": ranking_rows,
         "capital_plan": capital_plan,
         "replay_validation": replay_validation,

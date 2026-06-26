@@ -2,8 +2,9 @@
 // Weather widgets (dashboard-ready)
 // Expects existing dashboard to call these and provide container elements.
 
+import { fetchJSON as defaultFetchJSON } from "./api_client.js";
+
 let _weatherReqSeq = 0;
-const WEATHER_FETCH_TIMEOUT_MS = 15000;
 
 function _esc(value) {
   return String(value == null ? "" : value)
@@ -83,7 +84,7 @@ export async function loadWeatherWidgets({ symbol = "SPY", fetchJSON = null } = 
   const root = document.getElementById("weather-widgets");
   if (!root) return;
   const activeSymbol = String(symbol || "").trim().toUpperCase() || "SPY";
-  const sharedFetchJSON = typeof fetchJSON === "function" ? fetchJSON : null;
+  const sharedFetchJSON = typeof fetchJSON === "function" ? fetchJSON : defaultFetchJSON;
 
   const reqId = ++_weatherReqSeq;
   const weatherState = {
@@ -136,25 +137,7 @@ export async function loadWeatherWidgets({ symbol = "SPY", fetchJSON = null } = 
   }
 
   async function jget(url) {
-    if (sharedFetchJSON) {
-      return sharedFetchJSON(url);
-    }
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(new Error(`fetch_timeout:${url}`)), WEATHER_FETCH_TIMEOUT_MS);
-    try {
-      const r = await fetch(url, { cache: "no-store", signal: controller.signal });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      const raw = await r.text();
-      let j = null;
-      try {
-        j = raw ? JSON.parse(raw) : null;
-      } catch {}
-      if (!j || typeof j !== "object") throw new Error(`invalid_json_response: ${url}`);
-      if (j.ok === false) throw new Error(String(j.error || `api_error: ${url}`));
-      return j;
-    } finally {
-      clearTimeout(timeoutId);
-    }
+    return sharedFetchJSON(url);
   }
 
   _renderSummary(_getSlot("wx-snap"), [], { status: "loading" }, "empty", weatherState.snapshot.reason);

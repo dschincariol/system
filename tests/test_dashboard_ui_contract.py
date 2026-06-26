@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import functools
-import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,7 +17,9 @@ from tools.check_dashboard_ui_contract import (  # noqa: E402
     collect_dashboard_asset_graph,
     collect_dashboard_endpoint_references,
     collect_dashboard_js_modules,
+    collect_dashboard_route_snapshot,
     find_js_syntax_issues,
+    find_route_handler_registration_issues,
     find_screen_module_boundary_issues,
     find_unregistered_endpoint_references,
     route_path_registered,
@@ -102,80 +104,7 @@ FALLBACK_ONLY_UI_ENDPOINT_ALLOWLIST = {
 
 @functools.lru_cache(maxsize=1)
 def _dashboard_route_snapshot():
-    code = r"""
-import json
-import os
-
-os.environ.setdefault("TIMESCALE_ENABLED", "0")
-os.environ.setdefault("FEATURE_STORE_ENABLED", "0")
-os.environ.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
-os.environ.setdefault("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
-os.environ.setdefault("DASHBOARD_ROUTE_CONTRACT_INTROSPECTION", "1")
-
-import dashboard_server
-
-def _norm(route):
-    if isinstance(route, dict):
-        return {
-            "method": str(route.get("method") or "").upper(),
-            "path": str(route.get("path") or ""),
-            "handler": str(route.get("handler") or ""),
-        }
-    return {
-        "method": str(route[0] or "").upper(),
-        "path": str(route[1] or ""),
-        "handler": str(route[2] or ""),
-    }
-
-print("__DASHBOARD_ROUTE_SNAPSHOT__" + json.dumps({
-    "route_specs": [_norm(route) for route in dashboard_server.ROUTE_SPECS],
-    "fallback_route_specs": [_norm(route) for route in dashboard_server._FALLBACK_ROUTE_SPECS],
-    "raw_route_specs": [_norm(route) for route in dashboard_server._RAW_ROUTE_SPECS],
-}, sort_keys=True), flush=True)
-"""
-    env = dict(os.environ)
-    env.setdefault("TIMESCALE_ENABLED", "0")
-    env.setdefault("FEATURE_STORE_ENABLED", "0")
-    env.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
-    env.setdefault("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
-    env["DASHBOARD_ROUTE_CONTRACT_INTROSPECTION"] = "1"
-    env["ENGINE_MODE"] = "safe"
-    env["EXECUTION_MODE"] = "safe"
-    env["OPERATOR_MODE"] = "safe"
-    env["APP_ENV"] = "test"
-    env["PROD_LOCK"] = "0"
-    for key in ("ENV", "NODE_ENV", "TS_ENV"):
-        env.pop(key, None)
-    with tempfile.TemporaryDirectory(prefix="dashboard-route-contract-") as temp_root:
-        temp_path = Path(temp_root)
-        secrets_dir = temp_path / "secrets"
-        secrets_dir.mkdir()
-        token_file = temp_path / "dashboard_api_token"
-        token_file.write_text("dashboard-route-contract-token", encoding="utf-8")
-        token_file.chmod(0o600)
-        for spec in SECRET_ENV_SPECS:
-            env[spec.key] = ""
-        env["DASHBOARD_API_TOKEN_FILE"] = str(token_file)
-        env["TRADING_SECRET_POLICY_REPO_ROOT"] = str(temp_path)
-        env["TS_STORAGE_BACKEND"] = "sqlite"
-        env["TS_SECRETS_PROVIDER"] = "plaintext"
-        env["TS_DEV_SECRETS_DIR"] = str(secrets_dir)
-        env.setdefault("DB_PATH", str(temp_path / "dashboard_route_contract.db"))
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=str(REPO_ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-    assert result.returncode == 0, result.stderr or result.stdout
-    prefix = "__DASHBOARD_ROUTE_SNAPSHOT__"
-    for line in reversed((result.stdout or "").splitlines()):
-        if line.startswith(prefix):
-            return json.loads(line.removeprefix(prefix))
-    raise AssertionError(f"dashboard route snapshot missing from subprocess output:\n{result.stdout}\n{result.stderr}")
+    return collect_dashboard_route_snapshot(root=REPO_ROOT)
 
 
 def _canonical_route_specs(route_snapshot):
@@ -193,6 +122,7 @@ def test_business_refusal_ui_helpers_surface_reason_codes() -> None:
     data_sources_js = (REPO_ROOT / "ui" / "data_sources.js").read_text(encoding="utf-8")
     terminal_js = (REPO_ROOT / "ui" / "terminal" / "terminal.js").read_text(encoding="utf-8")
     api_client_js = (REPO_ROOT / "ui" / "api_client.js").read_text(encoding="utf-8")
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
 
     assert "allowedBusinessRefusal" in data_sources_js
     assert "payload.reason_code" in data_sources_js
@@ -201,6 +131,9 @@ def test_business_refusal_ui_helpers_surface_reason_codes() -> None:
     assert "j.reason_code || j.error" in terminal_js
     assert "allowBusinessFalse" in api_client_js
     assert "data.message || data.reason || data.reason_code || data.error" in api_client_js
+    assert "businessDegradedReason" in api_client_js
+    assert "portfolio snapshot degraded" in dashboard_js
+    assert "portfolio risk degraded" in dashboard_js
 
 
 def test_weather_widgets_use_shared_dashboard_fetch_client() -> None:
@@ -209,8 +142,28 @@ def test_weather_widgets_use_shared_dashboard_fetch_client() -> None:
 
     assert "loadWeatherWidgets({ symbol: _getActiveSymbol(\"SPY\"), fetchJSON })" in dashboard_js
     assert "loadWeatherWidgets({ symbol: selected || \"SPY\", fetchJSON })" in dashboard_js
-    assert "sharedFetchJSON = typeof fetchJSON === \"function\" ? fetchJSON : null" in weather_js
+    assert "sharedFetchJSON = typeof fetchJSON === \"function\" ? fetchJSON : defaultFetchJSON" in weather_js
     assert "return sharedFetchJSON(url);" in weather_js
+    assert "fetch(url" not in weather_js
+
+
+def test_authenticated_ui_api_calls_use_shared_client() -> None:
+    allowed_native_callers = {
+        "ui/api_client.js",
+        "ui/data_sources.js",
+        "ui/mobile/sw.js",
+    }
+    offenders = []
+    source_suffixes = {".js", ".mjs", ".cjs"}
+    for path in sorted(p for p in (REPO_ROOT / "ui").rglob("*") if p.suffix in source_suffixes):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel in allowed_native_callers:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if re.search(r"\bfetch\s*\(", line) or re.search(r"\bnew\s+EventSource\s*\(", line):
+                offenders.append(f"{rel}:{lineno}:{line.strip()}")
+    assert offenders == []
 
 
 def test_dashboard_route_contract_introspection_still_enforces_security_preflight():
@@ -273,6 +226,82 @@ def test_dashboard_html_js_surface_static_smoke():
         f"{issue.source_path}: {issue.detail}" for issue in syntax_issues
     )
     assert assets, "dashboard asset graph should not be empty"
+
+
+def test_mobile_ops_primitives_are_backported_to_desktop_surfaces():
+    dashboard_html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    data_sources_html = (REPO_ROOT / "ui" / "data_sources.html").read_text(encoding="utf-8")
+    data_sources_js = (REPO_ROOT / "ui" / "data_sources.js").read_text(encoding="utf-8")
+    base_css = (REPO_ROOT / "ui" / "base.css").read_text(encoding="utf-8")
+    utils_js = (REPO_ROOT / "ui" / "utils.js").read_text(encoding="utf-8")
+
+    assert 'id="dashboardOpsKpis"' in dashboard_html
+    assert 'class="opsKpiGrid dashboardOpsKpis"' in dashboard_html
+    assert 'id="recommendedActionSteps"' in dashboard_html
+    assert 'id="recommendedActionCard"' in dashboard_html
+    assert "opsStateTreatment" in dashboard_html
+    assert 'id="actionCenterState"' in data_sources_html
+    assert 'class="status-strip opsKpiGrid"' in data_sources_html
+    assert 'class="opsActionList"' in data_sources_html
+
+    assert "renderDashboardOpsKpis()" in dashboard_js
+    assert "kpiTileHtml({" in dashboard_js
+    assert "guidanceListHtml(buildRecommendedGuidance(rec)" in dashboard_js
+    assert "statusPillHtml(stateInfo.label" in data_sources_js
+    assert "guidanceListHtml([" in data_sources_js
+
+    for required_css in (
+        ".opsKpiTile::after",
+        '.opsKpiTile[data-status="blocked"]::after',
+        ".opsGuidanceList li::before",
+        ".opsStateTreatment[data-state=\"blocked\"]",
+    ):
+        assert required_css in base_css
+
+    assert "export function statusPillHtml" in utils_js
+    assert "export function kpiTileHtml" in utils_js
+    assert "export function guidanceListHtml" in utils_js
+    assert "statusAriaLabel" in utils_js
+    assert "data-status" in utils_js
+    assert "aria-label" in utils_js
+
+
+def test_dashboard_mission_control_first_viewport_contract():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    theme = (REPO_ROOT / "ui" / "dashboard_theme.css").read_text(encoding="utf-8")
+
+    required_ids = [
+        "missionTradePill",
+        "missionShouldPill",
+        "missionChangeText",
+        "missionNextText",
+        "missionHealthValue",
+        "missionHealthCoverage",
+        "dashboardScreenTabs",
+        "dashboardPersonaSelect",
+        "btnCommandPaletteToggle",
+        "recommendedActionCard",
+        "operatorOverviewCard",
+    ]
+    for element_id in required_ids:
+        assert f'id="{element_id}"' in html
+
+    assert 'class="missionBar"' in html
+    assert 'class="missionViewport"' in html
+    assert "Operator Guidance" in html
+    assert "Recommended Action" not in html
+
+    assert "function renderMissionControlHeader" in js
+    assert "function renderMissionHealthMini" in js
+    assert "renderMissionHealthMini(scorecard)" in js
+    assert 'document.getElementById("btnCommandPaletteToggle")' in js
+    assert "commandPalette.open()" in js
+
+    assert ".missionBar" in theme
+    assert ".missionViewport" in theme
+    assert "overflow-x: auto" in theme
 
 
 def test_chart_accessibility_fallback_contract_is_rendered_by_production_modules():
@@ -470,6 +499,39 @@ def test_dashboard_ui_api_paths_are_registered_or_documented():
         f"{issue.source_path}:{issue.line} {issue.transport} {issue.path}"
         for issue in issues
     )
+
+
+def test_dashboard_raw_route_specs_have_registered_handlers():
+    route_snapshot = _dashboard_route_snapshot()
+
+    issues = find_route_handler_registration_issues(
+        route_snapshot["raw_route_specs"],
+        route_snapshot["callable_api_handler_names"],
+    )
+
+    assert issues == [], "dashboard raw route handler registration drift:\n- " + "\n- ".join(
+        f"{issue.method} {issue.path} {issue.handler}: {issue.reason}" for issue in issues
+    )
+
+
+def test_data_sources_credential_entry_ui_routes_are_registered():
+    route_snapshot = _dashboard_route_snapshot()
+    data_sources_js = (REPO_ROOT / "ui" / "data_sources.js").read_text(encoding="utf-8")
+
+    expected_paths = {
+        "/api/data_sources/update",
+        "/api/data_sources/test",
+        "/api/data_sources/test_save",
+        "/api/data_sources/populate_now",
+        "/api/data_sources/accounts/update",
+    }
+
+    for path in expected_paths:
+        assert path in data_sources_js
+    missing_routes = [
+        path for path in sorted(expected_paths) if not route_path_registered(route_snapshot["route_specs"], path)
+    ]
+    assert missing_routes == []
 
 
 def test_dashboard_realtime_paths_are_checked_separately():

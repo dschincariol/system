@@ -1,12 +1,13 @@
-"""Static contract: browser-side code must not hard-code loopback/direct-sidecar
-hosts for links/origins that have to work from a remote LAN browser.
+"""Static contract: browser-side code must not hard-code loopback hosts for
+links/origins that have to work from a remote LAN browser.
 
 A Windows desktop opening ``http://192.168.0.165:8000`` must never be handed a
 ``127.0.0.1``/``localhost`` URL for the dashboard or operator bridge -- those
-resolve to the *client* machine, not the server. The operator sidecar must not
-be exposed as a direct LAN browser target; client code should use the
-same-origin dashboard bridge. These are text-level assertions (the repo's
-established idiom for UI contracts) so they run without a browser.
+resolve to the *client* machine, not the server. HTTP operator APIs stay on the
+same-origin dashboard bridge. The telemetry WebSocket is a special sidecar
+stream and must derive from the browser host plus a configurable operator port,
+with token/origin checks on the sidecar. These are text-level assertions (the
+repo's established idiom for UI contracts) so they run without a browser.
 """
 
 from __future__ import annotations
@@ -29,9 +30,10 @@ class OperatorUiUrlContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = OPERATOR_UI.read_text(encoding="utf-8")
 
-    def test_operator_ui_does_not_synthesize_direct_sidecar_origin(self) -> None:
+    def test_operator_ui_does_not_hardcode_loopback_sidecar_origin(self) -> None:
         self.assertNotIn("OPERATOR_DIRECT_ORIGIN", self.text)
-        self.assertNotIn(":4001", self.text)
+        self.assertNotIn("127.0.0.1:4001", self.text)
+        self.assertNotIn("localhost:4001", self.text)
 
     def test_dashboard_link_uses_browser_host_not_config_host(self) -> None:
         # Regression guard: the old code forced the link host from the
@@ -43,10 +45,14 @@ class OperatorUiUrlContractTests(unittest.TestCase):
     def test_no_hardcoded_dashboard_localhost_link(self) -> None:
         self.assertNotIn("http://127.0.0.1:8000/ui/data_sources.html", self.text)
 
-    def test_telemetry_ws_derives_from_location_host(self) -> None:
-        # Direct and bridged telemetry attempts must use the page host/origin.
-        self.assertIn("location.host", self.text)
+    def test_telemetry_ws_derives_sidecar_host_from_browser_host(self) -> None:
+        # HTTP stays bridged; telemetry connects to the sidecar host derived
+        # from the browser host with a configurable port.
+        self.assertIn("operatorTelemetryWsHost", self.text)
+        self.assertIn("location.hostname", self.text)
+        self.assertIn('window.OPERATOR_WS_PORT || "4001"', self.text)
         self.assertIn("/ws/operator", self.text)
+        self.assertIn("operatorTelemetryWsProtocols", self.text)
 
 
 class DashboardJsUrlContractTests(unittest.TestCase):

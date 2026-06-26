@@ -60,6 +60,7 @@ main() {
   require_file "${CREDSTORE_DIR}/object_store_secret_key.cred"
   require_file "${CREDSTORE_DIR}/dashboard_api_token.cred"
   require_file "${CREDSTORE_DIR}/operator_api_token.cred"
+  require_file "${CREDSTORE_DIR}/backup_evidence_hmac_key.cred"
 
   log "running production preflight in a transient systemd unit"
   systemd-run --wait --collect --pipe \
@@ -72,6 +73,7 @@ main() {
     --property="LoadCredentialEncrypted=object_store_secret_key:${CREDSTORE_DIR}/object_store_secret_key.cred" \
     --property="LoadCredentialEncrypted=dashboard_api_token:${CREDSTORE_DIR}/dashboard_api_token.cred" \
     --property="LoadCredentialEncrypted=operator_api_token:${CREDSTORE_DIR}/operator_api_token.cred" \
+    --property="LoadCredentialEncrypted=backup_evidence_hmac_key:${CREDSTORE_DIR}/backup_evidence_hmac_key.cred" \
     --property="NoNewPrivileges=true" \
     --property="PrivateTmp=true" \
     --property="ProtectHome=true" \
@@ -86,8 +88,9 @@ main() {
       TS_PG_ROLE=app \
       DASHBOARD_API_TOKEN_SECRET=dashboard_api_token \
       OPERATOR_API_TOKEN_SECRET=operator_api_token \
+      BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key \
       PYTHONUNBUFFERED=1 \
-      /usr/bin/bash -lc 'set -euo pipefail; set -a; . "$TRADING_ENV_FILE"; set +a; export TS_SERVICE_NAME=trading-prod-preflight TS_SECRETS_PROVIDER=systemd-creds TS_PG_ROLE=app DASHBOARD_API_TOKEN_SECRET=dashboard_api_token OPERATOR_API_TOKEN_SECRET=operator_api_token PYTHONPATH="${PYTHONPATH:-$APP_ROOT}"; cd "$APP_ROOT"; exec "$PYTHON_BIN" engine/runtime/prod_preflight.py --json'
+      /usr/bin/bash -lc 'set -euo pipefail; set -a; . "$TRADING_ENV_FILE"; set +a; export TS_SERVICE_NAME=trading-prod-preflight TS_SECRETS_PROVIDER=systemd-creds TS_PG_ROLE=app DASHBOARD_API_TOKEN_SECRET=dashboard_api_token OPERATOR_API_TOKEN_SECRET=operator_api_token BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key PYTHONPATH="${PYTHONPATH:-$APP_ROOT}"; cd "$APP_ROOT"; exec "$PYTHON_BIN" engine/runtime/prod_preflight.py --json'
 }
 
 main "$@"

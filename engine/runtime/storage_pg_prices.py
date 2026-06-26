@@ -26,6 +26,7 @@ from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.logging import get_logger
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.observability import record_component_health
+from engine.runtime.pg_connection_hygiene import rollback_if_in_transaction
 from engine.runtime.platform import connection_info_with_pg_password
 from engine.runtime.price_timescale_schema import (
     PRICE_TIMESCALE_COPY_TYPES,
@@ -720,6 +721,25 @@ def _warn_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
     )
 
 
+def _check_price_storage_connection(con: Any) -> None:
+    rollback_if_in_transaction(
+        con,
+        logger=LOG,
+        context="storage_pg_prices_pool_check",
+    )
+    check_connection = getattr(ConnectionPool, "check_connection", None)
+    if callable(check_connection):
+        check_connection(con)
+
+
+def _reset_price_storage_connection(con: Any) -> None:
+    rollback_if_in_transaction(
+        con,
+        logger=LOG,
+        context="storage_pg_prices_pool_reset",
+    )
+
+
 @dataclass(frozen=True)
 class PostgresPriceStorageConfig:
     """Configure the optional Postgres or Timescale price-storage sidecar."""
@@ -884,6 +904,8 @@ class PostgresPriceStorage:
                         "connect_timeout": int(max(1, round(self._config.connect_timeout_s))),
                         "application_name": str(self._config.application_name),
                     },
+                    check=_check_price_storage_connection,
+                    reset=_reset_price_storage_connection,
                     open=False,
                 )
                 try:
@@ -1269,8 +1291,13 @@ class PostgresPriceStorage:
             raise RuntimeError("timescale_prices_connection_pool_unavailable")
         con = pool.getconn(timeout=float(self._config.connect_timeout_s))
         discard = False
-        con.autocommit = False
         try:
+            rollback_if_in_transaction(
+                con,
+                logger=LOG,
+                context="storage_pg_prices_acquire",
+            )
+            con.autocommit = False
             self._prepare_connection(con)
             yield con
         except Exception:
@@ -1282,6 +1309,15 @@ class PostgresPriceStorage:
             raise
         finally:
             try:
+                if not discard:
+                    try:
+                        rollback_if_in_transaction(
+                            con,
+                            logger=LOG,
+                            context="storage_pg_prices_release",
+                        )
+                    except Exception:
+                        discard = True
                 if discard:
                     try:
                         con.close()

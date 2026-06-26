@@ -263,7 +263,7 @@
       "file": "engine/strategy/champion_manager.py",
       "severity": "error",
       "rule": "reportGeneralTypeIssues",
-      "line": 2635,
+      "line": 2771,
       "character": 5,
       "message": "Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing conditional code paths"
     },
@@ -271,7 +271,7 @@
       "file": "engine/strategy/champion_manager.py",
       "severity": "error",
       "rule": "reportOptionalIterable",
-      "line": 1873,
+      "line": 2009,
       "character": 37,
       "message": "Object of type \"None\" cannot be used as iterable value"
     },
@@ -279,7 +279,7 @@
       "file": "engine/strategy/champion_manager.py",
       "severity": "error",
       "rule": "reportOptionalMemberAccess",
-      "line": 1196,
+      "line": 1318,
       "character": 66,
       "message": "\"get\" is not a known attribute of \"None\""
     },

@@ -35,6 +35,14 @@ In short, the operator is supervising an automated workflow, not manually tradin
 | `ui/data_sources.html` | Single-page Data Sources Control Center for provider setup, credential resets, tests, and enable/disable actions |
 | `services/operator_ai/agent.js` | Bounded AI analysis layer for operator diagnostics and guarded repair flows |
 
+The dashboard opens on a mission-control command surface. The sticky mission
+bar is the first operational read: it answers whether the system can trade,
+whether it should trade, what changed most recently, and what the operator
+should do next. The supporting Overview, Operator Guidance, KPI, health-score,
+and readiness-evidence panels remain read-only advisory surfaces; backend
+readiness, execution-barrier, broker, and confirmation APIs remain the actual
+authority for trading and high-impact actions.
+
 The documented one-command launcher path is `./start_all.sh` to
 `start_all.py` to `boot/operator_server.js`. When the operator starts the
 engine, it passes runtime DSN/config values such as `TS_PG_DSN`, `TS_PG_PORT`,
@@ -195,10 +203,13 @@ The exact UI may evolve, but the important panels now include the following.
 
 | Panel | Meaning | What the operator should look for |
 | --- | --- | --- |
+| Operational KPI Summary | Compact runtime, readiness, execution, data, and alert state at the top of the dashboard | symbol-coded `OK` / `!` / `X` / `LOCK` / `?` states, stale or partial coverage, blocked execution |
+| Operator Guidance | Numbered next steps derived from runtime blockers, readiness, decisions, and advisories | stop/hold guidance during blocked or degraded states; guarded action guidance only when readiness and execution are clear |
 | Health/System | Runtime, database, and service health | errors, failed checks, stale state |
 | Readiness Evidence | Consolidated live/paper readiness evidence | `BLOCKED`, `WARN`, or `UNAVAILABLE` rows, owner subsystem, age, and remediation |
+| Data Sources Action Center | Feed credential, runtime, and readiness priorities from the canonical data-source page | urgent missing credentials, failed providers, degraded feeds, source cards that need testing or recovery |
 | Jobs | Background processes and job history | dead jobs, repeated restarts, missing feeds |
-| Alerts | Operational and model-related warnings | noisy rules, persistent incidents, unresolved problems |
+| Alerts | Grouped alarm and notification lifecycle surface | open WARN/HIGH/CRIT alarms first, INFO notifications second; acknowledged/shelved items that remain unresolved; stale, suppressed, and grouped flood counts |
 | Decisions | Recent system decisions and their explanations | unexpected actions, weak rationale, abnormal certainty |
 | Human Alignment | Summary of how operators interact with alerts | alerts that are opened often but rarely acknowledged |
 | Execution Advisories | Non-binding advice about execution quality or urgency | slippage risk, elevated latency, routing concerns |
@@ -229,6 +240,14 @@ That page is the single source of truth for:
 - testing connections
 - reading plain-language setup instructions and recommended next actions
 
+The credential-entry workflow is backed by first-class dashboard routes: Save
+uses `POST /api/data_sources/update`, Test Connection uses
+`POST /api/data_sources/test`, Test & Save uses
+`POST /api/data_sources/test_save`, Populate Now uses
+`POST /api/data_sources/populate_now`, and shared provider-account credentials
+use `POST /api/data_sources/accounts/update`. Dashboard boot and UI contract
+validation fail if any advertised route is missing its registered handler.
+
 Operators should not need to edit `.env` for provider credentials and should not need to bounce between the dashboard site and the operator site for this functional area.
 
 ### FX Operator Surfaces
@@ -242,6 +261,27 @@ FX surfacing is read-only in the browser. The UI displays data that upstream FX 
 The UI must not be used as proof of profitability. Profitability remains a backend governance and backtest-gate question, net of realistic costs.
 
 ## 6. Operator-Facing Features
+
+### Alert Lifecycle
+
+The dashboard treats alert state as a lifecycle, not a binary read/unread flag.
+WARN, HIGH, and CRIT rows are actionable alarms; INFO rows are informational
+notifications unless they repeat or escalate. The alert summary strip keeps the
+current counts visible for open alarms, notifications, acknowledgements,
+shelved alerts, suppressed notification paths, stale unresolved alerts, and
+grouped incidents.
+
+Acknowledgement means an operator has seen the alert and owns follow-up. It does
+not mean the condition cleared. Shelving means notifications are suppressed only
+until the displayed expiry; if the condition is still active after expiry it
+returns to the escalation path. Repeated similar alerts are collapsed into a
+parent incident in the queue so floods remain visible without hiding severity,
+affected entity, current state, freshness, or recommended action.
+
+Backend follow-up for higher maturity is to persist a canonical `incident_id`
+and explicit affected-entity field at alert creation time. Until then, the
+frontend groups by lifecycle family, entity, horizon bucket, and rule/message
+signature while preserving the original alert rows and detail drilldown.
 
 ### Decisions UI
 
@@ -287,6 +327,16 @@ Use it when a live, paper, or broker-facing action is blocked and the reason is 
 
 Live/paper critical evidence fails closed. Missing or stale critical evidence is shown as blocked or unavailable, not as passing. Broker activation reads this same evidence route before posting the activation request; the backend still independently enforces a fresh passing broker connection test and runtime/execution gates still decide whether trading can occur.
 
+### Institutional Check
+
+The operator Institutional Check diagnostic is backed by canonical
+`GET /api/operator/institutional_check`; the browser sidecar also keeps
+`GET /api/operator/institutionalCheck` as a compatibility alias.
+
+This is a completed diagnostic read, not a mutation or execution gate. When readiness or health is not passing in safe/sim, warming-up, or missing-feed states, the route still returns HTTP 200 with `ok=false`, legacy summary booleans (`configValid`, `healthOk`), and structured `checks`, `blockers`, and `reasons` fields. Each failed or degraded sub-check is named, and each blocker carries a machine-readable reason such as `readiness:storage_unavailable` or `health:health_snapshot_invalid`.
+
+HTTP 500 is reserved for genuine internal faults in the check itself, such as missing dashboard handler wiring or a readiness/health handler exception. Those responses include `error`, `reason_code` or `root_cause_code`, the failing `sub_check` when known, and `meta.status=500` so the operator sees an actionable platform fault instead of a generic `request_failed`.
+
 ### Operator AI Diagnostic And Patch Flow
 
 The operator surface now includes a bounded AI repair path.
@@ -309,9 +359,9 @@ What it does not do:
 ### Structured Confirmations
 
 High-impact operator actions use structured confirmation instead of native
-browser prompts. Live start, guided bootstrap, stop/restart, emergency stop,
-factory reset, repair/admin actions, secret changes, feed restarts, and
-operator-AI patch apply/rollback ask for a typed phrase, consequence
+browser prompts. Start, direct startup bootstrap, live start, guided bootstrap,
+stop/restart, emergency stop, factory reset, repair/admin actions, secret
+changes, feed restarts, and operator-AI patch apply/rollback ask for a typed phrase, consequence
 acknowledgement, and a reason or hold period where the server contract requires
 one.
 
@@ -322,6 +372,16 @@ request id, target, reason, and hold metadata where required), and the server
 rejects missing or invalid confirmation before running the mutation. Audit
 records keep the action, actor, source, request id, target, confirmation method,
 hold duration, and reason so incident review can reconstruct what was approved.
+
+Direct `POST /api/operator/start` and `POST /api/operator/bootstrap` calls are
+non-live start orchestration paths. They reject `{}` with
+`confirmation_required` before work starts. Confirmed start uses
+`action_id=operator.start` and `START_OPERATOR`; confirmed direct bootstrap uses
+`action_id=operator.bootstrap` and `BOOTSTRAP_OPERATOR`. Both require
+`consequence_ack`, actor/source surface, target/reason context, bounded request
+execution, and top-level domain errors such as `preflight_failed`,
+`start_failed:ingestion_runtime`, or `bootstrap_timeout` when orchestration
+does not complete cleanly.
 
 ### Model-directed decisioning
 

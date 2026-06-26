@@ -27,6 +27,14 @@ Port **:4001** is not a LAN entrypoint in the production compose contract. It is
 exposed only inside the Docker network as `operator:4001`, or loopback-only on a
 standalone host-side operator process.
 
+The `/operator/` bridge proxies HTTP API calls only. Operator Live-PnL/telemetry
+uses the sidecar WebSocket `/ws/operator` directly on the operator origin
+because the Python dashboard handler is not a WebSocket-upgrade proxy. The
+browser derives that sidecar host from the dashboard host plus the configured
+operator port, fetches a short-lived `/operator/ws_ticket` through dashboard
+auth, and the sidecar accepts the handshake only when that ticket signature,
+expiry, and dashboard/operator `Origin` validate.
+
 By default the dashboard binds to loopback (`127.0.0.1`) and is therefore only
 reachable from the Ubuntu host. LAN access is **opt-in**.
 
@@ -87,6 +95,12 @@ intentional fail-closed behavior: exposing an unauthenticated control plane to
 the network is never allowed. The startup banner also prints a warning if it
 detects a wildcard bind with no token.
 
+Sensitive dashboard GET routes also fail closed on LAN/remote binds. In local
+safe mode, `GET /api/data_sources` is intentionally open on loopback; when
+`TRADING_NETWORK_MODE=lan` resolves the dashboard bind to `0.0.0.0`, the same
+read requires `X-API-Token` before returning the source catalog, provider
+templates, or runtime posture.
+
 In **live/prod** mode, a public dashboard bind additionally
 requires an explicit acknowledgement:
 `TRADING_PUBLIC_NETWORK_EXPOSURE_ACK` + `_OWNER` + `_REASON`
@@ -145,7 +159,9 @@ This should report `TcpTestSucceeded : True`. Then open in a browser:
 Open browser **DevTools → Network**: you should see **no failed requests to
 `127.0.0.1` or `localhost`**. API calls are same-origin (`/api/...`), and the
 operator bridge stays same-origin through the dashboard — never a hard-coded
-client-local address.
+client-local address. The operator telemetry WebSocket is the exception: it
+targets `/ws/operator` on the sidecar host derived from the browser host and
+configured operator port, with ticket and origin enforcement on the sidecar.
 
 ---
 
@@ -160,9 +176,12 @@ client-local address.
   enabled.
 - CSP is **not** disabled. The operator server's `connect-src` is derived from
   the request host so same-origin LAN access works without weakening the policy.
-- Do not publish `:4001` for normal operations. A direct sidecar diagnostic must
-  stay loopback/internal, send `X-Operator-Token` on every request, and not be
-  carried into production.
+- Do not publish `:4001` for normal production operations without a reviewed
+  firewall/VPN/reverse-proxy design. A direct sidecar diagnostic must stay
+  loopback/internal, send `X-Operator-Token` on HTTP requests, and use the
+  authenticated `/ws/operator` handshake for telemetry. Browser access through
+  `/operator/` should use the dashboard-minted `/operator/ws_ticket` path, not
+  a raw operator token in the WebSocket URL.
 
 ---
 

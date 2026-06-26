@@ -50,6 +50,41 @@ def test_storage_pg_sql_normalization_cache_reuses_identical_sql(monkeypatch):
     storage_pg._clear_sql_normalization_cache()
 
 
+def test_postgres_storage_synthesizes_sqlite_version_probe():
+    class ExplodingRaw:
+        def cursor(self):
+            raise AssertionError("sqlite_version probe should be synthetic")
+
+    con = storage_pg.StorageConnection(ExplodingRaw())
+
+    row = con.execute("SELECT sqlite_version()").fetchone()
+
+    assert row[0] == "3.40.0-postgres-compat"
+
+
+def test_postgres_storage_synthesizes_quoted_pragma_table_info():
+    class FakeResult:
+        def fetchall(self):
+            return [(0, "time", "TIMESTAMPTZ", 1, None, 1)]
+
+    class FakeRaw:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def execute(self, sql: str, params: tuple[str, ...]):
+            self.calls.append((str(sql), tuple(params)))
+            return FakeResult()
+
+    raw = FakeRaw()
+    con = storage_pg.StorageConnection(raw)
+
+    rows = con.execute('PRAGMA table_info("price_quotes")').fetchall()
+
+    assert rows == [(0, "time", "TIMESTAMPTZ", 1, None, 1)]
+    assert raw.calls
+    assert raw.calls[0][1] == ("price_quotes",)
+
+
 def test_storage_pg_sql_normalization_cache_keeps_distinct_sql_classification(monkeypatch):
     storage_pg._clear_sql_normalization_cache()
     calls: list[str] = []
@@ -194,6 +229,8 @@ def test_get_pool_resolves_dsn_before_taking_pool_lock(monkeypatch):
     assert isinstance(pool, FakePool)
     assert pool.opened is True
     assert pool.kwargs["conninfo"].startswith("host=127.0.0.1")
+    assert pool.kwargs["check"] is storage_pool._check_connection
+    assert pool.kwargs["reset"] is storage_pool._rollback_if_in_transaction
 
 
 def test_configure_connection_rolls_back_dirty_connection(monkeypatch):
@@ -233,6 +270,146 @@ def test_configure_connection_rolls_back_dirty_connection(monkeypatch):
     assert conn.rollbacks == 1
     assert conn.autocommit is False
     assert statements == [f"SET search_path = {storage_pool.quote_ident(storage_pool.schema_name())}, public"]
+
+
+def test_release_rolls_back_failed_query_before_pool_reuse(monkeypatch):
+    storage_pool.close_pool()
+    statements: list[str] = []
+
+    class FakeInfo:
+        transaction_status = TransactionStatus.IDLE
+
+    class FakeCursor:
+        rowcount = 0
+        description = ()
+
+        def __init__(self, conn: "FakeConnection") -> None:
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql: str, params=None) -> None:
+            del params
+            text = str(sql)
+            statements.append(text)
+            if "failing_query" in text:
+                self.conn.info.transaction_status = TransactionStatus.INERROR
+                raise RuntimeError("originating sql failure")
+            if self.conn.info.transaction_status != TransactionStatus.IDLE:
+                raise RuntimeError("InFailedSqlTransaction")
+            if not bool(self.conn.autocommit):
+                self.conn.info.transaction_status = TransactionStatus.INTRANS
+
+        def fetchone(self):
+            return (1,)
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.info = FakeInfo()
+            self.autocommit = False
+            self.rollbacks = 0
+            self.closed = False
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+            self.info.transaction_status = TransactionStatus.IDLE
+
+        def close(self) -> None:
+            self.closed = True
+
+        def cursor(self):
+            return FakeCursor(self)
+
+    class FakePool:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.conn = FakeConnection()
+            self.getconn_count = 0
+            self.putconn_count = 0
+
+        def open(self, *, wait: bool, timeout: float) -> None:
+            del wait, timeout
+            self.kwargs["configure"](self.conn)
+
+        def getconn(self, *, timeout: float):
+            del timeout
+            self.getconn_count += 1
+            return self.conn
+
+        def putconn(self, conn) -> None:
+            assert conn is self.conn
+            self.putconn_count += 1
+
+        def close(self, timeout=None) -> None:
+            del timeout
+
+    monkeypatch.setattr(storage_pool, "_POOL", None)
+    monkeypatch.setattr(storage_pool, "_POOL_TRANSACTION_MODE", False)
+    monkeypatch.setattr(storage_pool, "_dsn", lambda: "host=127.0.0.1 port=5432 dbname=trading")
+    monkeypatch.setattr(storage_pool, "_pool_timeout_s", lambda: 0.25)
+    monkeypatch.setattr(storage_pool, "_connect_timeout_s", lambda timeout_s=None: 1)
+    monkeypatch.setattr(storage_pool, "default_pool_size", lambda: 1)
+    monkeypatch.setattr(storage_pool, "schema_name", lambda: "trading")
+    monkeypatch.setattr(storage_pool, "ConnectionPool", FakePool)
+
+    try:
+        first = storage_pool.acquire()
+        with pytest.raises(RuntimeError, match="originating sql failure"):
+            with first.cursor() as cur:
+                cur.execute("SELECT failing_query")
+        storage_pool.release(first)
+
+        second = storage_pool.acquire()
+        with second.cursor() as cur:
+            cur.execute("SELECT 1")
+            assert cur.fetchone() == (1,)
+        storage_pool.release(second)
+
+        assert first is second
+        assert storage_pool._POOL.getconn_count == 2  # type: ignore[union-attr]
+        assert storage_pool._POOL.putconn_count == 2  # type: ignore[union-attr]
+        assert first.rollbacks >= 2
+        assert "InFailedSqlTransaction" not in " ".join(statements)
+    finally:
+        storage_pool.close_pool()
+
+
+def test_release_closes_connection_when_rollback_fails(monkeypatch):
+    storage_pool.close_pool()
+
+    class FakeInfo:
+        transaction_status = TransactionStatus.INERROR
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.info = FakeInfo()
+            self.closed = False
+
+        def rollback(self) -> None:
+            raise RuntimeError("rollback failed")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.putconn_calls: list[FakeConnection] = []
+
+        def putconn(self, conn: FakeConnection) -> None:
+            self.putconn_calls.append(conn)
+
+    pool = FakePool()
+    conn = FakeConnection()
+    monkeypatch.setattr(storage_pool, "_POOL", pool)
+
+    storage_pool.release(conn)
+
+    assert conn.closed is True
+    assert pool.putconn_calls == [conn]
 
 
 def test_acquire_configures_fresh_connection_once_and_reuses_search_path_marker(monkeypatch):
@@ -737,8 +914,9 @@ def test_put_normalized_event_uses_schema_conflict_key(monkeypatch):
 
     assert event_id == 42
     sql = statements[-1][0]
-    assert "ON CONFLICT(event_key) DO UPDATE SET" in sql
+    assert "ON CONFLICT(event_key, ts_ms) DO UPDATE SET" in sql
     assert "event_key=COALESCE" not in sql
+    assert "ts_ms=COALESCE" not in sql
 
 
 def test_price_quotes_raw_buffer_uses_aligned_conflict_key_for_postgres():

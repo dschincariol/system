@@ -223,6 +223,122 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
     )
 
 
+def _is_closed_connection_error(error: BaseException) -> bool:
+    text = str(error or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "cannot operate on a closed database",
+            "closed database",
+            "connection already closed",
+            "connection is closed",
+            "connection closed",
+            "closed connection",
+        )
+    )
+
+
+def _connection_marked_closed(con: Any) -> bool:
+    if con is None:
+        return True
+    for attr in ("_closed", "closed"):
+        try:
+            value = getattr(con, attr)
+        except Exception as e:
+            _warn_nonfatal(
+                "BROKER_APPLY_ORDERS_CONNECTION_STATE_ATTR_FAILED",
+                e,
+                once_key=f"connection_state_attr:{attr}",
+                attr=str(attr),
+            )
+            continue
+        if isinstance(value, bool):
+            return bool(value)
+        if value is not None and not callable(value):
+            try:
+                return bool(value)
+            except Exception as e:
+                _warn_nonfatal(
+                    "BROKER_APPLY_ORDERS_CONNECTION_STATE_COERCE_FAILED",
+                    e,
+                    once_key=f"connection_state_coerce:{attr}",
+                    attr=str(attr),
+                )
+                continue
+    try:
+        raw = getattr(con, "raw", None)
+    except Exception:
+        raw = None
+    if raw is not None:
+        for attr in ("closed", "_closed"):
+            try:
+                if bool(getattr(raw, attr)):
+                    return True
+            except Exception as e:
+                _warn_nonfatal(
+                    "BROKER_APPLY_ORDERS_RAW_CONNECTION_STATE_FAILED",
+                    e,
+                    once_key=f"raw_connection_state:{attr}",
+                    attr=str(attr),
+                )
+                continue
+    return False
+
+
+def _safe_commit_connection(con: Any, *, context: str, once_key: str) -> bool:
+    if _connection_marked_closed(con):
+        _warn_nonfatal(
+            "BROKER_APPLY_ORDERS_COMMIT_SKIPPED_CLOSED_CONNECTION",
+            RuntimeError("connection already closed before commit"),
+            once_key=f"{once_key}:closed",
+            context=str(context),
+        )
+        return False
+    try:
+        con.commit()
+        return True
+    except Exception as e:
+        if _is_closed_connection_error(e):
+            _warn_nonfatal(
+                "BROKER_APPLY_ORDERS_COMMIT_SKIPPED_CLOSED_CONNECTION",
+                RuntimeError("connection already closed before commit"),
+                once_key=f"{once_key}:closed",
+                context=str(context),
+            )
+            return False
+        _warn_nonfatal(
+            "BROKER_APPLY_ORDERS_COMMIT_FAILED",
+            e,
+            once_key=once_key,
+            context=str(context),
+        )
+        return False
+
+
+def _safe_close_connection(con: Any, *, context: str, once_key: str) -> bool:
+    if con is None or _connection_marked_closed(con):
+        return False
+    try:
+        con.close()
+        return True
+    except Exception as e:
+        if _is_closed_connection_error(e):
+            _warn_nonfatal(
+                "BROKER_APPLY_ORDERS_CONNECTION_CLOSE_SKIPPED_CLOSED",
+                RuntimeError("connection already closed before close"),
+                once_key=f"{once_key}:closed",
+                context=str(context),
+            )
+            return False
+        _warn_nonfatal(
+            "BROKER_APPLY_ORDERS_CONNECTION_CLOSE_FAILED",
+            e,
+            once_key=once_key,
+            context=str(context),
+        )
+        return False
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -709,9 +825,9 @@ def _log_shadow_intents(payload: List[Dict[str, Any]], actor: str, mode_state: d
                         ),
                     )
 
-            con.commit()
+            _safe_commit_connection(con, context="shadow_intents", once_key="shadow_intents_commit")
         finally:
-            con.close()
+            _safe_close_connection(con, context="shadow_intents", once_key="shadow_intents_close")
     except Exception as e:
         _warn_nonfatal("BROKER_APPLY_ORDERS_SHADOW_INTENT_LOG_FAILED", e, once_key="shadow_intents_log", actor=str(actor))
 
@@ -746,9 +862,9 @@ def _write_execution_meta_last(broker: str, source: str) -> None:
                 """,
                 ("last_execution_broker", str(broker)),
             )
-            con.commit()
+            _safe_commit_connection(con, context="execution_meta_last", once_key="execution_meta_last_commit")
         finally:
-            con.close()
+            _safe_close_connection(con, context="execution_meta_last", once_key="execution_meta_last_close")
     except Exception as e:
         _warn_nonfatal("BROKER_APPLY_ORDERS_EXECUTION_META_WRITE_FAILED", e, once_key="execution_meta_last", source=str(source), broker=str(broker))
 
@@ -900,7 +1016,11 @@ def _load_latest_payload(*, live_strict: bool = False) -> Tuple[Optional[int], O
                 batch_ts_ms = batch.get("batch_ts_ms")
                 intents = list(batch.get("intents") or [])
             finally:
-                con.close()
+                _safe_close_connection(
+                    con,
+                    context="load_latest_execution_intents",
+                    once_key="load_latest_execution_intents_close",
+                )
 
             if (batch_id is not None) or intents:
                 return (
@@ -1526,7 +1646,7 @@ def _execute_live_mode(
     try:
         allow, ks_reason, ks_meta = execution_allowed(con=con_ks, symbol=None, regime=None)
     finally:
-        con_ks.close()
+        _safe_close_connection(con_ks, context="live_kill_switch", once_key="live_kill_switch_close")
 
     if not allow:
         payload = {"meta": dict(ks_meta or {})}
@@ -1560,7 +1680,7 @@ def _execute_live_mode(
                     correlation_id=_batch_correlation_id(batch_or_oid),
                 )
         finally:
-            con2.close()
+            _safe_close_connection(con2, context="position_reconcile", once_key="position_reconcile_close")
     except Exception as e:
         _warn_nonfatal("BROKER_APPLY_ORDERS_POSITION_RECONCILE_EXCEPTION", e, once_key="position_reconcile_exception")
         return _blocked(
@@ -1584,7 +1704,7 @@ def _execute_live_mode(
                 equity_usd=None,
             )
         finally:
-            con3.close()
+            _safe_close_connection(con3, context="risk_governor", once_key="risk_governor_close")
     except Exception as e:
         _warn_nonfatal("BROKER_APPLY_ORDERS_RISK_GOVERNOR_EXCEPTION", e, once_key="risk_governor_exception")
         return _blocked(
@@ -1856,7 +1976,7 @@ def main() -> int:
         try:
             allow, ks_reason, ks_meta = execution_allowed(con=con, symbol=None, regime=None)
         finally:
-            con.close()
+            _safe_close_connection(con, context="initial_kill_switch", once_key="initial_kill_switch_close")
 
         if not allow and _defer_initial_capital_block(ks_reason, ks_meta):
             deferred_initial_kill_switch = {
@@ -2046,15 +2166,9 @@ def main() -> int:
                 except Exception as e:
                     _warn_nonfatal("BROKER_APPLY_ORDERS_ADVISORY_PERSIST_FAILED", e, once_key="persist_execution_advisories")
 
-            try:
-                con.commit()
-            except Exception as e:
-                _warn_nonfatal("BROKER_APPLY_ORDERS_COMMIT_FAILED", e, once_key="epe_commit")
+            _safe_commit_connection(con, context="epe_decision_advisory", once_key="epe_commit")
         finally:
-            try:
-                con.close()
-            except Exception as e:
-                _warn_nonfatal("BROKER_APPLY_ORDERS_EPE_CONNECTION_CLOSE_FAILED", e, once_key="epe_connection_close")
+            _safe_close_connection(con, context="epe_decision_advisory", once_key="epe_connection_close")
 
         production_ready_payload, production_model_blocked_orders = _enforce_production_model_sources(
             shaped_payload,
@@ -2077,7 +2191,7 @@ def main() -> int:
                 orders=production_ready_payload,
             )
         finally:
-            con.close()
+            _safe_close_connection(con, context="model_kill_switch", once_key="model_kill_switch_close")
 
         if global_model_block is not None:
             return _blocked(

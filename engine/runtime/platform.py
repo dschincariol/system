@@ -414,46 +414,103 @@ def _load_pg_password_file(user: str | None = None) -> str:
     return ""
 
 
-def _load_pg_password_secret_ref(user: str | None = None) -> str:
+def _pg_password_secret_ref_env_names(user: str | None = None) -> tuple[str, ...]:
     role = pg_password_secret_name(user).removeprefix("pg_password_").upper()
-    for name in (
+    return (
         "TS_PG_PASSWORD_SECRET",
         "TIMESCALE_PASSWORD_SECRET",
         f"TS_PG_PASSWORD_{role}_SECRET",
         f"TS_PG_{role}_PASSWORD_SECRET",
         "PGPASSWORD_SECRET",
-    ):
-        secret_name = str(os.environ.get(name) or "").strip()
-        if not secret_name:
-            continue
-        from services.secrets.loader import load_secret
+    )
 
-        return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+
+def _configured_pg_password_secret_ref(user: str | None = None) -> tuple[str, str]:
+    for name in _pg_password_secret_ref_env_names(user):
+        secret_name = str(os.environ.get(name) or "").strip()
+        if secret_name:
+            return name, secret_name
+    return "", ""
+
+
+def _selected_secret_provider_name() -> str:
+    return str(os.environ.get("TS_SECRETS_PROVIDER") or "systemd-creds").strip().lower()
+
+
+def _systemd_pg_credentials_available() -> bool:
+    return bool(str(os.environ.get("CREDENTIALS_DIRECTORY") or "").strip())
+
+
+def _pg_secret_provider_unavailable_reason() -> str:
+    if _selected_secret_provider_name() not in {"systemd-creds", "systemd_creds"}:
+        return ""
+    if not _systemd_pg_credentials_available():
+        return "credentials_directory_missing"
     return ""
 
 
-def _load_pg_password(user: str | None = None) -> str:
-    configured_file = _load_pg_password_file(user)
-    if configured_file:
-        return configured_file
+def _load_pg_password_secret_ref(user: str | None = None) -> str:
+    _env_name, secret_name = _configured_pg_password_secret_ref(user)
+    if not secret_name or _pg_secret_provider_unavailable_reason():
+        return ""
+    from services.secrets.loader import load_secret
 
+    return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+
+
+def _pg_password_unavailable_error(user: str | None = None) -> Exception:
+    from services.secrets.loader import SecretNotAvailable
+
+    _env_name, configured_secret = _configured_pg_password_secret_ref(user)
+    secret_name = configured_secret or pg_password_secret_name(user)
+    reason = _pg_secret_provider_unavailable_reason()
+    if reason:
+        return SecretNotAvailable(
+            "pg_password_unavailable:"
+            f"{reason}: provider={_selected_secret_provider_name()} secret={secret_name}; "
+            "set CREDENTIALS_DIRECTORY with the systemd LoadCredential entry or configure "
+            "TS_PG_PASSWORD_FILE/TIMESCALE_PASSWORD_FILE/role-specific *_FILE/PGPASSWORD_FILE"
+        )
+    return SecretNotAvailable(
+        "pg_password_unavailable:"
+        f"secret={secret_name}; configure a readable Postgres password secret, "
+        "TS_PG_PASSWORD_FILE/TIMESCALE_PASSWORD_FILE/role-specific *_FILE/PGPASSWORD_FILE, "
+        "or a guarded inline development password"
+    )
+
+
+def _load_default_pg_password_secret(user: str | None = None) -> str:
+    from services.secrets.loader import load_secret
+
+    return load_secret(pg_password_secret_name(user)).decode("utf-8", "ignore").rstrip("\r\n")
+
+
+def _load_pg_password(user: str | None = None) -> str:
     configured_secret = _load_pg_password_secret_ref(user)
     if configured_secret:
         return configured_secret
+
+    provider_error: Exception | None = None
+    if _systemd_pg_credentials_available():
+        from services.secrets.loader import SecretNotAvailable
+
+        try:
+            provider_value = _load_default_pg_password_secret(user)
+        except SecretNotAvailable as exc:
+            provider_error = exc
+        else:
+            if provider_value:
+                return provider_value
+
+    configured_file = _load_pg_password_file(user)
+    if configured_file:
+        return configured_file
 
     configured = str(os.environ.get("TS_PG_PASSWORD") or os.environ.get("TIMESCALE_PASSWORD") or "").strip()
     if configured:
         return configured
 
     role = pg_password_secret_name(user).removeprefix("pg_password_").upper()
-    from services.secrets.loader import load_secret
-
-    if (
-        str(os.environ.get("TS_SECRETS_PROVIDER") or "").strip()
-        or str(os.environ.get("TS_DEV_SECRETS_DIR") or "").strip()
-        or str(os.environ.get("CREDENTIALS_DIRECTORY") or "").strip()
-    ):
-        return load_secret(pg_password_secret_name(user)).decode("utf-8", "ignore").rstrip("\r\n")
 
     for name in (
         f"TS_PG_PASSWORD_{role}",
@@ -467,7 +524,13 @@ def _load_pg_password(user: str | None = None) -> str:
     if value:
         return value
 
-    return load_secret(pg_password_secret_name(user)).decode("utf-8", "ignore").rstrip("\r\n")
+    if provider_error is not None:
+        raise provider_error
+
+    if _pg_secret_provider_unavailable_reason():
+        raise _pg_password_unavailable_error(user)
+
+    return _load_default_pg_password_secret(user)
 
 
 def _dsn_user(conninfo: str) -> str:

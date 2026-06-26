@@ -143,6 +143,27 @@ def _looks_like_state_payload(payload):
     return sum(1 for key in canonical_keys if key in payload) >= 3
 
 
+def _business_false_reason(payload) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("reason_code", "reason"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("reason_codes", "reasons"):
+        values = payload.get(key)
+        if isinstance(values, (list, tuple, set)):
+            for item in values:
+                value = str(item or "").strip()
+                if value:
+                    return value
+        elif values is not None:
+            value = str(values or "").strip()
+            if value:
+                return value
+    return ""
+
+
 def _map_error_to_status(error_code: str) -> int:
     code = str(error_code or "").strip().lower()
     if not code:
@@ -189,10 +210,18 @@ def _map_error_to_status(error_code: str) -> int:
         return 429
     if (
         code == "missing_credentials"
+        or code == "confirmation_required"
         or code.endswith("_credentials_missing")
         or code.endswith("_account_id_missing")
+        or code == "channel_not_configured"
+        or code.endswith("_not_configured")
+        or code.endswith("_config_missing")
+        or code.endswith("_host_missing")
+        or code.endswith("_url_missing")
     ):
         return 422
+    if code in {"unknown_channel"}:
+        return 400
     if (
         code.startswith("missing_")
         or code.startswith("invalid_")
@@ -310,6 +339,13 @@ def _derive_response_status(payload, default_status=200):
     if _looks_like_state_payload(payload):
         return default_status
 
+    if (
+        not str(payload.get("error") or "").strip()
+        and not str(payload.get("root_cause_code") or "").strip()
+        and _business_false_reason(payload)
+    ):
+        return default_status
+
     return _map_error_to_status(
         str(payload.get("error") or payload.get("root_cause_code") or "")
     )
@@ -377,6 +413,13 @@ _DESTRUCTIVE_ENDPOINT_PATHS = frozenset(
     }
 )
 
+_OPERATOR_CLEAR_LAST_ERROR_MUTATION_SPEC = {
+    "action_id": "operator.clear_last_error",
+    "severity": "low",
+    "consequence": "Clears displayed operator error state.",
+}
+
+
 _MUTATION_ROUTE_INVENTORY = {
     # Low: acknowledgement, telemetry, tests, and read-like writes.
     "/api/alerts/{id}/ack": {
@@ -435,11 +478,8 @@ _MUTATION_ROUTE_INVENTORY = {
         "severity": "medium",
         "consequence": "Updates the execution armed flag; arming live execution is confirmed separately.",
     },
-    "/api/operator/clearLastError": {
-        "action_id": "operator.clear_last_error",
-        "severity": "low",
-        "consequence": "Clears displayed operator error state.",
-    },
+    "/api/operator/clear_last_error": _OPERATOR_CLEAR_LAST_ERROR_MUTATION_SPEC,
+    "/api/operator/clearLastError": _OPERATOR_CLEAR_LAST_ERROR_MUTATION_SPEC,
     "/api/execution/advisories/action": {
         "action_id": "execution.advisory_action",
         "severity": "medium",
@@ -529,6 +569,26 @@ _CONFIRMATION_REGISTRY = {
         "severity": "high",
         "consequence": "Stops operator-controlled runtime processes.",
         "require_ack": True,
+    },
+    "/api/operator/start": {
+        "action_id": "operator.start",
+        "required_token": "START_OPERATOR",
+        "severity": "high",
+        "consequence": "Starts operator-managed runtime processes in non-live mode.",
+        "require_ack": True,
+        "require_actor": True,
+        "require_source": True,
+        "require_action_id": True,
+    },
+    "/api/operator/bootstrap": {
+        "action_id": "operator.bootstrap",
+        "required_token": "BOOTSTRAP_OPERATOR",
+        "severity": "high",
+        "consequence": "Runs the dashboard startup orchestrator in non-live mode and may start data or pipeline jobs.",
+        "require_ack": True,
+        "require_actor": True,
+        "require_source": True,
+        "require_action_id": True,
     },
     "/api/operator/restart": {
         "action_id": "operator.restart",
@@ -1224,7 +1284,13 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             if obj.get("ok", True):
                 obj.setdefault("error", None)
             else:
-                obj["error"] = str(obj.get("error") or "request_failed")
+                error = str(obj.get("error") or "").strip()
+                if error:
+                    obj["error"] = error
+                elif _business_false_reason(obj):
+                    obj.setdefault("error", None)
+                else:
+                    obj["error"] = "request_failed"
             meta = obj.get("meta")
             if not isinstance(meta, dict):
                 meta = {}
@@ -1541,6 +1607,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             expected = str(spec.get("required_token") or "").strip()
             payload = dict(body or {}) if isinstance(body, dict) else {}
             actual = str(payload.get("confirmation") or payload.get("confirm") or "").strip()
+            supplied_action_id = str(payload.get("action_id") or payload.get("actionId") or "").strip()
             method = str(payload.get("confirmation_method") or "").strip()
             if not method:
                 method = "typed_phrase" if payload.get("confirmation") is not None else "legacy_confirm"
@@ -1558,6 +1625,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             missing = []
             if not hmac.compare_digest(actual, str(expected)):
                 missing.append("confirmation")
+            if bool(spec.get("require_action_id")) and supplied_action_id != str(spec.get("action_id") or ""):
+                missing.append("action_id")
             if bool(spec.get("require_ack")) and not _truthy_confirmation_value(payload.get("consequence_ack")):
                 missing.append("consequence_ack")
             if bool(spec.get("require_actor")) and not actor:

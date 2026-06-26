@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Data Sources Control Plane</title>
   <link rel="icon" href="/ui/favicon.ico">
-  <link rel="stylesheet" href="/ui/data_sources.css">
   <link rel="stylesheet" href="/ui/base.css">
+  <link rel="stylesheet" href="/ui/data_sources.css">
 </head>
 <body class="data-sources-screen">
   <div class="shell">
@@ -20,22 +20,33 @@
       <div class="hero-actions">
         <button class="btn" id="addSourceBtn">Add RSS Feed</button>
         <button class="btn-secondary" id="refreshBtn">Refresh</button>
-        <a class="btn-secondary" href="/ui/dashboard.html">Dashboard</a>
+        <a class="btn-secondary" id="dashboardLink" href="/ui/dashboard.html?screen=data">Dashboard</a>
       </div>
     </div>
+
+    <section class="card context-card" aria-label="Active cross-surface context">
+      <div class="card-head">
+        <h2>Active Context</h2>
+        <button class="btn-secondary" id="clearContextBtn" type="button" disabled>Clear Context</button>
+      </div>
+      <div class="card-body context-row" id="activeContext">
+        <span class="pill dim">context none</span>
+        <span class="context-note">No source context is pinned.</span>
+      </div>
+    </section>
 
     <section class="card guide-shell">
       <div class="card-head">
         <h2>What Should I Do Now?</h2>
-        <span class="pill ok">Canonical Page</span>
+        <span id="actionCenterState" class="pill unavailable">loading</span>
       </div>
       <div class="card-body guide-grid">
-        <div class="guide-panel">
+        <div class="guide-panel opsGuidancePanel">
           <div class="guide-title">Recommended Next Step</div>
-          <div id="actionCenter"></div>
+          <div id="actionCenter" class="opsActionList"></div>
         </div>
-        <div class="guide-panel">
-          <div class="guide-title">How To Use This Page</div>
+        <div class="guide-panel opsGuidancePanel">
+          <div class="guide-title">Operator Guidance</div>
           <div id="quickGuide"></div>
         </div>
       </div>
@@ -63,11 +74,11 @@
       </div>
     </section>
 
-    <div class="status-strip">
-      <div class="metric"><div class="metric-label">Configured Sources</div><div class="metric-value" id="metricTotal">0</div></div>
-      <div class="metric"><div class="metric-label">Enabled / Runnable</div><div class="metric-value" id="metricEnabled">0</div></div>
-      <div class="metric"><div class="metric-label">Healthy</div><div class="metric-value" id="metricHealthy">0</div></div>
-      <div class="metric"><div class="metric-label">Accumulated Errors</div><div class="metric-value" id="metricErrors">0</div></div>
+    <div class="status-strip opsKpiGrid" role="group" aria-label="Data-source readiness KPI summary">
+      <div class="metric opsKpiTile" data-status="unavailable"><div class="metric-label opsKpiLabel">Configured Sources</div><div class="metric-value opsKpiValue" id="metricTotal">0</div><div class="metric-meta opsKpiMeta" id="metricTotalMeta">waiting</div></div>
+      <div class="metric opsKpiTile" data-status="unavailable"><div class="metric-label opsKpiLabel">Enabled / Runnable</div><div class="metric-value opsKpiValue" id="metricEnabled">0</div><div class="metric-meta opsKpiMeta" id="metricEnabledMeta">waiting</div></div>
+      <div class="metric opsKpiTile" data-status="unavailable"><div class="metric-label opsKpiLabel">Healthy</div><div class="metric-value opsKpiValue" id="metricHealthy">0</div><div class="metric-meta opsKpiMeta" id="metricHealthyMeta">waiting</div></div>
+      <div class="metric opsKpiTile" data-status="unavailable"><div class="metric-label opsKpiLabel">Accumulated Errors</div><div class="metric-value opsKpiValue" id="metricErrors">0</div><div class="metric-meta opsKpiMeta" id="metricErrorsMeta">waiting</div></div>
     </div>
 
     <div id="flash" class="empty flash"></div>

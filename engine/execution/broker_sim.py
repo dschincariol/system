@@ -683,6 +683,131 @@ def _ensure_broker_fill_provenance_columns(con) -> None:
     )
 
 
+def _account_snapshot_value_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _coerce_snapshot_float(value: Any) -> Optional[float]:
+    if _account_snapshot_value_missing(value):
+        return None
+    try:
+        out = float(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_account_snapshot_float_parse_failed",
+            "BROKER_SIM_ACCOUNT_SNAPSHOT_FLOAT_PARSE_FAILED",
+            e,
+            warn_key=f"account_snapshot_float_parse:{type(value).__name__}",
+            value_type=type(value).__name__,
+        )
+        return None
+    return float(out) if math.isfinite(out) else None
+
+
+def _coerce_snapshot_int(value: Any) -> Optional[int]:
+    if _account_snapshot_value_missing(value):
+        return None
+    try:
+        return int(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_account_snapshot_int_parse_failed",
+            "BROKER_SIM_ACCOUNT_SNAPSHOT_INT_PARSE_FAILED",
+            e,
+            warn_key=f"account_snapshot_int_parse:{type(value).__name__}",
+            value_type=type(value).__name__,
+        )
+        return None
+
+
+def _account_snapshot_needs_repair(
+    cash_raw: Any,
+    equity_raw: Any,
+    updated_ts_raw: Any,
+    snapshot: Dict[str, Any],
+) -> bool:
+    cash = _coerce_snapshot_float(cash_raw)
+    equity = _coerce_snapshot_float(equity_raw)
+    updated_ts_ms = _coerce_snapshot_int(updated_ts_raw)
+    if cash is None or equity is None or updated_ts_ms is None:
+        return True
+    try:
+        if abs(float(cash) - float(snapshot.get("cash") or 0.0)) > 1e-9:
+            return True
+        if abs(float(equity) - float(snapshot.get("equity") or 0.0)) > 1e-9:
+            return True
+        if int(updated_ts_ms) != int(snapshot.get("updated_ts_ms") or 0):
+            return True
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_account_snapshot_compare_failed",
+            "BROKER_SIM_ACCOUNT_SNAPSHOT_COMPARE_FAILED",
+            e,
+            warn_key="account_snapshot_compare_failed",
+        )
+        return True
+    return False
+
+
+def _is_closed_connection_error(error: BaseException) -> bool:
+    text = str(error or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "cannot operate on a closed database",
+            "closed database",
+            "connection already closed",
+            "connection is closed",
+            "connection closed",
+            "closed connection",
+        )
+    )
+
+
+def _repair_account_snapshot_if_needed(
+    con,
+    snapshot: Dict[str, Any],
+    *,
+    cash_raw: Any,
+    equity_raw: Any,
+    updated_ts_raw: Any,
+    scope: str,
+    book_key: Optional[str] = None,
+) -> None:
+    if not _account_snapshot_needs_repair(cash_raw, equity_raw, updated_ts_raw, snapshot):
+        return
+    try:
+        _write_account(
+            con,
+            cash=float(snapshot.get("cash") or 0.0),
+            equity=float(snapshot.get("equity") or 0.0),
+            ts_ms=int(snapshot.get("updated_ts_ms") or _now_ms()),
+            book_key=book_key,
+        )
+    except Exception as e:
+        error: BaseException
+        if _is_closed_connection_error(e):
+            error = RuntimeError("connection already closed before account snapshot repair")
+        else:
+            error = e
+        _warn_nonfatal(
+            "broker_sim_account_snapshot_repair_failed",
+            "BROKER_SIM_ACCOUNT_SNAPSHOT_REPAIR_FAILED",
+            error,
+            warn_key=f"account_snapshot_repair_failed:{scope}",
+            scope=str(scope),
+            book_key=str(_book_key(book_key) or ""),
+        )
+
+
+def _default_account_snapshot() -> Dict[str, Any]:
+    cash = float(BROKER_START_CASH or 0.0)
+    equity = float(BROKER_START_EQUITY or 0.0) if float(BROKER_START_EQUITY or 0.0) > 0.0 else float(cash)
+    if cash == 0.0 and equity == 0.0:
+        equity = 1.0
+    return {"cash": float(cash), "equity": float(equity), "updated_ts_ms": 0}
+
+
 def _normalize_account_snapshot(
     cash_raw: Any,
     equity_raw: Any,
@@ -690,10 +815,7 @@ def _normalize_account_snapshot(
     *,
     scope: str,
 ) -> Dict[str, Any]:
-    invalid_snapshot = any(
-        value is None or (isinstance(value, str) and not value.strip())
-        for value in (cash_raw, equity_raw, updated_ts_raw)
-    )
+    invalid_snapshot = any(_account_snapshot_value_missing(value) for value in (cash_raw, equity_raw, updated_ts_raw))
     cash = _safe_f(cash_raw, float(BROKER_START_CASH or 0.0))
     equity_default = (
         float(BROKER_START_EQUITY or 0.0)
@@ -701,7 +823,10 @@ def _normalize_account_snapshot(
         else float(cash)
     )
     equity = _safe_f(equity_raw, equity_default)
-    updated_ts_ms = _safe_i(updated_ts_raw, 0)
+    updated_ts_default = _now_ms() if _account_snapshot_value_missing(updated_ts_raw) else 0
+    updated_ts_ms = _safe_i(updated_ts_raw, int(updated_ts_default))
+    if invalid_snapshot and int(updated_ts_ms or 0) <= 0:
+        updated_ts_ms = _now_ms()
 
     if cash == 0.0 and equity == 0.0:
         if float(BROKER_START_EQUITY or 0.0) > 0.0:
@@ -903,13 +1028,23 @@ def _read_account(con, book_key: Optional[str] = None) -> dict:
             (str(_book_key(book_key)),),
         ).fetchone()
         if not r:
-            return {"cash": 0.0, "equity": 1.0, "updated_ts_ms": 0}
-        return _normalize_account_snapshot(
+            return _default_account_snapshot()
+        snapshot = _normalize_account_snapshot(
             r[0],
             r[1],
             r[2],
             scope=f"broker_shadow_account:{str(_book_key(book_key))}",
         )
+        _repair_account_snapshot_if_needed(
+            con,
+            snapshot,
+            cash_raw=r[0],
+            equity_raw=r[1],
+            updated_ts_raw=r[2],
+            scope=f"broker_shadow_account:{str(_book_key(book_key))}",
+            book_key=str(_book_key(book_key)),
+        )
+        return snapshot
     if _broker_account_uses_singleton_id(con):
         r = con.execute("SELECT cash, equity, updated_ts_ms FROM broker_account WHERE id=1").fetchone()
     else:
@@ -922,13 +1057,22 @@ def _read_account(con, book_key: Optional[str] = None) -> dict:
             """
         ).fetchone()
     if not r:
-        return {"cash": 0.0, "equity": 1.0, "updated_ts_ms": 0}
-    return _normalize_account_snapshot(
+        return _default_account_snapshot()
+    snapshot = _normalize_account_snapshot(
         r[0],
         r[1],
         r[2],
         scope="broker_account",
     )
+    _repair_account_snapshot_if_needed(
+        con,
+        snapshot,
+        cash_raw=r[0],
+        equity_raw=r[1],
+        updated_ts_raw=r[2],
+        scope="broker_account",
+    )
+    return snapshot
 
 
 def _write_account(con, cash: float, equity: float, ts_ms: int, book_key: Optional[str] = None):

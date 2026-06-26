@@ -19,6 +19,7 @@ BACKUP_EVIDENCE_DIR="${TRADING_BACKUP_EVIDENCE_DIR:-${BACKUP_ROOT}/evidence}"
 ETC_DIR="${TRADING_ETC_DIR:-/etc/trading}"
 TRADING_ENV_FILE="${TRADING_ENV_FILE:-${ETC_DIR}/trading.env}"
 BACKUP_EVIDENCE_HMAC_KEY_FILE="${TRADING_BACKUP_EVIDENCE_HMAC_KEY_FILE:-${ETC_DIR}/backup_evidence.hmac.key}"
+CREDSTORE_DIR="${TRADING_CREDSTORE_DIR:-/etc/credstore.encrypted}"
 PROVIDER_ENV="${TRADING_PROVIDER_ENV:-${ETC_DIR}/provider.env}"
 SYSTEMD_DST_DIR="${TRADING_SYSTEMD_DIR:-/etc/systemd/system}"
 POSTGRES_VERSION="${TRADING_POSTGRES_VERSION:-}"
@@ -195,6 +196,23 @@ PY
   install -m 0640 -o root -g "$TRADING_GROUP" "$tmp" "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
   rm -f "$tmp"
   log "created backup evidence HMAC key: ${BACKUP_EVIDENCE_HMAC_KEY_FILE}"
+}
+
+install_backup_evidence_hmac_credential() {
+  local target
+  command -v systemd-creds >/dev/null 2>&1 || die "systemd-creds is required to install backup_evidence_hmac_key"
+  target="${CREDSTORE_DIR}/backup_evidence_hmac_key.cred"
+  install -d -o root -g root -m 0700 "$CREDSTORE_DIR"
+  if [ -f "$target" ] && [ "${TRADING_CREDSTORE_FORCE:-0}" != "1" ]; then
+    chown root:root "$target"
+    chmod 0400 "$target"
+    log "kept existing encrypted backup evidence HMAC credential: ${target}"
+    return 0
+  fi
+  systemd-creds encrypt --name=backup_evidence_hmac_key "$BACKUP_EVIDENCE_HMAC_KEY_FILE" "$target"
+  chown root:root "$target"
+  chmod 0400 "$target"
+  log "installed encrypted backup evidence HMAC credential: ${target}"
 }
 
 detect_postgres_bin_dir() {
@@ -559,7 +577,8 @@ write_runtime_env() {
   set_env_var BACKUP_EVIDENCE_RTO_S "1800"
   set_env_var BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S "120"
   set_env_var BACKUP_EVIDENCE_REQUIRE_SIGNATURE "1"
-  set_env_var BACKUP_EVIDENCE_HMAC_KEY_FILE "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+  set_env_var BACKUP_EVIDENCE_HMAC_KEY_FILE ""
+  set_env_var BACKUP_EVIDENCE_HMAC_KEY_SECRET "backup_evidence_hmac_key"
   set_env_var TS_BACKUP_EVIDENCE_LOCK_TIMEOUT_S "30"
   set_env_var TS_BACKUP_EVIDENCE_PROBE_TIMEOUT_S "5"
   set_env_var TS_BACKUP_EVIDENCE_SYSTEMCTL_TIMEOUT_S "5"
@@ -858,6 +877,7 @@ main() {
     ensure_group_membership postgres "$TRADING_GROUP"
   fi
   ensure_backup_evidence_hmac_key
+  install_backup_evidence_hmac_credential
   create_backup_layout
   grant_operator_backup_evidence_access
   install_backup_scripts

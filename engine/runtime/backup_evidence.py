@@ -253,17 +253,47 @@ def _signature_key() -> Tuple[bytes | None, str]:
         raw = str(os.environ.get(name, "") or "")
         if raw.strip():
             return raw.encode("utf-8"), f"env:{name}"
-    for name in ("BACKUP_EVIDENCE_HMAC_KEY_FILE", "BACKUP_EVIDENCE_SIGNING_KEY_FILE"):
+
+    file_envs = ("BACKUP_EVIDENCE_HMAC_KEY_FILE", "BACKUP_EVIDENCE_SIGNING_KEY_FILE")
+    secret_envs = ("BACKUP_EVIDENCE_HMAC_KEY_SECRET", "BACKUP_EVIDENCE_SIGNING_KEY_SECRET")
+    provider_secret_names = ("backup_evidence_hmac_key", "BACKUP_EVIDENCE_HMAC_KEY", "backup_evidence_signing_key")
+
+    for name in file_envs:
         raw_path = str(os.environ.get(name, "") or "").strip()
-        if not raw_path:
-            continue
+        if raw_path:
+            break
+    else:
+        raw_path = ""
+    if raw_path:
         try:
-            raw = Path(raw_path).read_text(encoding="utf-8").strip()
+            from engine.runtime.secret_sources import read_secret_text_file
+
+            result = read_secret_text_file(raw_path)
         except Exception:
             return None, f"unreadable:{name}"
-        if raw:
-            return raw.encode("utf-8"), f"file:{name}"
-        return None, f"empty:{name}"
+        if result.ok and result.value:
+            return result.value.encode("utf-8"), f"file:{name}"
+        if result.empty:
+            return None, f"empty:{name}"
+        return None, f"unreadable:{name}"
+
+    try:
+        from engine.runtime.secret_sources import read_secret_text_from_env
+
+        raw = read_secret_text_from_env(
+            "BACKUP_EVIDENCE_HMAC_KEY",
+            file_envs=file_envs,
+            secret_envs=secret_envs,
+            provider_secret_names=provider_secret_names,
+        )
+    except Exception:
+        return None, "unreadable:BACKUP_EVIDENCE_HMAC_KEY_SECRET"
+    if raw:
+        if str(os.environ.get("BACKUP_EVIDENCE_HMAC_KEY_SECRET") or "").strip():
+            return raw.encode("utf-8"), "secret:BACKUP_EVIDENCE_HMAC_KEY_SECRET"
+        if str(os.environ.get("BACKUP_EVIDENCE_SIGNING_KEY_SECRET") or "").strip():
+            return raw.encode("utf-8"), "secret:BACKUP_EVIDENCE_SIGNING_KEY_SECRET"
+        return raw.encode("utf-8"), "provider:backup_evidence_hmac_key"
     return None, "missing"
 
 

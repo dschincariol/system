@@ -954,6 +954,8 @@ Failure if malformed:
 - alert acknowledgement expiry and shelving state become ambiguous
 - incident reviewers lose actor/reason/source evidence
 
+Lifecycle rows are only valid for a parent row in `alerts`. `ack_alert(...)`, `shelve_alert(...)`, and `resolve_alert(...)` check that parent inside the write transaction and return `ok=false`, `error=not_found`, `meta.status=404` without writing lifecycle rows when the alert id is unknown. Migration `0078_alert_lifecycle_orphan_cleanup` removes legacy orphan rows from the lifecycle tables.
+
 ### `alert_acks`
 
 | Field | Type | Req | Meaning | Units |
@@ -1063,7 +1065,11 @@ Snapshot schema:
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
-| `ok` | `BOOLEAN` | Yes | Health-derived top-level status. | boolean |
+| `ok` | `BOOLEAN` | Yes | Response-envelope success for the watchdog request. Operational watchdog health is reported by `watchdogs_ok`. | boolean |
+| `error` | `TEXT/null` | Yes | `null` for a successful watchdog response; transport/request errors use a string error code. | code |
+| `watchdogs_ok` | `BOOLEAN` | Yes | Health-derived watchdog status for price freshness and stale critical jobs. | boolean |
+| `ready` | `BOOLEAN` | Yes | Alias for `watchdogs_ok` for UI readiness checks. | boolean |
+| `watchdog_reasons` | `JSON array[string]` | Yes | Reasons such as `price_feed_not_ok`, `provider_monitor_stale`, or `metrics_collector_stale`. | list |
 | `ts_ms` | `INTEGER` | Yes | Snapshot time. | ms |
 | `provider_monitor` | `JSON object` | Yes | Running/staleness state for the `provider_monitor` job. | JSON |
 | `metrics_collector` | `JSON object` | Yes | Running/staleness state for the `metrics_collector` job. | JSON |
@@ -1072,6 +1078,25 @@ Snapshot schema:
 | `ingestion_freshness` | `JSON object` | Yes | Ingestion freshness block. | JSON |
 | `job_restart_counters` | `JSON object` | Yes | Restart counters keyed by job name. | counts |
 | `job_summary` | `JSON object` | Yes | Aggregate job summary. | JSON |
+| `meta.status` | `INTEGER` | Yes | HTTP status mirrored in the JSON envelope; 200 for a successfully generated watchdog snapshot. | status |
+
+### `market_session`
+
+`GET /api/market/session` separates exchange-clock state from data availability.
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Response-envelope success for the session request. | boolean |
+| `state` | `TEXT` | Yes | Exchange-clock state, currently `OPEN` or `CLOSED`. | enum |
+| `data_ready` | `BOOLEAN` | Yes | Whether the price-read path returned at least one usable latest price row. | boolean |
+| `data_reason` | `TEXT` | Yes | `ok`, `no_price_rows`, or `price_read_error:<ExceptionType>`. | code |
+| `data_symbol` | `TEXT/null` | Yes | Optional requested symbol used for the readiness probe. | symbol |
+| `data_source` | `TEXT` | Yes | Source of the latest price row or `price_read_router` when unavailable. | source |
+| `last_price_ts_ms` | `INTEGER/null` | Yes | Timestamp of the latest readable price row. | ms |
+| `data_count` | `INTEGER` | Yes | Number of rows returned by the bounded readiness probe. | count |
+| `ts_ms` | `INTEGER` | Yes | Snapshot time. | ms |
+| `meta.status` | `INTEGER` | Yes | HTTP status mirrored in the JSON envelope. | status |
+| `meta.data_ready` | `BOOLEAN` | Yes | Copy of `data_ready` for envelope-aware clients. | boolean |
 
 Ingestion child restart-storm accounting is stored in `job_locks` with the
 reserved row-name prefix `ingestion_restart_guard/v1::`. These rows are not
@@ -1224,8 +1249,19 @@ Failure if malformed:
 
 `auth` currently contains:
 
-- `token_required`
+- `dashboard_token_configured`
+- `mutation_token_required`
+- `mutation_safe_dev_localhost_fallback_enabled`
+- `mutation_auth_model`
 - `actor_required`
+- `sensitive_read_token_required`
+- `read_open_on_loopback`
+- `read_token_required_on_loopback`
+- `read_token_required_on_lan`
+- `read_fail_closed_on_remote_bind`
+- `network_mode`
+- `strict_reasons`
+- `remote_bind_reasons`
 
 `runtime` currently contains:
 
@@ -1516,4 +1552,32 @@ Failure if malformed:
 | `series[].stress_score` | `REAL` | Yes | Historical stress score, preserving post-GDELT values above `1.0`. | stress score |
 | `thresholds.warning` | `REAL` | Yes | Same warning threshold used by badges and chart reference lines. | stress score |
 | `thresholds.critical` | `REAL` | Yes | Same critical threshold used by badges and chart reference lines. | stress score |
+| `ready` | `BOOLEAN` | Yes when `series=[]` | `false` for a reasoned empty history. | boolean |
+| `reason` | `TEXT` | Yes when `series=[]` | `prices_table_missing` when the source table is absent, or `no_market_stress_history_yet` when it is present but has no VIX history. | code |
+| `source` | `TEXT` | Yes when `series=[]` | Source table used for the history read, normally `prices`. | table |
+| `table_present` | `BOOLEAN` | Yes when `series=[]` | Distinguishes absent source table from present-but-empty source. | boolean |
+| `meta.ready` | `BOOLEAN` | Yes when `series=[]` | Mirrors top-level `ready`. | boolean |
+| `meta.reason` | `TEXT` | Yes when `series=[]` | Mirrors top-level `reason`. | code |
 | `error` | `TEXT` | No | Error detail when `ok=false`. | message |
+
+## 25. Optional Dashboard Read Empty-State Markers
+
+The dashboard read endpoints below are optional in safe/sim and may be empty
+before training, promotion, or ingestion has produced rows. When they are empty
+but the read succeeds, the response must include `ready:false`, `reason`,
+`source`, `table_present`, and matching `meta.ready` / `meta.reason` fields:
+
+| Endpoint(s) | Empty payload key | Missing-table reason | Present-empty reason |
+| --- | --- | --- | --- |
+| `/api/promotion_audit`, `/api/promotion/audit` | `data:[]`, `rows:[]`, `audit:[]` | `model_promotion_audit_table_missing` | `no_promotions_yet` |
+| `/api/governance/summary`, `/api/promotion/explain` | `audit:[]` plus `audit_meta` | `model_promotion_audit_table_missing` | `no_promotions_yet` |
+| `/api/relevance_stats`, `/api/relevance/stats` | `stats:{}` | `labels_table_missing` | `relevance_stats_no_labels_yet` |
+| `/api/strategy_metrics`, `/api/strategy/metrics` | `data:[]`, `rows:[]`, `strategies:[]` | `strategy_metrics_table_missing` | `no_strategy_metrics_yet` |
+| `/api/causal/scores` | `data:[]`, `rows:[]` | `causal_scores_table_missing` | `no_causal_scores_yet` |
+| `/api/size_policy`, `/api/strategy/size_policy` | `policy:null`, `points:[]` | `size_policy_table_missing` | `size_policy_untrained` |
+
+If a source table exists but lacks required columns, the endpoint returns an
+explicit schema reason such as `strategy_metrics_schema_incomplete`. If size
+policy rows exist but are not yet usable because supporting evidence is absent,
+the size-policy read returns `size_policy_not_ready` or
+`size_policy_points_table_missing` while keeping `policy:null`.

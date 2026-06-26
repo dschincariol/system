@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict
 
+from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect_ro, run_write_txn
 from services.credential_encryption import (
     DEFAULT_MASTER_KEY_NAME,
@@ -282,7 +283,17 @@ def _rollback_after_broker_audit_write_failure(con, exc: BaseException) -> None:
             rollback()
     except Exception:
         LOG.debug("broker_config_audit_rollback_failed", exc_info=True)
-    LOG.warning("broker_config_audit_write_failed: %s", type(exc).__name__)
+    log_failure(
+        LOG,
+        event="broker_config_audit_write_failed",
+        code="BROKER_CONFIG_AUDIT_WRITE_FAILED",
+        message="broker config audit write failed after broker connection test",
+        error=exc,
+        level=logging.WARNING,
+        component="engine.api.api_broker_config",
+        extra={"phase": "broker_test_connection_audit_write"},
+        include_health=False,
+    )
 
 
 def _stored_config() -> Dict[str, Any]:

@@ -8,6 +8,7 @@
   - Safe failure path when backend or model is unavailable
 */
 
+import { apiFetch } from "./api_client.js";
 import { buildVoiceContextSnapshot } from "./voice.js";
 
 const PERSONA_KEYS = [
@@ -306,7 +307,7 @@ async function askCopilot(question) {
   };
 
   try {
-    const res = await fetch("/api/copilot/ask", {
+    const res = await apiFetch("/api/copilot/ask", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

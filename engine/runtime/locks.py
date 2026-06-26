@@ -20,8 +20,14 @@ else:
     def _db_connect_rw_direct():
         return _storage.connect_liveness_rw_direct()
 
+    def _db_connect_runtime_ro_direct():
+        return _storage.connect_ro_direct()
+
     def _get_conn(*, readonly: bool = False):
         return _db_connect_ro_direct() if bool(readonly) else _db_connect_rw_direct()
+
+    def _get_history_conn():
+        return _db_connect_runtime_ro_direct()
 
     @contextlib.contextmanager
     def advisory_lock(name: str):
@@ -205,7 +211,7 @@ else:
 
     def read_job_history(job_name: str, limit: int = 200) -> List[Dict[str, Any]]:
         ensure_job_history()
-        con = _get_conn(readonly=True)
+        con = _get_history_conn()
         try:
             rows = con.execute(
                 """
@@ -248,5 +254,7 @@ else:
         "_ensure_job_history",
         "_db_connect_ro_direct",
         "_db_connect_rw_direct",
+        "_db_connect_runtime_ro_direct",
         "_get_conn",
+        "_get_history_conn",
     ]

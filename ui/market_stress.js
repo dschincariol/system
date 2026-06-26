@@ -590,10 +590,12 @@ export async function loadMarketStressHistory(fetchJSON) {
     const ys = series.map((p) => p.value);
     if (ys.length < 2) {
       clearMarketStressSparklineMetadata(canvas);
+      const meta = j && j.meta && typeof j.meta === "object" ? j.meta : {};
+      const reason = String((j && (j.reason || j.error)) || meta.reason || "Market stress history does not have enough points to draw.");
       renderChartAccessibility(canvas, {
         title: "Market stress history",
         series,
-        emptyMessage: "Market stress history does not have enough points to draw.",
+        emptyMessage: reason,
         valueLabel: "stress score",
         valueFormatter: (v) => Number(v).toFixed(3),
         chartType: "canvas-sparkline",

@@ -235,6 +235,17 @@ do not write broker fills, positions, order state, or execution-ledger rows. Liv
 paper-sim override orders still write the broker and execution-ledger evidence
 used by attribution, idempotency, and operator diagnostics.
 
+`broker_apply_orders.py` treats connection finalization as idempotent on the
+paper/sim path: commits are skipped when the storage wrapper is already marked
+closed, and close calls are skipped for already-closed handles. This prevents a
+primary broker-sim or policy error from being replaced by a secondary closed
+database exception. `broker_sim.py` also repairs null or blank account snapshot
+fields before sizing: null `cash` defaults to `BROKER_START_CASH`, zero/missing
+`equity` falls back to cash or `BROKER_START_EQUITY`, and the repaired snapshot is
+written back on the active transaction. Advisory-only execution analytics remain
+optional; if `execution_analytics` is not present yet, `execution_ai_advisor.py`
+falls back to `execution_fills` without warning spam.
+
 ### Broker Simulation Options
 
 `broker_sim.py` treats canonical OCC option symbols as option contracts only when

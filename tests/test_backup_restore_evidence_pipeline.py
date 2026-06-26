@@ -681,6 +681,33 @@ def test_signed_backup_evidence_verifies_with_key_file(monkeypatch, tmp_path):
     assert state["signature"]["key_source"] == "file:BACKUP_EVIDENCE_HMAC_KEY_FILE"
 
 
+def test_signed_backup_evidence_verifies_with_systemd_secret_ref(monkeypatch, tmp_path):
+    evidence_path = tmp_path / "latest_backup_restore_evidence.json"
+    cred_dir = tmp_path / "credentials"
+    cred_dir.mkdir()
+    (cred_dir / "backup_evidence_hmac_key").write_text("test-signing-key\n", encoding="utf-8")
+    evidence_path.write_text(
+        json.dumps(_sign_payload(_fresh_evidence_payload(), "test-signing-key"), separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BACKUP_EVIDENCE_PATH", str(evidence_path))
+    monkeypatch.setenv("TS_SECRETS_PROVIDER", "systemd-creds")
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(cred_dir))
+    monkeypatch.setenv("BACKUP_EVIDENCE_HMAC_KEY_SECRET", "backup_evidence_hmac_key")
+    monkeypatch.setenv("TS_CREDENTIAL_AUDIT_ENABLED", "0")
+    monkeypatch.delenv("BACKUP_EVIDENCE_HMAC_KEY", raising=False)
+    monkeypatch.delenv("BACKUP_EVIDENCE_SIGNING_KEY", raising=False)
+    monkeypatch.delenv("BACKUP_EVIDENCE_HMAC_KEY_FILE", raising=False)
+    monkeypatch.delenv("BACKUP_EVIDENCE_SIGNING_KEY_FILE", raising=False)
+
+    from engine.runtime.backup_evidence import backup_restore_evidence_snapshot
+
+    state = backup_restore_evidence_snapshot(engine_mode="live")
+    assert state["ok"] is True
+    assert state["signature"]["status"] == "verified"
+    assert state["signature"]["key_source"] == "secret:BACKUP_EVIDENCE_HMAC_KEY_SECRET"
+
+
 def test_signed_backup_evidence_reports_unreadable_key(monkeypatch, tmp_path):
     evidence_path = tmp_path / "latest_backup_restore_evidence.json"
     evidence_path.write_text(

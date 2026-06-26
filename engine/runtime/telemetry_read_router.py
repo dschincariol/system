@@ -18,6 +18,10 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.pg_connection_hygiene import (
+    rollback_if_in_transaction,
+    transaction_status_name,
+)
 from engine.runtime.state_cache import cache_get_or_load
 from engine.runtime.storage import connect_ro
 from engine.runtime.data_source_log_store import data_source_log_detail_from_json
@@ -152,6 +156,25 @@ def _warn_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
     )
 
 
+def _check_timescale_read_connection(con: Any) -> None:
+    rollback_if_in_transaction(
+        con,
+        logger=LOG,
+        context="telemetry_read_pool_check",
+    )
+    check_connection = getattr(ConnectionPool, "check_connection", None)
+    if callable(check_connection):
+        check_connection(con)
+
+
+def _reset_timescale_read_connection(con: Any) -> None:
+    rollback_if_in_transaction(
+        con,
+        logger=LOG,
+        context="telemetry_read_pool_reset",
+    )
+
+
 def _sqlite_table_exists(con: Any, name: str) -> bool:
     row = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
@@ -256,6 +279,8 @@ def _get_timescale_read_pool(config: TimescaleConfig) -> Any:
                 "connect_timeout": int(max(1, round(float(config.connect_timeout_s)))),
                 "application_name": _pool_application_name(config),
             },
+            check=_check_timescale_read_connection,
+            reset=_reset_timescale_read_connection,
             open=False,
         )
         try:
@@ -292,16 +317,35 @@ def _timescale_connection():
     con = pool.getconn(timeout=float(config.connect_timeout_s))
     discard = False
     try:
+        rollback_if_in_transaction(
+            con,
+            logger=LOG,
+            context="telemetry_read_acquire",
+        )
         _prepare_timescale_connection(con, config)
         yield con, str(config.schema_name or "public")
-    except Exception:
+    except Exception as exc:
         discard = True
+        _warn_nonfatal(
+            "TELEMETRY_READ_ROUTER_TIMESCALE_CONNECTION_FAILED",
+            exc,
+            transaction_status=transaction_status_name(con),
+        )
         try:
             con.rollback()
         except Exception as exc:
             _warn_nonfatal("TELEMETRY_READ_ROUTER_ROLLBACK_FAILED", exc)
         raise
     finally:
+        if not discard:
+            try:
+                rollback_if_in_transaction(
+                    con,
+                    logger=LOG,
+                    context="telemetry_read_release",
+                )
+            except Exception:
+                discard = True
         if discard:
             try:
                 con.close()

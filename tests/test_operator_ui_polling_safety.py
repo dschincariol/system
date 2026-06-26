@@ -69,4 +69,10 @@ def test_operator_ui_supports_dashboard_origin_bridge():
     assert "function operatorBridgeUrl(url)" in text
     assert "fetch(operatorBridgeUrl(url), init)" in text
     assert "function operatorTelemetryWsUrl()" in text
+    assert "function operatorTelemetryWsProtocols()" in text
+    assert "function openOperatorTelemetrySocket(url)" in text
+    assert "Sec-WebSocket-Protocol" in text
+    assert "operator-token." in text
+    assert "operatorTelemetryWsHost()" in text
     assert 'direct.pathname = "/ws/operator";' in text
+    assert "new WebSocket(url, protocols)" in text

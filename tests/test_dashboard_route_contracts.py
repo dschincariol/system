@@ -881,6 +881,7 @@ def test_route_specs_integrity(monkeypatch: pytest.MonkeyPatch):
     (dashboard_server,) = _reload_modules("dashboard_server")
     route_specs = list(dashboard_server.ROUTE_SPECS)
     api_handlers = dict(dashboard_server.API_HANDLERS)
+    raw_route_specs = dashboard_server._normalize_route_specs(dashboard_server._RAW_ROUTE_SPECS)
 
     route_keys = [(str(route["method"]), str(route["path"])) for route in route_specs]
     duplicates = [key for key, count in Counter(route_keys).items() if count > 1]
@@ -896,6 +897,334 @@ def test_route_specs_integrity(monkeypatch: pytest.MonkeyPatch):
         if str(route["handler"]) not in api_handlers or not callable(api_handlers.get(str(route["handler"])))
     ]
     assert missing_handlers == [], f"route handlers missing from API_HANDLERS: {missing_handlers}"
+
+    raw_missing_handlers = [
+        {
+            "method": str(route["method"]),
+            "path": str(route["path"]),
+            "handler": str(route["handler"]),
+        }
+        for route in raw_route_specs
+        if str(route["handler"]) not in api_handlers or not callable(api_handlers.get(str(route["handler"])))
+    ]
+    assert raw_missing_handlers == [], (
+        "advertised route handlers missing from API_HANDLERS before filtering: "
+        f"{raw_missing_handlers}"
+    )
+
+
+def test_operator_snake_case_aliases_resolve_with_compatibility_routes(route_runtime):
+    dashboard_server = route_runtime["dashboard_server"]
+    route_index = _route_index(dashboard_server)
+
+    expected_aliases = [
+        (
+            ("GET", "/api/operator/bootstrap_status"),
+            ("GET", "/api/operator/bootstrapStatus"),
+            "api_get_operator_bootstrap_status",
+        ),
+        (
+            ("GET", "/api/operator/institutional_check"),
+            ("GET", "/api/operator/institutionalCheck"),
+            "api_get_operator_institutional_check",
+        ),
+        (
+            ("POST", "/api/operator/clear_last_error"),
+            ("POST", "/api/operator/clearLastError"),
+            "api_post_operator_clear_last_error",
+        ),
+    ]
+
+    for canonical_key, compatibility_key, expected_handler in expected_aliases:
+        assert canonical_key in route_index
+        assert compatibility_key in route_index
+        assert route_index[canonical_key]["handler"] == expected_handler
+        assert route_index[compatibility_key]["handler"] == expected_handler
+
+    class _FakeJob:
+        last_error = "operator failure"
+
+    class _JobsWithError:
+        def __init__(self) -> None:
+            self.name = "operator_clear_error_contract"
+            self.job = _FakeJob()
+
+        def list_jobs(self):
+            return [{"name": self.name}]
+
+        def get(self, name: str):
+            return self.job if str(name) == self.name else None
+
+    fake_jobs = _JobsWithError()
+    route_runtime["ctx"]["JOBS"] = fake_jobs
+
+    for path in ("/api/operator/clear_last_error", "/api/operator/clearLastError"):
+        fake_jobs.job.last_error = "operator failure"
+        response = _invoke_route(route_runtime, method="POST", path=path)
+        assert response["ok"] is True
+        assert f"job:{fake_jobs.name}" in response["cleared"]
+        assert fake_jobs.job.last_error is None
+
+    http_transport = importlib.reload(importlib.import_module("engine.api.http_transport"))
+    canonical_spec = http_transport._route_mutation_spec("/api/operator/clear_last_error", {})
+    compatibility_spec = http_transport._route_mutation_spec("/api/operator/clearLastError", {})
+    assert canonical_spec == compatibility_spec == {
+        "action_id": "operator.clear_last_error",
+        "severity": "low",
+        "consequence": "Clears displayed operator error state.",
+    }
+
+
+def test_data_source_credential_entry_routes_resolve_to_real_handlers(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TIMESCALE_ENABLED", "0")
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("TIMESCALE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
+    monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
+    data_sources_routes, dashboard_server = _reload_modules("routes.data_sources_routes", "dashboard_server")
+
+    expected = {
+        ("POST", "/api/data_sources/update"): "api_post_data_source_update",
+        ("POST", "/api/data_sources/test"): "api_post_data_source_test",
+        ("POST", "/api/data_sources/test_save"): "api_post_data_source_test_save",
+        ("POST", "/api/data_sources/populate_now"): "api_post_data_source_populate_now",
+        ("POST", "/api/data_sources/accounts/update"): "api_post_data_source_account_update",
+    }
+    route_index = _route_index(dashboard_server)
+
+    for route_key, handler_name in expected.items():
+        assert route_index[route_key]["handler"] == handler_name
+        assert dashboard_server.API_HANDLERS[handler_name] is getattr(data_sources_routes, handler_name)
+
+
+def test_data_source_credential_entry_routes_dispatch_real_payloads(
+    route_runtime,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from engine.api import http_transport
+    from routes import data_sources_routes
+
+    dashboard_server = route_runtime["dashboard_server"]
+    token = "test-dashboard-token-1234567890"
+    paths = {
+        "/api/data_sources/update",
+        "/api/data_sources/test",
+        "/api/data_sources/test_save",
+        "/api/data_sources/populate_now",
+        "/api/data_sources/accounts/update",
+    }
+    route_specs = [route for route in dashboard_server.ROUTE_SPECS if route.get("path") in paths]
+    assert {route.get("path") for route in route_specs} == paths
+
+    class _FakeManager:
+        def update_source(self, body):
+            return {"source_key": str(body.get("source_key") or ""), "updated": True}
+
+        def test_connection(self, source_key, *, actor="operator", client_ip=""):
+            return {
+                "ok": True,
+                "status": "pass",
+                "source_key": source_key,
+                "actor": actor,
+                "client_ip": client_ip,
+                "message": "fake connectivity test",
+            }
+
+        def test_and_save_source(self, body, *, actor="operator", client_ip=""):
+            return {
+                "ok": True,
+                "saved": True,
+                "source_key": str(body.get("source_key") or ""),
+                "actor": actor,
+                "client_ip": client_ip,
+                "test": {"ok": True, "status": "pass", "message": "fake test-and-save"},
+            }
+
+        def populate_now(self, source_key, *, actor="operator", client_ip=""):
+            return {
+                "ok": True,
+                "source_key": source_key,
+                "actor": actor,
+                "client_ip": client_ip,
+                "populate_evidence": {
+                    "contract_status": "pass",
+                    "storage_table": "fake_data_source_populate_evidence",
+                },
+            }
+
+        def update_provider_account(self, body):
+            return {"account_key": str(body.get("account_key") or ""), "updated": True}
+
+        def manage_lifecycle(self, *, reason, jobs_manager=None):
+            return {"ok": True, "reason": reason, "jobs_manager_present": jobs_manager is not None}
+
+    monkeypatch.setattr(data_sources_routes, "get_manager", lambda: _FakeManager())
+    monkeypatch.setattr(http_transport, "emit_counter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(http_transport, "emit_timing", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(http_transport, "deny_if_shutdown", lambda: None)
+    monkeypatch.setattr(http_transport, "_append_mutation_audit_event", lambda _payload: None)
+
+    handler_cls = http_transport.build_handler(
+        route_specs,
+        dashboard_server.API_HANDLERS,
+        token,
+        ctx=route_runtime["ctx"],
+        static_dir=str(tmp_path),
+    )
+    httpd = http_transport.run_http_server("127.0.0.1", 0, handler_cls)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    def _post(path: str, body: dict) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "X-API-Token": token},
+        )
+        with urllib.request.urlopen(request, timeout=2.0) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+
+    try:
+        update_status, update_payload = _post(
+            "/api/data_sources/update",
+            {"source_key": "codex_fake_source", "actor": "unit-test"},
+        )
+        test_status, test_payload = _post(
+            "/api/data_sources/test",
+            {"source_key": "codex_fake_source", "actor": "unit-test"},
+        )
+        test_save_status, test_save_payload = _post(
+            "/api/data_sources/test_save",
+            {"source_key": "codex_fake_source", "actor": "unit-test", "create": False},
+        )
+        populate_status, populate_payload = _post(
+            "/api/data_sources/populate_now",
+            {"source_key": "codex_fake_source", "actor": "unit-test"},
+        )
+        account_status, account_payload = _post(
+            "/api/data_sources/accounts/update",
+            {"account_key": "codex_fake_account", "actor": "unit-test"},
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2.0)
+
+    assert update_status == 200
+    assert update_payload["ok"] is True
+    assert update_payload["source"]["updated"] is True
+    assert test_status == 200
+    assert test_payload["ok"] is True
+    assert test_payload["status"] == "pass"
+    assert test_save_status == 200
+    assert test_save_payload["saved"] is True
+    assert test_save_payload["test"]["status"] == "pass"
+    assert populate_status == 200
+    assert populate_payload["populate_evidence"]["contract_status"] == "pass"
+    assert account_status == 200
+    assert account_payload["provider_account"]["updated"] is True
+    for payload in (update_payload, test_payload, test_save_payload, populate_payload, account_payload):
+        assert payload.get("error") != "unknown_endpoint"
+
+
+def test_data_source_builtin_delete_policy_refusal_is_403_and_preserves_source(
+    route_runtime,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from engine.api import http_transport
+    from routes import data_sources_routes
+
+    token = "test-dashboard-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+    monkeypatch.setattr(http_transport, "emit_counter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(http_transport, "emit_timing", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(http_transport, "deny_if_shutdown", lambda: None)
+    monkeypatch.setattr(http_transport, "_append_mutation_audit_event", lambda _payload: None)
+
+    manager = data_sources_routes.get_manager()
+    before_sources = manager.list_sources()
+    builtin = next(source for source in before_sources if bool(source.get("builtin")))
+    source_key = str(builtin.get("source_key") or "")
+    before_count = len(before_sources)
+
+    handler_cls = http_transport.build_handler(
+        [("POST", "/api/data_sources/delete", "api_post_data_source_delete")],
+        {"api_post_data_source_delete": data_sources_routes.api_post_data_source_delete},
+        token,
+        ctx=route_runtime["ctx"],
+        static_dir=str(tmp_path),
+    )
+    httpd = http_transport.run_http_server("127.0.0.1", 0, handler_cls)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{httpd.server_address[1]}/api/data_sources/delete",
+        data=json.dumps({
+            "source_key": source_key,
+            "confirmation": "DELETE_SOURCE",
+            "confirm": "DELETE_SOURCE",
+            "consequence_ack": True,
+            "actor": "unit-test",
+            "source": "pytest",
+            "action_id": "data_sources.delete",
+        }).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "X-API-Token": token},
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=2.0)
+        payload = json.loads(raised.value.read().decode("utf-8"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2.0)
+
+    after_sources = manager.list_sources()
+    assert raised.value.code == 403
+    assert payload["ok"] is False
+    assert payload["error"] == f"builtin_source_delete_not_allowed:{source_key}"
+    assert payload["http_status"] == 403
+    assert payload["meta"]["status"] == 403
+    assert manager.get_source(source_key) is not None
+    assert len(after_sources) == before_count
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "path"),
+    [
+        ("api_post_data_source_test_save", "/api/data_sources/test_save"),
+        ("api_post_data_source_populate_now", "/api/data_sources/populate_now"),
+    ],
+)
+def test_route_filter_fails_loud_when_data_source_handler_entry_is_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    handler_name: str,
+    path: str,
+):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TIMESCALE_ENABLED", "0")
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("TIMESCALE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
+    monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
+    (dashboard_server,) = _reload_modules("dashboard_server")
+
+    handlers = dict(dashboard_server.API_HANDLERS)
+    handlers.pop(handler_name)
+
+    with pytest.raises(RuntimeError, match="route_handler_registration_failed") as exc_info:
+        dashboard_server._filter_route_specs_for_handlers(
+            dashboard_server._normalize_route_specs(dashboard_server._RAW_ROUTE_SPECS),
+            handlers,
+        )
+    assert path in str(exc_info.value)
 
 
 def test_market_stress_api_returns_threshold_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1629,7 +1958,9 @@ def test_runtime_watchdogs_health_cache_miss_does_not_sync_refresh(route_runtime
     response = api_system.api_get_runtime_watchdogs({}, route_runtime["ctx"])
 
     assert calls == [False]
-    assert response["ok"] is False
+    assert response["ok"] is True
+    assert response["watchdogs_ok"] is False
+    assert "price_feed_not_ok" in response["watchdog_reasons"]
     assert response["pipeline_watchdog_state"]["ingestion_runtime"]["running"] is True
 
 

@@ -1,9 +1,13 @@
 "use strict";
 
+import { fetchJSON as sharedFetchJSON } from "./api_client.js";
+import { normalizeAlert, normalizeAlertsPayload, severityRank } from "./alerts.js";
+
 const ROOT_ID = "dashboardCommandPaletteRoot";
 const STYLE_ID = "dashboardCommandPaletteStyle";
 const DATA_TTL_MS = 15000;
 const DEFAULT_LIMIT = 14;
+const MAX_DYNAMIC_ROWS = 60;
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];
@@ -166,14 +170,40 @@ function normalizeJobRows(payload) {
   return Array.isArray(root.jobs) ? root.jobs : [];
 }
 
+export function normalizeDecisionRows(payload) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const rows = Array.isArray(payload)
+    ? payload
+    : (Array.isArray(root.decisions)
+      ? root.decisions
+      : (Array.isArray(root.rows)
+        ? root.rows
+        : (Array.isArray(root.items) ? root.items : [])));
+  return rows
+    .filter((row) => row && typeof row === "object")
+    .slice(0, MAX_DYNAMIC_ROWS);
+}
+
+export function normalizeDataSourceRows(payload) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const rows = Array.isArray(payload)
+    ? payload
+    : (Array.isArray(root.sources)
+      ? root.sources
+      : (Array.isArray(root.rows)
+        ? root.rows
+        : (Array.isArray(root.items) ? root.items : [])));
+  return rows
+    .filter((row) => row && typeof row === "object")
+    .slice(0, MAX_DYNAMIC_ROWS);
+}
+
+function normalizeAlertRows(payload) {
+  return normalizeAlertsPayload(payload).slice(0, MAX_DYNAMIC_ROWS);
+}
+
 async function defaultFetchJSON(path) {
-  const res = await fetch(path, { cache: "no-store" });
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
-  if (!res.ok) {
-    throw new Error((data && data.error) || `${res.status} ${res.statusText}`);
-  }
-  return data;
+  return sharedFetchJSON(path);
 }
 
 function ensureStyles(doc) {
@@ -339,7 +369,8 @@ function createShell(doc) {
           role="combobox"
           aria-expanded="true"
           aria-controls="dashboardCommandPaletteList"
-          placeholder="Search screens, panels, symbols, models, jobs, or decision ID"
+          aria-autocomplete="list"
+          placeholder="Search screens, panels, symbols, decisions, jobs, alerts, or data sources"
         />
         <button class="btn btnSmall" id="dashboardCommandPaletteClose" type="button">Close</button>
       </div>
@@ -361,20 +392,107 @@ function getVisibleScreenTargets(doc) {
   return targets;
 }
 
-function buildStaticItems(doc, options) {
+function screenDefinitionsFromOptions(labels = {}, definitions = []) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of asArray(definitions)) {
+    const key = cleanLabel(raw && raw.key).toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      key,
+      label: cleanLabel(raw.label) || labels[key] || capitalize(key),
+      aliases: asArray(raw.aliases),
+      keywords: asArray(raw.keywords),
+    });
+  }
+  for (const key of Object.keys(labels || {})) {
+    const normalized = cleanLabel(key).toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push({
+      key: normalized,
+      label: labels[normalized] || capitalize(normalized),
+      aliases: [],
+      keywords: [],
+    });
+  }
+  return out;
+}
+
+function palettePersonaLabel(options) {
+  if (typeof options.getPersonaLabel === "function") {
+    return cleanLabel(options.getPersonaLabel());
+  }
+  return cleanLabel(options.personaLabel || "current persona");
+}
+
+function isScreenAllowedForPalette(screen, visibleScreens, options) {
+  if (typeof options.isScreenAllowed === "function") return !!options.isScreenAllowed(screen);
+  return !visibleScreens.size || visibleScreens.has(screen);
+}
+
+function isPanelAllowedForPalette(screen, panelId, options) {
+  if (typeof options.isPanelAllowed === "function") return !!options.isPanelAllowed(screen, panelId);
+  return true;
+}
+
+function buildDomNavigationItems(doc, options) {
+  const items = [];
+  doc.querySelectorAll("[data-command-palette]").forEach((el) => {
+    const id = cleanLabel(el.id || el.getAttribute("data-command-id") || "");
+    const label = cleanLabel(
+      el.getAttribute("data-command-title") ||
+      el.getAttribute("aria-label") ||
+      el.title ||
+      el.textContent
+    );
+    if (!id || !label) return;
+    const type = cleanLabel(el.getAttribute("data-command-type") || "Navigation");
+    const context = cleanLabel(el.getAttribute("data-command-context") || el.title || "");
+    const href = cleanLabel(el.href || el.getAttribute("href") || "");
+    const action = cleanLabel(el.getAttribute("data-command-action") || (href ? "navigate" : "click"));
+    const keywords = cleanLabel(el.getAttribute("data-command-keywords") || "")
+      .split(/\s+/)
+      .filter(Boolean);
+    items.push({
+      id: commandId("nav", id),
+      title: label,
+      subtitle: [context, href ? new URL(href, "http://dashboard.local").pathname : ""].filter(Boolean).join(" / "),
+      badge: type,
+      keywords: [label, context, href, action, ...keywords],
+      priority: 75,
+      run: () => {
+        if (typeof options.activateNavigationTarget === "function") {
+          return options.activateNavigationTarget({ element: el, href, action, id });
+        }
+        if (action === "click" && typeof el.click === "function") return el.click();
+        if (href && typeof window !== "undefined") window.location.href = href;
+        return undefined;
+      },
+    });
+  });
+  return items;
+}
+
+export function buildStaticCommandItems(doc, options = {}) {
   const items = [];
   const labels = options.screenLabels || {};
-  const allowedScreens = getVisibleScreenTargets(doc);
-  const screenSet = new Set(allowedScreens.length ? allowedScreens : Object.keys(labels));
+  const visibleScreenSet = new Set(getVisibleScreenTargets(doc));
+  const screenDefinitions = screenDefinitionsFromOptions(labels, options.screenDefinitions);
+  const allScreenKeys = new Set(screenDefinitions.map((screen) => screen.key));
+  const personaLabel = palettePersonaLabel(options);
 
-  for (const screen of screenSet) {
-    const label = labels[screen] || capitalize(screen);
+  for (const screenDef of screenDefinitions) {
+    const screen = screenDef.key;
+    const label = screenDef.label || labels[screen] || capitalize(screen);
+    const allowed = isScreenAllowedForPalette(screen, visibleScreenSet, options);
     items.push({
       id: commandId("screen", screen),
       title: `Go to ${label}`,
-      subtitle: "Dashboard screen",
+      subtitle: allowed ? "Dashboard screen" : `Dashboard screen / Hidden in ${personaLabel}`,
       badge: "Screen",
-      keywords: [screen, label, "tab", "navigate"],
+      keywords: [screen, label, "tab", "navigate", ...screenDef.aliases, ...screenDef.keywords, allowed ? "visible" : "restricted"],
       priority: 80,
       run: () => options.navigateToScreen && options.navigateToScreen(screen),
     });
@@ -385,29 +503,36 @@ function buildStaticItems(doc, options) {
       .split(",")
       .map((part) => cleanLabel(part).toLowerCase())
       .filter(Boolean)
-      .filter((screen) => !screenSet.size || screenSet.has(screen));
+      .filter((screen) => !allScreenKeys.size || allScreenKeys.has(screen));
     if (!screens.length) return;
     const heading = el.querySelector("h2,h3,.card-header,.drawerTitle,.copilotTitle");
     const label = stripIconText(heading ? heading.textContent : el.id);
     if (!label) return;
-    const preferred = screens.includes(String(options.getActiveScreen && options.getActiveScreen() || "").toLowerCase())
-      ? String(options.getActiveScreen()).toLowerCase()
-      : screens[0];
+    const activeScreen = String(options.getActiveScreen && options.getActiveScreen() || "").toLowerCase();
+    const preferred = screens.includes(activeScreen)
+      ? activeScreen
+      : (screens.find((screen) => isScreenAllowedForPalette(screen, visibleScreenSet, options)) || screens[0]);
+    const allowed = isScreenAllowedForPalette(preferred, visibleScreenSet, options)
+      && isPanelAllowedForPalette(preferred, el.id, options);
     items.push({
       id: commandId("panel", el.id),
       title: `Open ${label}`,
-      subtitle: `${labels[preferred] || capitalize(preferred)} panel`,
+      subtitle: [
+        `${labels[preferred] || capitalize(preferred)} panel`,
+        allowed ? "" : `Hidden in ${personaLabel}`,
+      ].filter(Boolean).join(" / "),
       badge: "Panel",
-      keywords: [el.id, label, ...screens],
+      keywords: [el.id, label, ...screens, allowed ? "visible" : "restricted"],
       priority: 60,
       run: () => options.navigateToPanel && options.navigateToPanel(preferred, el.id),
     });
   });
 
+  items.push(...buildDomNavigationItems(doc, options));
   return items;
 }
 
-function buildJobItems(doc, jobs, options) {
+export function buildJobItems(doc, jobs, options = {}) {
   void doc;
   const items = [];
   for (const row of asArray(jobs)) {
@@ -451,19 +576,20 @@ function buildJobItems(doc, jobs, options) {
   return items;
 }
 
-function buildSymbolItems(symbols, options) {
+export function buildSymbolItems(symbols, options = {}) {
   const seen = new Set();
   const items = [];
   for (const raw of asArray(symbols)) {
     const symbol = cleanLabel(typeof raw === "string" ? raw : (raw && (raw.symbol || raw.ticker || raw.name))).toUpperCase();
     if (!symbol || seen.has(symbol)) continue;
     seen.add(symbol);
+    const status = typeof raw === "object" ? cleanLabel(raw.status || raw.state || raw.asset_class || raw.exchange) : "";
     items.push({
       id: commandId("symbol", symbol),
       title: `Focus symbol ${symbol}`,
-      subtitle: "Applies the dashboard symbol filter",
+      subtitle: ["Applies the dashboard symbol filter", status].filter(Boolean).join(" / "),
       badge: "Symbol",
-      keywords: [symbol, "ticker", "watchlist"],
+      keywords: [symbol, "ticker", "watchlist", status],
       priority: 45,
       run: () => options.focusSymbol && options.focusSymbol(symbol),
     });
@@ -471,7 +597,7 @@ function buildSymbolItems(symbols, options) {
   return items;
 }
 
-function buildModelItems(rows, options) {
+export function buildModelItems(rows, options = {}) {
   const seen = new Set();
   const items = [];
   for (const row of asArray(rows)) {
@@ -491,6 +617,84 @@ function buildModelItems(rows, options) {
       keywords: [stage, modelName, kind, "registry", "champion", "challenger"],
       priority: 40,
       run: () => options.focusModel && options.focusModel({ row, stage, modelName, kind, label }),
+    });
+  }
+  return items;
+}
+
+export function buildDecisionItems(rows, options = {}) {
+  const seen = new Set();
+  const items = [];
+  for (const row of normalizeDecisionRows(rows)) {
+    const id = cleanLabel(row.id || row.decision_id || row.event_id || row.prediction_id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const symbol = cleanLabel(row.symbol || row.ticker).toUpperCase();
+    const action = cleanLabel(row.action || row.side || row.decision || row.intent);
+    const confidence = Number(row.certainty ?? row.confidence ?? row.confidence_raw);
+    const status = cleanLabel(row.status || row.risk_impact || row.outcome || row.stage);
+    const confText = Number.isFinite(confidence) ? `${Math.round(confidence * 100)}% confidence` : "";
+    items.push({
+      id: commandId("decision-row", id),
+      title: `Open decision ${id}`,
+      subtitle: [symbol || "SYSTEM", action, confText, status].filter(Boolean).join(" / "),
+      badge: "Decision",
+      keywords: [id, symbol, action, status, row.why, row.reason, "decision", "drilldown"],
+      priority: 52,
+      run: () => options.openDecision && options.openDecision(id),
+    });
+  }
+  return items;
+}
+
+export function buildAlertItems(rows, options = {}) {
+  const seen = new Set();
+  const items = [];
+  const alerts = normalizeAlertRows(rows).sort((a, b) => {
+    const rankDelta = severityRank(b.severity) - severityRank(a.severity);
+    if (rankDelta !== 0) return rankDelta;
+    return Number(b.ts_ms || b.ts || 0) - Number(a.ts_ms || a.ts || 0);
+  });
+  for (const alert of alerts) {
+    const row = normalizeAlert(alert);
+    const id = cleanLabel(row && row.id);
+    if (!row || !id || seen.has(id)) continue;
+    seen.add(id);
+    const symbol = cleanLabel(row.symbol || "SYSTEM").toUpperCase();
+    const status = cleanLabel(row.status || (row.resolved ? "resolved" : "active"));
+    const message = cleanLabel(row.message || row.event_title || row.reason || "Alert");
+    items.push({
+      id: commandId("alert", id),
+      title: `Open alert ${symbol}`,
+      subtitle: [row.severity, status, message].filter(Boolean).join(" / "),
+      badge: "Alert",
+      keywords: [id, symbol, row.severity, status, message, row.rule_id, "incident", "alert"],
+      priority: 48 + severityRank(row.severity),
+      run: () => options.openAlert && options.openAlert(row),
+    });
+  }
+  return items;
+}
+
+export function buildDataSourceItems(rows, options = {}) {
+  const seen = new Set();
+  const items = [];
+  for (const row of normalizeDataSourceRows(rows)) {
+    const key = cleanLabel(row.source_key || row.key || row.id || row.name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const label = cleanLabel(row.display_name || row.name || key);
+    const provider = cleanLabel(row.provider_name || row.provider || row.source_type || row.type);
+    const enabled = row.enabled === true ? "enabled" : (row.enabled === false ? "disabled" : "");
+    const status = cleanLabel(row.runnable_state || row.status || row.operator_status || row.health_state);
+    items.push({
+      id: commandId("data-source", key),
+      title: `Open data source ${label}`,
+      subtitle: [key, provider, enabled, status].filter(Boolean).join(" / "),
+      badge: "Data",
+      keywords: [key, label, provider, enabled, status, row.job_name, "source", "provider", "feed", "ingestion"],
+      priority: 46,
+      run: () => options.openDataSource && options.openDataSource(key),
     });
   }
   return items;
@@ -533,6 +737,7 @@ export function initCommandPalette(options = {}) {
     errors: [],
     loadedAt: 0,
     loadToken: 0,
+    previousFocus: null,
   };
 
   function setStatus(text, isError = false) {
@@ -542,6 +747,7 @@ export function initCommandPalette(options = {}) {
 
   function renderStateRow(text, isError = false) {
     list.innerHTML = "";
+    input.removeAttribute("aria-activedescendant");
     const row = doc.createElement("div");
     row.className = `commandPaletteState${isError ? " is-error" : ""}`;
     row.textContent = text;
@@ -556,12 +762,13 @@ export function initCommandPalette(options = {}) {
     state.results = results;
     if (state.activeIndex >= results.length) state.activeIndex = Math.max(0, results.length - 1);
 
+    const resultText = `${results.length} result${results.length === 1 ? "" : "s"}`;
     if (state.loading) {
-      setStatus("Loading dynamic commands...");
+      setStatus(`Loading dynamic commands... ${resultText} available.`);
     } else if (state.errors.length) {
-      setStatus(`Some command sources are unavailable: ${state.errors.join(", ")}`, true);
+      setStatus(`Some command sources are unavailable: ${state.errors.join(", ")}. ${resultText} available.`, true);
     } else {
-      setStatus(results.length ? `${results.length} command${results.length === 1 ? "" : "s"}` : "");
+      setStatus(results.length ? `${resultText}. Use up and down arrows to choose.` : "0 results.");
     }
 
     if (!results.length) {
@@ -578,10 +785,15 @@ export function initCommandPalette(options = {}) {
     list.innerHTML = "";
     results.forEach((item, index) => {
       const button = doc.createElement("button");
+      const optionId = `dashboardCommandPaletteOption${index}`;
+      button.id = optionId;
       button.type = "button";
       button.className = `commandPaletteItem${index === state.activeIndex ? " is-active" : ""}`;
       button.setAttribute("role", "option");
       button.setAttribute("aria-selected", index === state.activeIndex ? "true" : "false");
+      if (index === state.activeIndex) {
+        input.setAttribute("aria-activedescendant", optionId);
+      }
       button.dataset.index = String(index);
       const badgeClass = item.confirm ? "commandPaletteBadge is-confirm" : "commandPaletteBadge";
       button.innerHTML = `
@@ -595,6 +807,7 @@ export function initCommandPalette(options = {}) {
       button.querySelector(".commandPaletteItemSubtitle").textContent = item.subtitle || "";
       button.querySelector(".commandPaletteBadge").textContent = item.badge || "";
       button.addEventListener("mouseenter", () => {
+        if (state.activeIndex === index) return;
         state.activeIndex = index;
         render();
       });
@@ -617,10 +830,13 @@ export function initCommandPalette(options = {}) {
 
     const nextItems = [];
     const errors = [];
-    const [jobsResult, symbolsResult, modelsResult] = await Promise.allSettled([
+    const [jobsResult, symbolsResult, modelsResult, decisionsResult, alertsResult, dataSourcesResult] = await Promise.allSettled([
       fetchJSON("/api/jobs"),
       fetchJSON("/api/terminal/watchlist"),
       fetchJSON("/api/model/registry?limit=25"),
+      fetchJSON("/api/ui/decisions?limit=40"),
+      fetchJSON("/api/alerts/timeline?limit=50"),
+      fetchJSON("/api/data_sources"),
     ]);
     if (token !== state.loadToken) return;
 
@@ -639,6 +855,21 @@ export function initCommandPalette(options = {}) {
     } else {
       errors.push("models");
     }
+    if (decisionsResult.status === "fulfilled") {
+      nextItems.push(...buildDecisionItems(decisionsResult.value, options));
+    } else {
+      errors.push("decisions");
+    }
+    if (alertsResult.status === "fulfilled") {
+      nextItems.push(...buildAlertItems(alertsResult.value, options));
+    } else {
+      errors.push("alerts");
+    }
+    if (dataSourcesResult.status === "fulfilled") {
+      nextItems.push(...buildDataSourceItems(dataSourcesResult.value, options));
+    } else {
+      errors.push("data sources");
+    }
 
     state.dynamicItems = nextItems;
     state.errors = errors;
@@ -648,26 +879,36 @@ export function initCommandPalette(options = {}) {
   }
 
   function open() {
-    state.staticItems = buildStaticItems(doc, options);
+    state.staticItems = buildStaticCommandItems(doc, options);
     state.activeIndex = 0;
+    state.previousFocus = doc.activeElement && doc.activeElement !== input ? doc.activeElement : null;
     state.open = true;
     root.classList.add("is-open");
     root.removeAttribute("hidden");
     root.setAttribute("aria-hidden", "false");
+    input.setAttribute("aria-expanded", "true");
     input.value = "";
     render();
     setTimeout(() => {
       input.focus();
       input.select();
     }, 0);
-    void loadDynamic(false);
+    if (options.enableDynamic !== false) void loadDynamic(false);
   }
 
-  function close() {
+  function close({ restoreFocus = true } = {}) {
     state.open = false;
     root.classList.remove("is-open");
     root.setAttribute("hidden", "");
     root.setAttribute("aria-hidden", "true");
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+    if (restoreFocus && state.previousFocus && typeof state.previousFocus.focus === "function") {
+      try {
+        state.previousFocus.focus({ preventScroll: true });
+      } catch {}
+    }
+    state.previousFocus = null;
   }
 
   function toggle() {
@@ -678,7 +919,7 @@ export function initCommandPalette(options = {}) {
   async function executeActive() {
     const item = state.results[state.activeIndex];
     if (!item || typeof item.run !== "function") return;
-    close();
+    close({ restoreFocus: false });
     try {
       await item.run();
     } catch (error) {

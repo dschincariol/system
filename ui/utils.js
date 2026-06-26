@@ -250,6 +250,67 @@ export function withStatusGlyph(text, tone) {
   return `${token.glyph} ${label}`;
 }
 
+function cleanPrimitiveText(value, fallback = "-") {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text || fallback;
+}
+
+function primitiveClassList(...parts) {
+  return parts
+    .flatMap((part) => String(part || "").split(/\s+/))
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+export function statusPillHtml(label, tone = "neutral", {
+  className = "",
+  id = "",
+  mono = false,
+  title = "",
+} = {}) {
+  const token = statusToken(tone);
+  const text = cleanPrimitiveText(label);
+  const classes = primitiveClassList("pill", token.className, mono ? "mono" : "", className);
+  return `<span${id ? ` id="${escapeHTML(id)}"` : ""} class="${escapeHTML(classes)}" data-status="${escapeHTML(token.key)}" aria-label="${escapeHTML(statusAriaLabel(token.key, text))}"${title ? ` title="${escapeHTML(title)}"` : ""}>${escapeHTML(text)}</span>`;
+}
+
+export function kpiTileHtml({
+  label,
+  value,
+  meta,
+  tone = "neutral",
+  className = "",
+  valueClassName = "",
+} = {}) {
+  const token = statusToken(tone);
+  const safeLabel = cleanPrimitiveText(label);
+  const safeValue = cleanPrimitiveText(value);
+  const safeMeta = cleanPrimitiveText(meta, "");
+  const classes = primitiveClassList("opsKpiTile", token.className, className);
+  return `
+    <div class="${escapeHTML(classes)}" data-status="${escapeHTML(token.key)}" role="group" aria-label="${escapeHTML(statusAriaLabel(token.key, `${safeLabel}: ${safeValue}${safeMeta ? `. ${safeMeta}` : ""}`))}">
+      <span class="opsKpiLabel">${escapeHTML(safeLabel)}</span>
+      <strong class="${escapeHTML(primitiveClassList("opsKpiValue", valueClassName))}">${escapeHTML(safeValue)}</strong>
+      <span class="opsKpiMeta">${escapeHTML(safeMeta || "-")}</span>
+    </div>
+  `;
+}
+
+export function guidanceListHtml(items, {
+  className = "",
+  emptyText = "Hold position and wait for the next runtime update.",
+  id = "",
+} = {}) {
+  const steps = (Array.isArray(items) ? items : [])
+    .map((item) => cleanPrimitiveText(item, ""))
+    .filter(Boolean);
+  const safeSteps = steps.length ? steps : [emptyText];
+  return `<ol${id ? ` id="${escapeHTML(id)}"` : ""} class="${escapeHTML(primitiveClassList("opsGuidanceList", className))}">${safeSteps
+    .map((item) => `<li>${escapeHTML(item)}</li>`)
+    .join("")}</ol>`;
+}
+
 export function tradeMarkerStatus(side, qty = 0) {
   const rawSide = String(side || "").toUpperCase();
   const nQty = Number(qty || 0);

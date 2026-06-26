@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from psycopg.pq import TransactionStatus
 
 from engine.api import api_market
 from engine.runtime import price_read_router
@@ -88,6 +89,68 @@ def test_sqlite_quote_rows_supports_canonical_time_column(
         (BASE_TS_MS + 6, 206.0, 6.0),
         (BASE_TS_MS + 7, 207.0, 7.0),
     ]
+
+
+def test_postgres_storage_quote_fallback_uses_postgres_timestamp_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(
+            self,
+            *,
+            one: tuple[Any, ...] | None = None,
+            many: list[tuple[Any, ...]] | None = None,
+        ) -> None:
+            self._one = one
+            self._many = many or []
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return list(self._many)
+
+    class FakePostgresStorageConnection:
+        __module__ = "engine.runtime.storage_pg"
+
+        def __init__(self) -> None:
+            self.data_sql = ""
+            self.data_params: tuple[Any, ...] = ()
+            self.closed = False
+
+        def execute(self, sql: str, params: tuple[Any, ...] | None = None):
+            sql_text = str(sql)
+            if "sqlite_master" in sql_text:
+                return FakeResult(one=(1,) if params == ("price_quotes",) else None)
+            if sql_text.startswith("PRAGMA table_info"):
+                return FakeResult(
+                    many=[
+                        (0, "time", "TIMESTAMPTZ", 1, None, 1),
+                        (1, "symbol", "TEXT", 1, None, 2),
+                        (2, "last", "DOUBLE PRECISION", 0, None, 0),
+                        (3, "volume", "DOUBLE PRECISION", 0, None, 0),
+                    ]
+                )
+            self.data_sql = sql_text
+            self.data_params = tuple(params or ())
+            return FakeResult(many=[(BASE_TS_MS, 101.0, 1.0)])
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake = FakePostgresStorageConnection()
+    monkeypatch.setattr(price_read_router, "connect_ro", lambda: fake)
+
+    rows = price_read_router._fetch_sqlite_quote_rows(symbol="GLD", since_ts_ms=BASE_TS_MS - 1, limit=5)
+
+    assert rows == [(BASE_TS_MS, 101.0, 1.0)]
+    assert "strftime" not in fake.data_sql
+    assert "typeof" not in fake.data_sql
+    assert 'EXTRACT(EPOCH FROM "time")' in fake.data_sql
+    assert '"time" > TO_TIMESTAMP(? / 1000.0)' in fake.data_sql
+    assert 'ORDER BY "time" DESC' in fake.data_sql
+    assert fake.data_params == ("GLD", BASE_TS_MS - 1, 5)
+    assert fake.closed is True
 
 
 def test_sqlite_quote_rows_falls_back_to_prices_price_px_without_volume(
@@ -442,12 +505,115 @@ def test_price_reader_reuses_pool_until_dsn_or_schema_changes(monkeypatch: pytes
     assert "unit-price-test" in str(created[0].kwargs["conninfo"])
     assert created[0].kwargs["min_size"] == 1
     assert created[0].kwargs["max_size"] == 4
+    assert created[0].kwargs["check"] is price_read_router._check_timescale_price_read_connection
+    assert created[0].kwargs["reset"] is price_read_router._reset_timescale_price_read_connection
     assert created[0].open_calls == [(True, 0.2)]
     assert created[0].getconn_calls == [0.2, 0.2]
     assert len(created[0].putconn_calls) == 2
     assert created[0].close_calls == [0.2]
     assert created[1].getconn_calls == [0.2]
     assert created[1].close_calls == [0.2]
+
+
+def test_price_read_pool_recovers_after_failed_query_on_same_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TIMESCALE_PRICES_ENABLED", "1")
+    monkeypatch.setenv("TIMESCALE_PRICES_DSN", "postgres://unit-price-test")
+    monkeypatch.setenv("TIMESCALE_PRICES_SCHEMA", "prices")
+    monkeypatch.setenv("TIMESCALE_PRICES_POOL_MIN_SIZE", "1")
+    monkeypatch.setenv("TIMESCALE_PRICES_POOL_MAX_SIZE", "1")
+    monkeypatch.setenv("TIMESCALE_PRICES_CONNECT_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("ASYNC_PRICE_WRITER_ENABLED", "0")
+
+    class FakeInfo:
+        transaction_status = TransactionStatus.IDLE
+
+    class FakeCursor:
+        def __init__(self, conn: "FakeConnection") -> None:
+            self.conn = conn
+            self.last_sql = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def execute(self, sql: str, params: Any = None) -> None:
+            del params
+            self.last_sql = str(sql)
+            if "failing_query" in self.last_sql:
+                self.conn.info.transaction_status = TransactionStatus.INERROR
+                raise RuntimeError("originating price read failure")
+            if self.conn.info.transaction_status != TransactionStatus.IDLE:
+                raise RuntimeError("InFailedSqlTransaction")
+            if not bool(self.conn.autocommit):
+                self.conn.info.transaction_status = TransactionStatus.INTRANS
+
+        def fetchone(self):
+            return (1,)
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.info = FakeInfo()
+            self.autocommit = False
+            self.closed = False
+            self.rollbacks = 0
+
+        def cursor(self):
+            return FakeCursor(self)
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+            self.info.transaction_status = TransactionStatus.IDLE
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakePool:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = dict(kwargs)
+            self.connections = [FakeConnection(), FakeConnection()]
+            self.getconn_calls: list[float] = []
+            self.putconn_calls: list[FakeConnection] = []
+
+        def open(self, *, wait: bool, timeout: float) -> None:
+            del wait, timeout
+
+        def close(self, *, timeout: float) -> None:
+            del timeout
+
+        def getconn(self, *, timeout: float) -> FakeConnection:
+            self.getconn_calls.append(float(timeout))
+            return self.connections[1] if self.connections[0].closed else self.connections[0]
+
+        def putconn(self, con: FakeConnection) -> None:
+            self.putconn_calls.append(con)
+
+    price_read_router.close_timescale_price_read_pool()
+    price_read_router._CONFIG = None
+    price_read_router._CONFIG_KEY = None
+    monkeypatch.setattr(price_read_router, "psycopg", object())
+    monkeypatch.setattr(price_read_router, "ConnectionPool", FakePool)
+
+    with pytest.raises(RuntimeError, match="originating price read failure"):
+        with price_read_router._timescale_connection() as (con, _schema):
+            with con.cursor() as cur:
+                cur.execute("SELECT failing_query")
+
+    pool = next(iter(price_read_router._POOLS.values()))
+    first = pool.connections[0]
+    assert first.rollbacks == 1
+    assert first.closed is True
+
+    with price_read_router._timescale_connection() as (con, _schema):
+        with con.cursor() as cur:
+            cur.execute("SELECT 1")
+            assert cur.fetchone() == (1,)
+
+    assert pool.getconn_calls == [0.2, 0.2]
+    assert len(pool.putconn_calls) == 2
+    assert pool.connections[1].closed is False
+    price_read_router.close_timescale_price_read_pool()
 
 
 def test_market_candles_dense_sqlite_history_keeps_newest_ticks(
@@ -511,6 +677,32 @@ def test_market_candles_handler_uses_short_cache(monkeypatch: pytest.MonkeyPatch
     assert first["candles"][-1]["close"] == 2.0
 
 
+def test_market_candles_falls_back_to_latest_rows_when_recent_window_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def _rows_since(**kwargs: Any):
+        calls.append(dict(kwargs))
+        if int(kwargs["since_ts_ms"]) > 0:
+            return []
+        return [(BASE_TS_MS + (i * 60_000), 100.0 + float(i), 2.0) for i in range(3)]
+
+    monkeypatch.setattr(api_market, "_rows_since", _rows_since)
+    monkeypatch.setattr(api_market, "cache_get_or_load", lambda _scope, _key, loader, ttl_s=0.0: loader())
+    monkeypatch.setattr(api_market.time, "time", lambda: (BASE_TS_MS + (10 * 24 * 60 * 60_000)) / 1000.0)
+
+    payload = api_market.api_get_market_candles({"symbol": "GLD", "tf": "1m", "limit": "10"}, None)
+
+    assert [int(call["since_ts_ms"]) for call in calls] == [BASE_TS_MS + (10 * 24 * 60 * 60_000) - (6 * 60 * 60_000), 0]
+    assert payload["ok"] is True
+    assert payload["meta"]["ready"] is True
+    assert payload["meta"]["stale_fallback"] is True
+    assert payload["candles"]
+    assert payload["candles"][0]["open"] == 100.0
+    assert payload["candles"][-1]["close"] == 102.0
+
+
 def test_dashboard_prices_handler_uses_short_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     from engine.api import api_dashboard_reads
 
@@ -550,6 +742,8 @@ def test_read_caches_do_not_intercept_write_api(monkeypatch: pytest.MonkeyPatch)
 
     con = sqlite3.connect(":memory:")
     try:
+        con.execute("CREATE TABLE alerts (id INTEGER PRIMARY KEY)")
+        con.execute("INSERT INTO alerts (id) VALUES (123)")
         monkeypatch.setattr(api_write, "run_write_txn", lambda fn: fn(con))
         out = api_write.ack_alert(123, who="operator", source="unit", reason="checking")
     finally:

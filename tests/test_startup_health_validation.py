@@ -1975,6 +1975,62 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertIn("async:safe", events)
         self.assertLess(events.index("run_server"), events.index("async:safe"))
 
+    def test_start_system_safe_feedless_late_validation_degrades_without_stop(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTION_MODE": "safe",
+                "ENGINE_MODE": "safe",
+                "OPERATOR_MODE": "safe",
+                "BROKER": "sim",
+                "BROKER_NAME": "sim",
+                "DISABLE_LIVE_EXECUTION": "1",
+                "KILL_SWITCH_GLOBAL": "1",
+                "IBKR_ENABLED": "0",
+                "POLYGON_REST_ENABLED": "0",
+                "POLYGON_WS_ENABLED": "0",
+                "TRADIER_ENABLED": "0",
+                "ALPACA_ENABLED": "0",
+            },
+            clear=False,
+        ):
+            os.environ.pop("STARTUP_HEALTH_LATE_FAILURE", None)
+            os.environ.pop("STARTUP_HEALTH_SAFE_MODE_FEEDLESS_DEGRADED", None)
+            storage, lifecycle_state, start_system = _reload_modules(
+                "engine.runtime.storage",
+                "engine.runtime.lifecycle_state",
+                "start_system",
+            )
+            storage.init_db()
+            lifecycle_state.set_state(lifecycle_state.WARMING_UP, "awaiting_first_price_tick")
+            start_system._STARTUP_TRACE["startup_health_validation"] = {
+                "ok": False,
+                "blocking_checks": [],
+                "blocking_gates": [],
+                "critical_systems_missing": [],
+                "reasons": ["health_not_ok:awaiting_first_price_tick"],
+                "health_reasons": ["prices:no_recent_price"],
+                "lifecycle_state": "WARMING_UP",
+                "first_price_ts_ms": "",
+                "prices_ok": False,
+            }
+
+            stop_reasons: list[str] = []
+            with patch.object(start_system, "_request_dashboard_runtime_stop", side_effect=lambda reason: stop_reasons.append(str(reason))):
+                start_system._handle_late_startup_health_validation_failure(
+                    RuntimeError("startup_health_validation_failed:awaiting_first_price_tick"),
+                    mode="safe",
+                    scope="unit_post_bind",
+                )
+
+            self.assertEqual(stop_reasons, [])
+            self.assertEqual(os.environ.get("DISABLE_LIVE_EXECUTION"), "1")
+            self.assertNotIn("STARTUP_HEALTH_LATE_FAILURE", os.environ)
+            self.assertIn("awaiting_first_price_tick", os.environ.get("STARTUP_HEALTH_SAFE_MODE_FEEDLESS_DEGRADED", ""))
+            state = lifecycle_state.get_state()
+            self.assertEqual(str(state.get("state") or ""), lifecycle_state.DEGRADED)
+            self.assertEqual(str(state.get("detail") or ""), "safe_mode_feedless_startup_health_degraded")
+
     def test_start_system_late_validation_failure_requests_full_runtime_stop(self) -> None:
         with patch.dict(
             os.environ,

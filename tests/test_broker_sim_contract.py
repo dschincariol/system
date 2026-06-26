@@ -232,6 +232,41 @@ class BrokerSimOverrideOrderPipelineTests(unittest.TestCase):
             con.close()
         self.assertIsNone(last_applied)
 
+    def test_null_cash_account_snapshot_repairs_to_start_cash(self) -> None:
+        storage, broker_sim = self._init_runtime()
+        con = storage.connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO broker_account(id, cash, equity, updated_ts_ms)
+                VALUES(1, NULL, 0, NULL)
+                ON CONFLICT(id) DO UPDATE SET
+                  cash=excluded.cash,
+                  equity=excluded.equity,
+                  updated_ts_ms=excluded.updated_ts_ms
+                """
+            )
+            con.commit()
+
+            account = broker_sim._read_account(con)
+            self.assertEqual(float(account["cash"]), 100000.0)
+            self.assertEqual(float(account["equity"]), 100000.0)
+            self.assertGreater(int(account["updated_ts_ms"]), 0)
+            con.commit()
+        finally:
+            con.close()
+
+        con = storage.connect(readonly=True)
+        try:
+            row = con.execute("SELECT cash, equity, updated_ts_ms FROM broker_account WHERE id=1").fetchone()
+        finally:
+            con.close()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(float(row[0]), 100000.0)
+        self.assertEqual(float(row[1]), 100000.0)
+        self.assertGreater(int(row[2]), 0)
+
     def test_override_orders_live_sim_persists_state_and_ledger_effects(self) -> None:
         storage, broker_sim = self._init_runtime()
         now_ms = int(time.time() * 1000)

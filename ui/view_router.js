@@ -13,10 +13,69 @@ const PERSONA_LABELS = {
 
 const DEFAULT_PERSONA = "operations";
 
+export const DASHBOARD_SCREEN_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    key: "overview",
+    label: "Overview",
+    aliases: Object.freeze(["home", "mission", "status"]),
+    keywords: Object.freeze(["mission control", "health", "readiness", "alerts", "pnl"]),
+  }),
+  Object.freeze({
+    key: "operate",
+    label: "Operate",
+    aliases: Object.freeze(["ops", "jobs", "runtime"]),
+    keywords: Object.freeze(["jobs", "startup", "logs", "broker", "operator"]),
+  }),
+  Object.freeze({
+    key: "explain",
+    label: "Explain",
+    aliases: Object.freeze(["why", "governance"]),
+    keywords: Object.freeze(["decisions", "governance", "promotion", "alignment"]),
+  }),
+  Object.freeze({
+    key: "analyze",
+    label: "Analyze",
+    aliases: Object.freeze(["analysis", "models", "research"]),
+    keywords: Object.freeze(["charts", "model", "validation", "backtest", "metrics"]),
+  }),
+  Object.freeze({
+    key: "data",
+    label: "Data Health",
+    aliases: Object.freeze(["health", "feeds", "sources"]),
+    keywords: Object.freeze(["ingestion", "providers", "feeds", "data sources"]),
+  }),
+  Object.freeze({
+    key: "positions",
+    label: "Positions",
+    aliases: Object.freeze(["exposure", "book", "portfolio"]),
+    keywords: Object.freeze(["exposure", "targets", "live book", "risk"]),
+  }),
+  Object.freeze({
+    key: "execution",
+    label: "Execution",
+    aliases: Object.freeze(["orders", "fills", "terminal"]),
+    keywords: Object.freeze(["orders", "fills", "tca", "barrier", "broker"]),
+  }),
+]);
+
+export const DASHBOARD_SCREEN_LABELS = Object.freeze(Object.fromEntries(
+  DASHBOARD_SCREEN_DEFINITIONS.map((screen) => [screen.key, screen.label])
+));
+
+export const DASHBOARD_SCREEN_ALIASES = Object.freeze(Object.fromEntries(
+  DASHBOARD_SCREEN_DEFINITIONS.flatMap((screen) => (
+    Array.from(screen.aliases || []).map((alias) => [alias, screen.key])
+  ))
+));
+
+export const DASHBOARD_SCREEN_KEYS = Object.freeze(
+  DASHBOARD_SCREEN_DEFINITIONS.map((screen) => screen.key)
+);
+
 const PERSONA_SCREEN_ALLOWLISTS = {
   operations: ["overview", "operate", "data", "execution"],
   fund_manager: ["overview", "explain", "analyze", "positions"],
-  expert: ["overview", "operate", "explain", "analyze", "data", "positions", "execution"],
+  expert: DASHBOARD_SCREEN_KEYS,
 };
 
 const PERSONA_PANEL_ALLOWLISTS = {
@@ -167,6 +226,12 @@ export function getAllowedDashboardScreens(persona = getActiveDashboardPersona()
 
 export function isDashboardScreenAllowed(persona, screen) {
   return getAllowedDashboardScreens(persona).includes(String(screen || "").trim().toLowerCase());
+}
+
+export function isDashboardPanelAllowed(persona, screen, panelId) {
+  const allowed = getAllowedPanelIds(persona, screen);
+  if (allowed === null) return true;
+  return allowed.has(String(panelId || "").trim());
 }
 
 export function getDefaultDashboardScreen(persona = getActiveDashboardPersona()) {

@@ -8,12 +8,17 @@
 
 import { esc, escapeHTML, fmtTime } from "./utils.js";
 import {
+  alertAffectedEntity,
+  alertLifecycleState,
   applyAlertLocalState,
   cellColor,
+  defaultAlertRecommendedAction,
+  formatAlertDurationMs,
   normalizeAlert,
   normalizeAlertDetailPayload,
   normalizeAlertsPayload,
   normalizeSeverity,
+  summarizeAlertLifecycleCounts,
 } from "./alerts.js";
 
 export function _scoreCell(rows, severityRank) {
@@ -646,18 +651,12 @@ function _overlayAlertState(row, deps = {}) {
 
 function _drawerStateMeta(alertRow) {
   const alert = normalizeAlert(alertRow) || {};
-  if (alert.status === "resolved") {
-    return { text: "RESOLVED", cls: "ok" };
-  }
-  if (alert.shelved) {
-    return { text: "SHELVED", cls: "warn" };
-  }
-  if (alert.ack_expired || alert.retriggered || alert.lifecycle_state === "retriggered") {
-    return { text: "RE-TRIGGERED", cls: cellColor(alert).cls };
-  }
-  if (alert.acked) {
-    return { text: "ACKED", cls: cellColor(alert).cls };
-  }
+  const lifecycle = alertLifecycleState(alert);
+  if (lifecycle.key === "resolved") return { text: "RESOLVED", cls: "ok" };
+  if (lifecycle.key === "shelved") return { text: "SHELVED, UNRESOLVED", cls: "warn" };
+  if (lifecycle.key === "acknowledged") return { text: "ACKED, UNRESOLVED", cls: "warn" };
+  if (lifecycle.key === "retriggered") return { text: "RE-TRIGGERED", cls: lifecycle.tone || cellColor(alert).cls };
+  if (lifecycle.key === "stale") return { text: "STALE ACTIVE", cls: lifecycle.tone || "warn" };
   return { text: alert.severity || "INFO", cls: cellColor(alert).cls };
 }
 
@@ -798,6 +797,74 @@ export function notificationPolicySummary(row, nowMs = Date.now()) {
   return `${normalizeSeverity(policy.severity || alert.severity)} notifications ${suppressed}; ${rate}; ${nextText}. ${explanation}`;
 }
 
+export function renderAlertLifecycleCountSummary(host, rows, nowMs = Date.now()) {
+  if (!host) return;
+  const summary = summarizeAlertLifecycleCounts(rows, nowMs);
+  const alarmTone = summary.crit > 0
+    ? "crit"
+    : summary.high > 0
+      ? "high"
+      : summary.warn > 0
+        ? "warn"
+        : "ok";
+  const tiles = [
+    {
+      label: "Open alarms",
+      value: summary.alarms,
+      detail: `${summary.crit} crit / ${summary.high} high / ${summary.warn} warn`,
+      tone: alarmTone,
+    },
+    {
+      label: "Notifications",
+      value: summary.notifications,
+      detail: "info only",
+      tone: summary.notifications > 0 ? "info" : "ok",
+    },
+    {
+      label: "Acknowledged",
+      value: summary.acknowledged,
+      detail: "still unresolved",
+      tone: summary.acknowledged > 0 ? "warn" : "ok",
+    },
+    {
+      label: "Shelved",
+      value: summary.shelved,
+      detail: "expiry visible",
+      tone: summary.shelved > 0 ? "warn" : "ok",
+    },
+    {
+      label: "Suppressed",
+      value: summary.suppressed,
+      detail: "notification path",
+      tone: summary.suppressed > 0 ? "warn" : "ok",
+    },
+    {
+      label: "Stale",
+      value: summary.stale,
+      detail: "needs refresh",
+      tone: summary.stale > 0 ? "high" : "ok",
+    },
+    {
+      label: "Grouped",
+      value: summary.grouped_incidents,
+      detail: summary.flood_groups > 0 ? `${summary.flood_groups} flood groups` : "no floods",
+      tone: summary.flood_groups > 0 ? "info" : "ok",
+    },
+  ];
+
+  host.setAttribute(
+    "aria-label",
+    `Alert lifecycle summary: ${summary.alarms} open alarms, ${summary.notifications} notifications, ${summary.shelved} shelved, ${summary.suppressed} suppressed, ${summary.stale} stale.`
+  );
+  host.innerHTML = tiles.map((tile) => `
+    <div class="alertSummaryTile" data-tone="${esc(tile.tone)}">
+      <div class="alertSummaryLabel">${esc(tile.label)}</div>
+      <div class="alertSummaryValue">${esc(String(tile.value))}</div>
+      <div class="alertSummaryDetail">${esc(tile.detail)}</div>
+    </div>
+  `).join("");
+}
+
 function _renderAlertLifecycle(row) {
   const alert = normalizeAlert(row) || {};
   const events = normalizeAlertLifecycle(alert);
@@ -889,10 +956,13 @@ export async function openIncidentDrawer(row, deps) {
     const titleMessage = alertRow.message || alertRow.event_title || "Alert";
     const tsLabel = alertRow.ts ? fmtTime(alertRow.ts) : "timestamp unavailable";
     const stateMeta = _drawerStateMeta(alertRow);
+    const lifecycle = alertLifecycleState(alertRow);
+    const entity = alertAffectedEntity(alertRow);
+    const recommendedAction = defaultAlertRecommendedAction(alertRow);
 
-    if (title) title.textContent = `${alertRow.severity} • ${titleSymbol}`;
+    if (title) title.textContent = `${alertRow.severity} • ${entity || titleSymbol}`;
     if (sub) {
-      sub.textContent = `${titleMessage} • ${tsLabel}${alertRow.status === "resolved" ? " • resolved" : ""}`;
+      sub.textContent = `${titleMessage} • ${tsLabel} • ${lifecycle.label}`;
     }
     if (statePill) {
       statePill.className = `pill ${stateMeta.cls}`;
@@ -925,15 +995,21 @@ export async function openIncidentDrawer(row, deps) {
         : null;
       const nextEscalation = Number(alertRow.next_escalation_ts_ms || 0);
       const shelfExpiry = Number(alertRow.shelve_expires_ts_ms || 0);
+      const shelfRemaining = Number.isFinite(shelfExpiry) && shelfExpiry > Date.now()
+        ? formatAlertDurationMs(shelfExpiry - Date.now())
+        : "";
 
       facts.innerHTML = `
+        <div class="kvK">entity</div><div class="kvV">${esc(entity)}</div>
         <div class="kvK">symbol</div><div class="kvV">${esc(titleSymbol)}</div>
         <div class="kvK">severity</div><div class="kvV">${esc(alertRow.severity)}</div>
         <div class="kvK">rule_id</div><div class="kvV">${esc(alertRow.rule_id || "—")}</div>
         <div class="kvK">status</div><div class="kvV">${esc(alertRow.status)}</div>
+        <div class="kvK">current state</div><div class="kvV">${esc(lifecycle.label)}</div>
+        <div class="kvK">recommended action</div><div class="kvV">${esc(recommendedAction)}</div>
         <div class="kvK">lifecycle</div><div class="kvV">${esc(alertLifecycleSummary(alertRow))}</div>
         <div class="kvK">next escalation</div><div class="kvV">${Number.isFinite(nextEscalation) && nextEscalation > 0 ? esc(fmtTime(nextEscalation)) : "—"}</div>
-        <div class="kvK">shelving expiry</div><div class="kvV">${Number.isFinite(shelfExpiry) && shelfExpiry > 0 ? esc(fmtTime(shelfExpiry)) : "—"}</div>
+        <div class="kvK">shelving expiry</div><div class="kvV">${Number.isFinite(shelfExpiry) && shelfExpiry > 0 ? esc(`${fmtTime(shelfExpiry)}${shelfRemaining ? ` (${shelfRemaining} remaining)` : ""}`) : "—"}</div>
         <div class="kvK">horizon_s</div><div class="kvV">${esc(alertRow.horizon_s)}</div>
         <div class="kvK">expected_z</div><div class="kvV">${Number.isFinite(z) ? z.toFixed(3) : "—"}</div>
         <div class="kvK">confidence</div><div class="kvV">${Number.isFinite(conf) ? conf.toFixed(2) : "—"}</div>
@@ -1172,6 +1248,11 @@ export async function loadAlertsUI(deps) {
     }
   );
 
+  renderAlertLifecycleCountSummary(
+    document.getElementById("alertLifecycleSummary"),
+    getLastAlerts() || []
+  );
+
   renderHeatmap(
     document.getElementById("alertsHeatmap"),
     filtered,
@@ -1223,7 +1304,12 @@ export async function loadAlertsUI(deps) {
     const z = Number(r.expected_z);
     const conf = Number(r.confidence);
     const color = cellColor(r);
-    const symbolLabel = r.symbol === "EXECUTION" ? "Execution" : (r.symbol || "—");
+    const symbolLabel = alertAffectedEntity(r);
+    const lifecycle = alertLifecycleState(r);
+    const recommendedAction = _recommendedPosture(r) || defaultAlertRecommendedAction(r);
+    const shelfRemaining = lifecycle.key === "shelved" && lifecycle.remainingMs != null
+      ? ` • shelf ${formatAlertDurationMs(lifecycle.remainingMs)} left`
+      : "";
 
     const impactWord =
       (Math.abs(z) >= 2.5) ? "Very strong" :
@@ -1237,6 +1323,7 @@ export async function loadAlertsUI(deps) {
       "Low";
 
     tr.className = "table-row clickable-row";
+    tr.dataset.alertId = String(r.id || "");
     tr.tabIndex = 0;
     tr.innerHTML = `
       <td class="mono metric-meta">${Number.isFinite(ts) ? fmtTime(ts) : "—"}</td>
@@ -1248,10 +1335,17 @@ export async function loadAlertsUI(deps) {
 }">
   ${r.status === "resolved"
     ? "RESOLVED"
+    : lifecycle.key === "shelved"
+      ? "SHELVED"
+      : lifecycle.key === "acknowledged"
+        ? "ACKED"
+        : lifecycle.key === "stale"
+          ? "STALE"
     : r.acked
       ? "ACKED"
       : r.severity}
 </div>
+<div class="metric-meta">${escapeHTML(lifecycle.label)}</div>
       </td>
       <td>${escapeHTML(symbolLabel)}</td>
       <td class="table-cell-num">${r.horizon_s != null && String(r.horizon_s).trim() !== "" ? `${escapeHTML(String(r.horizon_s))}s` : "—"}</td>
@@ -1260,11 +1354,16 @@ export async function loadAlertsUI(deps) {
       <td>
         ${escapeHTML(r.message || r.event_title || "Alert")}
         ${r.reason ? `<div class="metric-meta">${esc(r.reason)}</div>` : ""}
+        <div class="metric-meta"><strong>Action:</strong> ${esc(recommendedAction)}</div>
       </td>
       <td class="mono metric-meta">
-${ageMin == null ? "—" : `${ageMin}m ago`}${
+${ageMin == null ? "freshness unknown" : `${ageMin}m ago${lifecycle.stale ? " • STALE" : ""}`}${shelfRemaining}${
   r.status === "resolved"
     ? ` • RESOLVED${r.resolved_reason ? ` (${r.resolved_reason})` : ""}`
+    : lifecycle.key === "shelved"
+      ? ` • SHELVED until ${lifecycle.expiresTsMs ? fmtTime(lifecycle.expiresTsMs) : "unknown"}`
+      : lifecycle.key === "acknowledged"
+        ? ` • ACKED only${lifecycle.expiresTsMs ? ` until ${fmtTime(lifecycle.expiresTsMs)}` : ""}`
     : r.acked
       ? ` • ACKED by ${r.acked_by || "?"}`
       : ""

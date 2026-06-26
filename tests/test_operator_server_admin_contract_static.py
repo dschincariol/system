@@ -80,6 +80,7 @@ def test_operator_server_high_impact_routes_call_confirmation_helper():
         "/api/operator/config": "operator.config_write",
         "/api/operator/secrets": "operator.secrets_write",
         "/api/operator/start": "operator.start",
+        "/api/operator/bootstrap": "operator.bootstrap",
         "/api/operator/stop": "operator.stop",
         "/api/operator/restart": "operator.restart",
         "/api/operator/restart_engine": "operator.restart",
@@ -94,6 +95,45 @@ def test_operator_server_high_impact_routes_call_confirmation_helper():
     for path, action_id in required.items():
         assert path in text
         assert action_id in text
+
+
+def test_operator_start_and_bootstrap_are_confirmed_bounded_routes():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    start_block = _extract_block(
+        text,
+        'app.post("/api/operator/start", async (req, res) => {',
+        'app.post("/api/operator/stop", (req, res) => {',
+    )
+    proxy_block = _extract_block(
+        text,
+        'app.post("/api/operator/self_repair",',
+        "// UI expects the camelCase endpoint; keep snake_case as the canonical API form.",
+    )
+
+    assert '"operator.bootstrap": {' in text
+    assert 'requiredToken: "BOOTSTRAP_OPERATOR"' in text
+    assert "OPERATOR_START_REQUEST_TIMEOUT_MS" in start_block
+    assert 'error: "start_timeout"' in start_block
+    assert 'verifyHealth({ force: true, timeoutMs:' in start_block
+    assert 'httpGetJson(`${base}/api/telemetry`, Math.min(5000' in start_block
+    assert 'app.post("/api/operator/bootstrap",' in proxy_block
+    assert 'operatorConfirmedProxyPost("/api/operator/bootstrap", "invalid_bootstrap_response", "operator.bootstrap", OPERATOR_BOOTSTRAP_REQUEST_TIMEOUT_MS)' in proxy_block
+
+
+def test_operator_sidecar_snake_case_aliases_keep_camelcase_compatibility():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    block = _extract_block(
+        text,
+        "function handleClearLastErrorRoute(_req, res) {",
+        'app.post("/api/operator/set_mode", (req, res) => {',
+    )
+
+    assert 'app.get(["/api/operator/bootstrap_status", "/api/operator/bootstrapStatus"]' in text
+    assert 'app.get(["/api/operator/institutional_check", "/api/operator/institutionalCheck"]' in text
+    assert 'app.post("/api/operator/clear_last_error", handleClearLastErrorRoute);' in block
+    assert 'app.post("/api/operator/clearLastError", handleClearLastErrorRoute);' in block
+    assert "clearLastError();" in block
+    assert "jsonOk(res, {})" in block
 
 
 def test_operator_live_controls_fail_closed_for_disable_live_execution():
@@ -138,6 +178,27 @@ def test_operator_server_caches_polled_db_routes():
     assert 'readOperatorDbCache(_dbSchemaCache)' in text
     assert 'writeOperatorDbCache("bootstrap_counts", payload);' in text
     assert 'writeOperatorDbCache("db_schema", payload);' in text
+
+
+def test_operator_safe_feedless_degraded_health_counts_for_supervision():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    helper_block = _extract_block(
+        text,
+        "function safeModeDegradedServingHealth",
+        "function rowsFromOperatorPayload",
+    )
+    health_block = _extract_block(
+        text,
+        "async function verifyHealth",
+        "async function verifyDashboardReadiness",
+    )
+
+    assert 'status !== "WARMING_UP" && status !== "DEGRADED"' in helper_block
+    assert "firstPriceTs" in helper_block
+    assert 'value === "live" || value === "shadow"' in helper_block
+    assert "const supervisionReady = bodyOk || safeDegradedServing;" in health_block
+    assert "if (reachable && supervisionReady)" in health_block
+    assert "safe_degraded_serving: safeDegradedServing" in health_block
 
 
 def test_operator_server_caches_runtime_detection_and_uses_ingestion_owner_pid():
@@ -236,6 +297,52 @@ def test_support_snapshot_proxy_declares_auth_scope_and_redaction():
     assert 'operator_dashboard_auth_required' in text
     assert '"DASHBOARD_API_TOKEN or DASHBOARD_API_TOKEN_FILE"' in text
     assert "dashboard_token_configured" in text
+
+
+def test_operator_proxy_health_uses_health_contract_validator():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    proxy_block = _extract_block(
+        text,
+        'app.get("/api/operator/proxy/health",',
+        "const ROOT = path.join(__dirname"
+    )
+    health_helper_block = _extract_block(
+        text,
+        "function operatorHealthProxyGet(path, invalidError) {",
+        "const OPERATOR_BARRIER_PROXY_TIMEOUT_MS = clampNumber("
+    )
+
+    assert 'operatorHealthProxyGet("/api/health", "invalid_system_health_response")' in proxy_block
+    assert 'operatorCanonicalProxyGet("/api/health", "invalid_system_health_response")' not in proxy_block
+    assert "function isHealthApiShape(payload)" in text
+    assert "isHealthApiShape(r.json)" in health_helper_block
+    assert "operatorHealthProxyGet" in health_helper_block
+
+
+def test_operator_telemetry_websocket_requires_token_and_origin_guard():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    ws_block = _extract_block(
+        text,
+        "function startTelemetryWebSocket(server){",
+        "function broadcastTelemetry(type, payload){",
+    )
+    auth_block = _extract_block(
+        text,
+        "function operatorRequestToken(req) {",
+        "function operatorMutationAuthorized(req) {",
+    )
+
+    assert "operatorWebSocketOriginAuthorized(info.req)" in ws_block
+    assert "operatorMutationAuthorized(info.req)" in ws_block
+    assert "operator_origin_forbidden" in ws_block
+    assert "operator_forbidden" in ws_block
+    assert "operatorRequestWebSocketProtocolToken(req)" in auth_block
+    assert "operatorWebSocketTicketAuthorized(req, token)" in text
+    assert "operator-ticket." in text
+    assert "operator_ws" in text
+    assert "exp_ms" in text
+    assert "sec-websocket-protocol" in text
+    assert "operator-token." in text
 
 
 def test_operator_readiness_proxy_timeout_is_bounded():

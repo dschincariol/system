@@ -5,7 +5,7 @@ trap 'rc=$?; echo "[credstore-install] ERROR line ${BASH_LINENO[0]} while runnin
 
 CREDSTORE_DIR="${TRADING_CREDSTORE_DIR:-/etc/credstore.encrypted}"
 LEGACY_SECRET_DIR="${TRADING_LEGACY_SECRET_DIR:-/etc/trading/secrets}"
-SECRET_NAMES="${TRADING_CREDSTORE_SECRET_NAMES:-master_key pg_password_app pg_password_ingest pg_password_reader redis_password object_store_secret_key dashboard_api_token operator_api_token}"
+SECRET_NAMES="${TRADING_CREDSTORE_SECRET_NAMES:-master_key pg_password_app pg_password_ingest pg_password_reader redis_password object_store_secret_key dashboard_api_token operator_api_token backup_evidence_hmac_key}"
 
 log() {
   printf '[credstore-install] %s\n' "$*"
@@ -43,6 +43,9 @@ read_secret_value() {
   value="${!env_name:-}"
   if [ -z "$value" ] && [ "$name" = "master_key" ] && [ "${TRADING_GENERATE_MASTER_KEY:-1}" = "1" ]; then
     value="$(openssl rand -base64 32)"
+  fi
+  if [ -z "$value" ] && [ "$name" = "backup_evidence_hmac_key" ] && [ "${TRADING_GENERATE_BACKUP_EVIDENCE_HMAC_KEY:-1}" = "1" ]; then
+    value="$(openssl rand -hex 32)"
   fi
   if [ -z "$value" ]; then
     read -r -s -p "Enter value for ${name}: " value

@@ -71,6 +71,8 @@ def test_safe_simulated_ingestion_writes_fresh_prices_and_api_freshness(monkeypa
     assert feed["price_freshness"]["status"] == "fresh"
     assert feed["price_freshness"]["source"] == "simulated"
     assert feed["price_freshness"]["simulated"] is True
+    assert feed["price_freshness"]["live_market_data_ok"] is False
+    assert feed["price_freshness"]["live_feed_status"] == "simulated"
 
     con = storage.connect_ro_direct()
     try:
@@ -81,6 +83,8 @@ def test_safe_simulated_ingestion_writes_fresh_prices_and_api_freshness(monkeypa
     assert ctx.out["prices"]["ok"] is True
     assert ctx.out["prices"]["status"] == "fresh"
     assert ctx.out["prices"]["simulated"] is True
+    assert ctx.out["prices"]["live_market_data_ok"] is False
+    assert ctx.out["prices"]["live_feed_status"] == "simulated"
 
     rendered = json.dumps({"result": result, "feed": feed, "health": ctx.out}, sort_keys=True, default=str)
     assert canary not in rendered
@@ -107,6 +111,38 @@ def test_missing_real_provider_credentials_degrade_without_network(monkeypatch, 
     assert result["classification"] == "missing_credentials"
     assert result["message"] == "polygon_credentials_missing"
     assert result["evidence"]["missing_env_vars"] == ["POLYGON_API_KEY"]
+    assert result["missing_credential_env_vars"] == ["POLYGON_API_KEY"]
+    assert result["live_market_data_ok"] is False
+    storage.close_pooled_connections()
+
+
+def test_simulated_connection_test_is_not_live_green_and_lists_missing_live_credentials(monkeypatch, tmp_path) -> None:
+    storage, _sim_ingestion, _api_read, _health = _reload_runtime(monkeypatch, tmp_path)
+    for env_name in (
+        "POLYGON_API_KEY",
+        "POLYGON_API_KEY_FILE",
+        "POLYGON_KEY",
+        "POLYGON_KEY_FILE",
+        "TRADIER_API_TOKEN",
+        "TRADIER_API_TOKEN_FILE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("DATA_SOURCE_CONNECTION_TEST_MIN_INTERVAL_S", "0")
+    manager_mod = importlib.reload(importlib.import_module("services.data_source_manager"))
+    manager = manager_mod.DataSourceManager()
+    manager.initialize()
+    manager_mod._MANAGER = manager
+
+    result = manager.test_connection("simulated", actor="unit-test")
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert result["classification"] == "simulated_not_live"
+    assert result["simulated"] is True
+    assert result["live_market_data_ok"] is False
+    assert result["live_feed_status"] == "simulated"
+    assert "POLYGON_API_KEY" in result["missing_credential_env_vars"]
+    assert "TRADIER_API_TOKEN" in result["missing_credential_env_vars"]
     storage.close_pooled_connections()
 
 
@@ -184,4 +220,6 @@ def test_dashboard_data_health_uses_feed_freshness_contract() -> None:
     assert "price_freshness" in data_health_js
     assert "dataFreshnessPill" in data_health_js
     assert "priceFreshness.simulated" in data_health_js
+    assert "live_market_data_ok" in data_health_js
+    assert "missing_credential_env_vars" in data_health_js
     assert "prices ${priceFreshnessStatus}" in data_health_js

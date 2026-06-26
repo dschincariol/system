@@ -570,7 +570,8 @@ app.get("/api/operator/stderr_tail", wrapOperatorRoute(async (req, res) => {
     });
 }));
 
-// proxy endpoints used by snapshot bundle
+// Explicit dashboard proxy endpoints kept for operator UI and compatibility callers.
+// Each route must use the validator that matches its upstream API contract.
 app.get("/api/operator/proxy/jobs",
   operatorProxyGet("/api/jobs", "invalid_jobs_response")
 );
@@ -588,7 +589,7 @@ app.get("/api/operator/proxy/validation",
 );
 
 app.get("/api/operator/proxy/health",
-  operatorCanonicalProxyGet("/api/health", "invalid_system_health_response")
+  operatorHealthProxyGet("/api/health", "invalid_system_health_response")
 );
 
 const ROOT = path.join(__dirname, "..");
@@ -947,6 +948,13 @@ const OPERATOR_CONFIRMATION_REGISTRY = Object.freeze({
     requiredToken: "START_OPERATOR",
     severity: "high",
     consequence: "Starts operator-controlled runtime processes and may start data or pipeline jobs.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.bootstrap": {
+    requiredToken: "BOOTSTRAP_OPERATOR",
+    severity: "high",
+    consequence: "Runs the dashboard startup orchestrator in non-live mode and may start data or pipeline jobs.",
     requireReason: true,
     minReasonLength: 6,
   },
@@ -1330,6 +1338,9 @@ function operatorRequestToken(req) {
     if (bearer) return bearer;
   }
 
+  const protocolToken = operatorRequestWebSocketProtocolToken(req);
+  if (protocolToken) return protocolToken;
+
   try {
     const rawUrl = String(req.url || "");
     const parsed = new NodeURL(rawUrl, "http://127.0.0.1");
@@ -1342,12 +1353,99 @@ function operatorRequestToken(req) {
   return "";
 }
 
+function base64UrlDecodeText(value) {
+  const raw = String(value || "").trim();
+  if (!raw || !/^[A-Za-z0-9_-]+$/.test(raw)) return "";
+  try {
+    const padded = raw.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(raw.length / 4) * 4, "=");
+    return Buffer.from(padded, "base64").toString("utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function operatorRequestWebSocketProtocolToken(req) {
+  const raw = String(req?.headers?.["sec-websocket-protocol"] || "").trim();
+  if (!raw) return "";
+  for (const part of raw.split(",")) {
+    const protocol = String(part || "").trim();
+    if (!protocol.startsWith("operator-token.")) continue;
+    const token = base64UrlDecodeText(protocol.slice("operator-token.".length));
+    if (token) return token;
+  }
+  return "";
+}
+
+function operatorRequestWebSocketTicket(req) {
+  const raw = String(req?.headers?.["sec-websocket-protocol"] || "").trim();
+  if (!raw) return "";
+  for (const part of raw.split(",")) {
+    const protocol = String(part || "").trim();
+    if (!protocol.startsWith("operator-ticket.")) continue;
+    const ticket = protocol.slice("operator-ticket.".length).trim();
+    if (ticket) return ticket;
+  }
+  return "";
+}
+
+function base64UrlEncodeBuffer(buffer) {
+  return Buffer.from(buffer)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function safeTextEquals(a, b) {
+  const left = Buffer.from(String(a || ""), "utf8");
+  const right = Buffer.from(String(b || ""), "utf8");
+  if (left.length === 0 || right.length === 0 || left.length !== right.length) return false;
+  try {
+    return crypto.timingSafeEqual(left, right);
+  } catch {
+    return false;
+  }
+}
+
+function operatorWebSocketTicketAuthorized(req, token) {
+  const ticket = operatorRequestWebSocketTicket(req);
+  if (!ticket || !token) return false;
+  const parts = ticket.split(".");
+  if (parts.length !== 2) return false;
+  const [payloadB64, signatureB64] = parts;
+  if (!payloadB64 || !signatureB64) return false;
+
+  const expected = base64UrlEncodeBuffer(
+    crypto.createHmac("sha256", String(token)).update(payloadB64).digest()
+  );
+  if (!safeTextEquals(signatureB64, expected)) return false;
+
+  let payload = null;
+  try {
+    payload = JSON.parse(base64UrlDecodeText(payloadB64) || "{}");
+  } catch {
+    return false;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  if (String(payload.aud || "") !== "operator_ws") return false;
+
+  const exp = Number(payload.exp_ms || 0);
+  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+
+  const expectedOrigin = normalizeOriginText(payload.origin);
+  const requestOrigin = normalizeOriginText(req?.headers?.origin);
+  if (!expectedOrigin || !requestOrigin || expectedOrigin !== requestOrigin) return false;
+
+  return true;
+}
+
 function operatorMutationAuthorized(req) {
   const token = operatorApiTokenFromConfig();
 
   if (!token) return false;
 
-  return timingSafeTokenEquals(operatorRequestToken(req), token);
+  if (timingSafeTokenEquals(operatorRequestToken(req), token)) return true;
+  return operatorWebSocketTicketAuthorized(req, token);
 }
 
 function operatorRouteRequiresAuth(req) {
@@ -1356,6 +1454,76 @@ function operatorRouteRequiresAuth(req) {
   if (method === "OPTIONS") return false;
   if (pathName === "/ping" || pathName === "/api/operator/ping") return false;
   return true;
+}
+
+function normalizeOriginText(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    return new NodeURL(raw).origin;
+  } catch {
+    return "";
+  }
+}
+
+function formatHostForOrigin(host) {
+  const raw = String(host || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("[") && raw.endsWith("]")) return raw;
+  return raw.includes(":") ? `[${raw}]` : raw;
+}
+
+function hostFromHostHeader(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    return new NodeURL(`http://${raw}`).hostname;
+  } catch {
+    return raw.replace(/:\d+$/, "");
+  }
+}
+
+function addOriginForHost(out, host, port) {
+  const normalized = normalizeUrlHostForCompare(host);
+  if (!normalized || normalized === "0.0.0.0" || normalized === "::") return;
+  const formatted = formatHostForOrigin(normalized);
+  const p = Number(port);
+  if (!formatted || !Number.isFinite(p) || p <= 0) return;
+  out.add(`http://${formatted}:${p}`);
+  out.add(`https://${formatted}:${p}`);
+}
+
+function operatorAllowedWebSocketOrigins(req) {
+  let envObj = {};
+  try {
+    envObj = readEnv();
+  } catch {}
+  const configured = String(envObj.OPERATOR_ALLOWED_ORIGIN || process.env.OPERATOR_ALLOWED_ORIGIN || "http://127.0.0.1:8000")
+    .split(",")
+    .map((s) => normalizeOriginText(s))
+    .filter(Boolean);
+  const origins = new Set(configured.filter((origin) => origin !== "*" && origin !== "null"));
+
+  const dashboardPort = clampNumber(process.env.DASHBOARD_PORT || envObj.DASHBOARD_PORT || 8000, 8000, 1, 65535);
+  const hostCandidates = [
+    hostFromHostHeader(req?.headers?.host),
+    process.env.DASHBOARD_HOST || envObj.DASHBOARD_HOST,
+    OPERATOR_BIND_HOST,
+    "127.0.0.1",
+    "localhost",
+  ];
+  for (const host of hostCandidates) {
+    addOriginForHost(origins, host, dashboardPort);
+    addOriginForHost(origins, host, OPERATOR_PORT);
+  }
+
+  return origins;
+}
+
+function operatorWebSocketOriginAuthorized(req) {
+  const origin = normalizeOriginText(req?.headers?.origin);
+  if (!origin) return false;
+  return operatorAllowedWebSocketOrigins(req).has(origin);
 }
 
 // --------------------------------------------------
@@ -3632,6 +3800,37 @@ function writeOperatorDbCache(key, payload) {
   }
 }
 
+function safeModeDegradedServingHealth(body, envObj = {}) {
+  if (!body || typeof body !== "object") return false;
+  const modeCandidates = [
+    state.lastMode ||
+    "",
+    envObj.ENGINE_MODE,
+    envObj.EXECUTION_MODE,
+    envObj.OPERATOR_MODE,
+    process.env.ENGINE_MODE,
+    process.env.EXECUTION_MODE,
+    process.env.OPERATOR_MODE,
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+  if (modeCandidates.some((value) => value === "live" || value === "shadow")) return false;
+  const mode = modeCandidates[0] || "safe";
+  if (mode !== "safe") return false;
+
+  const lifecycle = body.lifecycle && typeof body.lifecycle === "object" ? body.lifecycle : {};
+  const status = String(body.status || lifecycle.state || body.state || "").trim().toUpperCase();
+  if (status !== "WARMING_UP" && status !== "DEGRADED") return false;
+
+  const firstPriceTs = String(lifecycle.first_price_ts_ms || body.first_price_ts_ms || "").trim();
+  if (firstPriceTs) return false;
+
+  const liveDisabled = String(envObj.DISABLE_LIVE_EXECUTION || process.env.DISABLE_LIVE_EXECUTION || "1")
+    .trim()
+    .toLowerCase();
+  if (["0", "false", "no", "off"].includes(liveDisabled)) return false;
+
+  return true;
+}
+
 function rowsFromOperatorPayload(payload, keys = []) {
   if (Array.isArray(payload)) return payload;
   if (!payload || typeof payload !== "object") return [];
@@ -3652,6 +3851,7 @@ function rowsFromOperatorPayload(payload, keys = []) {
 
 async function verifyHealth(options = {}) {
   const force = !!(options && options.force);
+  const timeoutMs = clampNumber(options && options.timeoutMs, 20000, 1000, 20000);
   const now = Date.now();
   if (
     !force &&
@@ -3673,15 +3873,17 @@ async function verifyHealth(options = {}) {
 
   const url = override || `http://${host}:${port}/api/health`;
 
-  const r = await httpGetJson(url);
+  const r = await httpGetJson(url, timeoutMs);
   const body = (r && r.json && typeof r.json === "object") ? r.json : null;
   const bodyOk = !!(body && body.ok === true);
   const warmup = String((body && body.status) || "").toUpperCase() === "WARMING_UP";
   const reachable = !!(r && r.ok && body);
+  const safeDegradedServing = reachable && safeModeDegradedServingHealth(body, env);
+  const supervisionReady = bodyOk || safeDegradedServing;
 
   let result;
 
-  if (reachable && bodyOk) {
+  if (reachable && supervisionReady) {
     state.lastHealthyAt = nowIso();
     state.restartAttempts = 0;
     state.consecutiveStartupFailures = 0;
@@ -3700,6 +3902,8 @@ async function verifyHealth(options = {}) {
       status: r.status,
       body,
       warmup,
+      supervision_ready: supervisionReady,
+      safe_degraded_serving: safeDegradedServing,
       error: null,
       transport_error: null
     };
@@ -3711,6 +3915,8 @@ async function verifyHealth(options = {}) {
       status: Number(r.status || 0),
       body,
       warmup,
+      supervision_ready: false,
+      safe_degraded_serving: false,
       error: reachable ? String((body && body.error) || "health_not_ok") : String(r.error || "dashboard_unreachable"),
       transport_error: reachable ? null : String(r.error || "dashboard_unreachable")
     };
@@ -5162,8 +5368,8 @@ app.get("/api/operator/bootstrap", (req, res) => {
   });
 });
 
-// UI expects this endpoint
-app.get("/api/operator/bootstrapStatus", wrapOperatorRoute(async (req, res) => {
+// UI expects the camelCase endpoint; keep snake_case as the canonical API form.
+app.get(["/api/operator/bootstrap_status", "/api/operator/bootstrapStatus"], wrapOperatorRoute(async (req, res) => {
   const envObj = readEnv();
   const readiness = await getReadiness();
   const preflight = await getPreflight(state.lastMode || "safe", { skipValidationGate: true });
@@ -5447,6 +5653,16 @@ function isCanonicalApiShape(payload) {
   return required.every((key) => Object.prototype.hasOwnProperty.call(payload, key));
 }
 
+function isHealthApiShape(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  if (!Object.prototype.hasOwnProperty.call(payload, "ok")) return false;
+  if (typeof payload.ok !== "boolean") return false;
+  if (!Object.prototype.hasOwnProperty.call(payload, "ts_ms")) return false;
+  if (!Object.prototype.hasOwnProperty.call(payload, "db")) return false;
+  if (!payload.db || typeof payload.db !== "object" || Array.isArray(payload.db)) return false;
+  return true;
+}
+
 function operatorCanonicalProxyGet(path, invalidError) {
   return wrapOperatorRoute(async (req, res) => {
       const envObj = readEnv();
@@ -5490,7 +5706,7 @@ function operatorHealthProxyGet(path, invalidError) {
           timed_out: !!r.timed_out
         }, operatorErrorStatus(r.error || "dashboard_unreachable", 503));
       }
-      if (!r.json || typeof r.json !== "object") {
+      if (!isHealthApiShape(r.json)) {
         return sendOperatorPayload(res, {
           ok: false,
           error: invalidError,
@@ -5515,6 +5731,18 @@ const OPERATOR_BARRIER_PROXY_TIMEOUT_MS = clampNumber(
   10000,
   5000,
   60000
+);
+const OPERATOR_START_REQUEST_TIMEOUT_MS = clampNumber(
+  process.env.OPERATOR_START_REQUEST_TIMEOUT_MS || 25000,
+  25000,
+  5000,
+  120000
+);
+const OPERATOR_BOOTSTRAP_REQUEST_TIMEOUT_MS = clampNumber(
+  process.env.OPERATOR_BOOTSTRAP_REQUEST_TIMEOUT_MS || 25000,
+  25000,
+  5000,
+  180000
 );
 
 function operatorProxyGet(path, invalidError, timeoutOrOptions) {
@@ -5680,12 +5908,16 @@ app.post("/api/operator/self_repair",
   operatorConfirmedProxyPost("/api/operator/self_repair", "invalid_self_repair_response", "operator.self_repair")
 );
 
+app.post("/api/operator/bootstrap",
+  operatorConfirmedProxyPost("/api/operator/bootstrap", "invalid_bootstrap_response", "operator.bootstrap", OPERATOR_BOOTSTRAP_REQUEST_TIMEOUT_MS)
+);
+
 app.post("/api/operator/bootstrap_pipeline",
   operatorConfirmedProxyPost("/api/operator/bootstrap_pipeline", "invalid_bootstrap_pipeline_response", "operator.guided_bootstrap", 180000)
 );
 
-// UI expects this endpoint
-app.get("/api/operator/institutionalCheck", wrapOperatorRoute(async (req, res) => {
+// UI expects the camelCase endpoint; keep snake_case as the canonical API form.
+app.get(["/api/operator/institutional_check", "/api/operator/institutionalCheck"], wrapOperatorRoute(async (req, res) => {
   ensureEnvFile();
   const envObj = readEnv();
   const { sanitized, issues } = validateAndSanitizeEnv(envObj);
@@ -5723,16 +5955,82 @@ if (healthOk && health.body && Array.isArray(health.body.notes)) {
     ...(healthOk ? [] : ["health"]),
     ...(dataFlowing ? [] : ["telemetry"])
   ];
-  const currentBlocker = errors[0] || null;
+  const checks = [
+    {
+      name: "config",
+      ok: configValid,
+      status: configValid ? "pass" : "fail",
+      level: configValid ? "info" : "error",
+      reason: configValid ? null : "config_invalid",
+      reasons: configValid ? [] : ["config_invalid"],
+      details: { issueCount: Array.isArray(issues) ? issues.length : 0 }
+    },
+    {
+      name: "entrypoint",
+      ok: entryExists,
+      status: entryExists ? "pass" : "fail",
+      level: entryExists ? "info" : "error",
+      reason: entryExists ? null : "entry_missing",
+      reasons: entryExists ? [] : ["entry_missing"],
+      details: { path: ENTRY }
+    },
+    {
+      name: "database_path",
+      ok: dbPathWritable,
+      status: dbPathWritable ? "pass" : "degraded",
+      level: dbPathWritable ? "info" : "warn",
+      reason: dbPathWritable ? null : "db_path_not_writable",
+      reasons: dbPathWritable ? [] : ["db_path_not_writable"],
+      details: { resolvedDb }
+    },
+    {
+      name: "health",
+      ok: healthOk,
+      status: healthOk ? "pass" : "fail",
+      level: healthOk ? "info" : "error",
+      reason: healthOk ? null : (status() === "RUNNING" ? "health_not_ok" : "engine_not_running"),
+      reasons: healthOk ? [] : [(status() === "RUNNING" ? "health_not_ok" : "engine_not_running")],
+      details: { health: health || null }
+    },
+    {
+      name: "telemetry",
+      ok: dataFlowing,
+      status: dataFlowing ? "pass" : "degraded",
+      level: dataFlowing ? "info" : "warn",
+      reason: dataFlowing ? null : String((telemetry && telemetry.detail) || "telemetry_not_flowing"),
+      reasons: dataFlowing ? [] : [String((telemetry && telemetry.detail) || "telemetry_not_flowing")],
+      details: { telemetry: telemetry || null }
+    }
+  ];
+  const blockers = checks
+    .filter((check) => !check.ok)
+    .map((check) => ({
+      name: check.name,
+      status: check.status,
+      reason: check.reason,
+      reasons: check.reasons
+    }));
+  const reasons = [];
+  for (const blocker of blockers) {
+    for (const reason of (blocker.reasons || [blocker.reason])) {
+      if (reason) reasons.push(`${blocker.name}:${reason}`);
+    }
+  }
+  const currentBlocker = (blockers[0] && blockers[0].reason) || errors[0] || null;
 
   return jsonState(res, {
     ok: configValid && entryExists && healthOk && dataFlowing,
+    pass: configValid && entryExists && healthOk && dataFlowing,
     configValid,
     entryExists,
     dbPathWritable,
     healthOk,
+    dataFlowing,
     schemaInvalid,
     requiresRepair: schemaInvalid,
+    checks,
+    blockers,
+    reasons,
     details: {
       dashboardBase: dashBaseUrlFromEnv(sanitized),
       telemetry: telemetry || null,
@@ -5864,6 +6162,23 @@ app.post("/api/operator/start", async (req, res) => {
   if (!confirmation) return;
 
   const steps = [];
+  const startDeadlineMs = Date.now() + OPERATOR_START_REQUEST_TIMEOUT_MS;
+  const remainingStartMs = () => Math.max(0, startDeadlineMs - Date.now());
+  const failStartTimeout = (stage, detail = {}) => {
+    const payload = {
+      ok: false,
+      error: "start_timeout",
+      reason: `start_timeout:${stage}`,
+      status: "TIMEOUT",
+      mode,
+      timed_out: true,
+      timeout_ms: OPERATOR_START_REQUEST_TIMEOUT_MS,
+      steps,
+      detail
+    };
+    setLastError("START_TIMEOUT", `Start timed out during ${stage}`, payload);
+    return sendOperatorPayload(res, payload, 504);
+  };
 
   if (OPERATOR_DISABLE_INTERNAL_ENGINE_START) {
     const detail = startEngine(mode);
@@ -5916,10 +6231,13 @@ steps.push({ id: "bind_wait", ok: false, label: "Waiting for backend bind", deta
 const envObjBind = readEnv();
 const bindPort = Number(envObjBind.DASHBOARD_PORT || 8000);
 const bindHost = _normalizeDashHostForLoopback(envObjBind.DASHBOARD_HOST || "127.0.0.1");
-  const bindWaitMs = Math.max(
+  const configuredBindWaitMs = clampNumber(
+    envObjBind.OPERATOR_BIND_WAIT_MS || process.env.OPERATOR_BIND_WAIT_MS || 10000,
     10000,
-    Number(envObjBind.OPERATOR_BIND_WAIT_MS || process.env.OPERATOR_BIND_WAIT_MS || 600000)
+    1000,
+    OPERATOR_START_REQUEST_TIMEOUT_MS
   );
+  const bindWaitMs = Math.max(1000, Math.min(configuredBindWaitMs, remainingStartMs()));
 const bindPollMs = 500;
 const bindAttempts = Math.max(1, Math.ceil(bindWaitMs / bindPollMs));
 
@@ -5927,7 +6245,9 @@ let bound = false;
 let bindFailure = null;
 
 for (let i = 0; i < bindAttempts; i++) {
-  await sleep(bindPollMs);
+  const waitMs = Math.min(bindPollMs, Math.max(0, remainingStartMs()));
+  if (waitMs <= 0) break;
+  await sleep(waitMs);
 
   if (!child) {
     const stderrTail = currentAttemptStderrTail(16000);
@@ -5967,6 +6287,9 @@ if (!bound) {
     label: "Waiting for backend bind",
     detail
   };
+  if (remainingStartMs() <= 0) {
+    return failStartTimeout("bind_wait", detail);
+  }
   setLastError("BIND_TIMEOUT", "Backend never bound to port", detail);
   return jsonFail(res, "bind_timeout", 504, { status: "BIND_TIMEOUT", steps, detail });
 }
@@ -5984,10 +6307,10 @@ steps.push({ id: "health", ok: false, label: "Waiting for health", detail: "poll
 let healthy = false;
 let lastHealth = null;
 
-for (let i = 0; i < 120; i++) {
-  await sleep(i < 10 ? 1000 : 2000);
+for (let i = 0; remainingStartMs() > 0; i++) {
+  await sleep(Math.min(i < 10 ? 1000 : 2000, Math.max(0, remainingStartMs())));
 
-  lastHealth = await verifyHealth();
+  lastHealth = await verifyHealth({ force: true, timeoutMs: Math.min(5000, Math.max(1000, remainingStartMs())) });
 
   if (lastHealth && lastHealth.ok === true) {
     healthy = true;
@@ -6002,6 +6325,9 @@ if (!healthy) {
   }
 
   steps[steps.length - 1] = { id: "health", ok: false, label: "Waiting for health", detail: lastHealth || "not healthy" };
+  if (remainingStartMs() <= 0) {
+    return failStartTimeout("health", lastHealth || { error: "health_timeout" });
+  }
   setLastError("BOOT_HEALTH_FAIL", "Backend did not become healthy");
   return jsonFail(res, "backend_unhealthy", 503, { status: "UNHEALTHY", steps });
 }
@@ -6015,11 +6341,11 @@ steps[steps.length - 1] = { id: "health", ok: true, label: "Waiting for health",
   const base = dashBaseUrlFromEnv(envObjTelemetry);
 
   let dbCheck = { ok: false, status: 0, json: null };
-  for (let i = 0; i < 20; i++) {
-    dbCheck = await httpGetJson(`${base}/api/telemetry`);
+  for (let i = 0; i < 20 && remainingStartMs() > 0; i++) {
+    dbCheck = await httpGetJson(`${base}/api/telemetry`, Math.min(5000, Math.max(1000, remainingStartMs())));
     const body = (dbCheck && dbCheck.json && typeof dbCheck.json === "object") ? dbCheck.json : null;
     if (dbCheck.ok && body && body.ok === true) break;
-    await sleep(i < 5 ? 500 : 1000);
+    await sleep(Math.min(i < 5 ? 500 : 1000, Math.max(0, remainingStartMs())));
   }
 
   const telemetryBody = (dbCheck && dbCheck.json && typeof dbCheck.json === "object") ? dbCheck.json : null;
@@ -6039,6 +6365,9 @@ steps[steps.length - 1] = { id: "health", ok: true, label: "Waiting for health",
       status: dbCheck.status,
       body: telemetryBody
     });
+    if (remainingStartMs() <= 0) {
+      return failStartTimeout("telemetry", { status: dbCheck.status, body: telemetryBody });
+    }
     return jsonFail(res, "telemetry_not_ready", 503, { status: "NO_DATA_API", steps, telemetry: telemetryBody });
   }
 
@@ -6052,10 +6381,13 @@ steps[steps.length - 1] = { id: "health", ok: true, label: "Waiting for health",
 // FULL AUTO BOOTSTRAP (single primary feed + pipeline)
 // ------------------------------------------------------------
 try {
+  if (remainingStartMs() <= 1000) {
+    throw new Error("start_request_budget_exhausted");
+  }
   const envObjBootstrap = readEnv();
   const base2 = dashBaseUrlFromEnv(envObjBootstrap);
 
-  const jobsRes2 = await httpGetJson(`${base2}/api/jobs`);
+  const jobsRes2 = await httpGetJson(`${base2}/api/jobs`, Math.min(5000, Math.max(1000, remainingStartMs())));
   const jobs2 = (jobsRes2 && jobsRes2.ok && jobsRes2.json && Array.isArray(jobsRes2.json.jobs))
     ? jobsRes2.json.jobs
     : [];
@@ -6084,57 +6416,31 @@ try {
       !isolatedIngestionEnabled &&
       !(ingestionRuntimeJob && ingestionRuntimeJob.running);
 
-    if (shouldStartLegacyFeed) {
-      await new Promise((resolve) => {
-        const lib = base2.startsWith("https") ? https : http;
-        const body = JSON.stringify(operatorConfirmationBody(req, "JOB_ACTION", {
+    if (shouldStartLegacyFeed && remainingStartMs() > 1000) {
+      await httpPostJson(
+        `${base2}/api/jobs/start?name=${encodeURIComponent(feedToStart)}`,
+        operatorConfirmationBody(req, "JOB_ACTION", {
           actionId: "jobs.start",
           target: feedToStart,
-        }));
-        const req2 = lib.request(
-          `${base2}/api/jobs/start?name=${encodeURIComponent(feedToStart)}`,
-          {
-            method: "POST",
-            headers: {
-              ...trustedControlPlaneAuthHeaders("POST", `${base2}/api/jobs/start?name=${encodeURIComponent(feedToStart)}`),
-              "Content-Type": "application/json",
-              "Content-Length": Buffer.byteLength(body),
-            },
-          },
-          () => resolve()
-        );
-        req2.on("error", () => resolve());
-        req2.write(body);
-        req2.end();
-      });
+        }),
+        Math.min(5000, Math.max(1000, remainingStartMs()))
+      );
 
       // Warm only the selected primary feed
-      await sleep(2000);
+      await sleep(Math.min(2000, Math.max(0, remainingStartMs())));
     }
 
     // Trigger full pipeline (POST required)
-    await new Promise((resolve) => {
-      const lib = base2.startsWith("https") ? https : http;
-      const body = JSON.stringify(operatorConfirmationBody(req, "RUN_PIPELINE", {
-        actionId: "pipeline.run",
-        target: `mode:${mode}`,
-      }));
-      const req2 = lib.request(
+    if (remainingStartMs() > 1000) {
+      await httpPostJson(
         `${base2}/api/pipeline/run`,
-        {
-          method: "POST",
-          headers: {
-            ...trustedControlPlaneAuthHeaders("POST", `${base2}/api/pipeline/run`),
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(body),
-          },
-        },
-        () => resolve()
+        operatorConfirmationBody(req, "RUN_PIPELINE", {
+          actionId: "pipeline.run",
+          target: `mode:${mode}`,
+        }),
+        Math.min(5000, Math.max(1000, remainingStartMs()))
       );
-      req2.on("error", () => resolve());
-      req2.write(body);
-      req2.end();
-    });
+    }
   }
 } catch {}
 
@@ -6175,10 +6481,13 @@ app.post("/api/operator/emergencyStop", (req, res) => {
   return sendOperatorPayload(res, r, r && r.ok ? 200 : 500);
 });
 
-app.post("/api/operator/clearLastError", (req, res) => {
+function handleClearLastErrorRoute(_req, res) {
   clearLastError();
   return jsonOk(res, {});
-});
+}
+
+app.post("/api/operator/clear_last_error", handleClearLastErrorRoute);
+app.post("/api/operator/clearLastError", handleClearLastErrorRoute);
 
 app.post("/api/operator/set_mode", (req, res) => {
   const requestedForTarget = String((req.body && req.body.mode) || "safe").trim().toLowerCase() || "safe";
@@ -8092,6 +8401,10 @@ function startTelemetryWebSocket(server){
     server,
     path: "/ws/operator",
     verifyClient: (info, done) => {
+      if (!operatorWebSocketOriginAuthorized(info.req)) {
+        done(false, 403, "operator_origin_forbidden");
+        return;
+      }
       if (operatorMutationAuthorized(info.req)) {
         done(true);
         return;

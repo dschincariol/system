@@ -7,9 +7,11 @@ HTTP/API handlers for operator handlers endpoints.
 # engine/api/api_operator_handlers.py
 # Operator console APIs extracted from dashboard_server.py
 
-import time
 import json
 import logging
+import os
+import threading
+import time
 from typing import Any, Callable, Dict, Optional, cast
 
 from engine.api.http_parsing import qs as _qs
@@ -51,6 +53,159 @@ def _api_handler(ctx: JsonDict, name: str) -> Optional[ApiHandler]:
     return cast(Optional[ApiHandler], fn if callable(fn) else None)
 
 
+def _dedupe_text(values: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    if isinstance(values, (list, tuple, set)):
+        candidates = list(values)
+    else:
+        candidates = [values]
+    for value in candidates:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
+
+
+def _institutional_reason_from_item(item: Any) -> str:
+    if isinstance(item, dict):
+        for key in ("code", "reason_code", "reason", "error", "root_cause_code", "message", "detail"):
+            text = str(item.get(key) or "").strip()
+            if text:
+                return text
+        return ""
+    return str(item or "").strip()
+
+
+def _institutional_issue_is_failing(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return True
+    if item.get("ok") is True or item.get("pass") is True:
+        return False
+    level = str(item.get("level") or item.get("severity") or "").strip().lower()
+    if level in {"info", "ok", "pass", "passed", "success"}:
+        return False
+    status = str(item.get("status") or item.get("state") or "").strip().lower()
+    if status in {"ok", "pass", "passed", "healthy", "success"}:
+        return False
+    if level in {"warn", "warning", "error", "fail", "failed", "critical"}:
+        return True
+    if status in {"warn", "warning", "error", "fail", "failed", "blocked", "degraded", "unavailable"}:
+        return True
+    return not bool(item.get("passed") is True or item.get("healthy") is True)
+
+
+def _institutional_reason_text_is_failing(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    passing_tokens = {
+        "config_valid",
+        "startup_complete",
+        "database_reachable",
+        "schema_valid",
+        "ingestion_active",
+        "ingestion_not_stale",
+    }
+    if text in passing_tokens:
+        return False
+    if text.endswith(("_valid", "_complete", "_reachable", "_active", "_not_stale")):
+        return False
+    return True
+
+
+def _institutional_payload_reasons(payload: JsonDict, *, fallback: str) -> list[str]:
+    reasons: list[str] = []
+
+    for key in ("reason_code", "reason", "root_cause_code", "error"):
+        text = str(payload.get(key) or "").strip()
+        if text:
+            reasons.append(text)
+
+    for key in ("reason_codes", "reasons", "errors", "critical_blockers", "current_degraded_reasons"):
+        value = payload.get(key)
+        if isinstance(value, (list, tuple, set)):
+            reasons.extend(_institutional_reason_from_item(item) for item in value)
+        elif value is not None:
+            reasons.append(_institutional_reason_from_item(value))
+
+    production_validation = _dict_or_empty(payload.get("production_validation"))
+    for key in ("summary_reason", "status"):
+        text = str(production_validation.get(key) or "").strip()
+        if text and text.lower() not in {"healthy", "ok", "pass", "passed"}:
+            reasons.append(text)
+    for key in ("current_degraded_reasons", "critical_failures"):
+        value = production_validation.get(key)
+        if isinstance(value, (list, tuple, set)):
+            reasons.extend(_institutional_reason_from_item(item) for item in value)
+
+    readiness = _dict_or_empty(payload.get("readiness"))
+    issues = readiness.get("issues") if readiness else payload.get("issues")
+    if isinstance(issues, (list, tuple, set)):
+        reasons.extend(_institutional_reason_from_item(item) for item in issues if _institutional_issue_is_failing(item))
+
+    status = str(payload.get("status") or payload.get("state") or "").strip()
+    if status and status.lower() not in {"healthy", "ok", "pass", "passed", "running", "live"}:
+        reasons.append(status)
+
+    deduped = [reason for reason in _dedupe_text(reasons) if _institutional_reason_text_is_failing(reason)]
+    return deduped or [fallback]
+
+
+def _institutional_check_status(payload: JsonDict, *, ok: bool) -> str:
+    if ok:
+        return "pass"
+
+    status = str(payload.get("status") or payload.get("state") or "").strip().lower()
+    if bool(payload.get("failed")) or status in {"failed", "fail", "error", "blocked", "critical"}:
+        return "fail"
+    if bool(payload.get("degraded")) or status in {"degraded", "starting", "warming_up", "warn", "warning"}:
+        return "degraded"
+    return "fail"
+
+
+def _institutional_check(name: str, payload: JsonDict, *, ok: bool, fallback: str) -> JsonDict:
+    status = _institutional_check_status(payload, ok=ok)
+    reasons = [] if ok else _institutional_payload_reasons(payload, fallback=fallback)
+    check: JsonDict = {
+        "name": name,
+        "ok": bool(ok),
+        "status": status,
+        "level": "info" if ok else ("warn" if status == "degraded" else "error"),
+        "reasons": reasons,
+        "reason": reasons[0] if reasons else None,
+        "summary": "pass" if ok else f"{name}:{reasons[0] if reasons else fallback}",
+        "details": {
+            "status": payload.get("status"),
+            "state": payload.get("state"),
+            "ready": payload.get("ready"),
+            "degraded": payload.get("degraded"),
+            "failed": payload.get("failed"),
+            "safe_to_operate": payload.get("safe_to_operate"),
+        },
+    }
+    return check
+
+
+def _institutional_internal_failure(sub_check: str, error: BaseException, ctx: JsonDict) -> JsonDict:
+    message = f"Institutional check {sub_check} sub-check raised {type(error).__name__}."
+    out = failure_response(
+        LOG,
+        event="api_operator_handlers_institutional_check_subcheck_failed",
+        code="API_OPERATOR_HANDLERS_INSTITUTIONAL_CHECK_SUBCHECK_FAILED",
+        message=message,
+        error=error,
+        component="engine.api.api_operator_handlers",
+        ctx=ctx,
+        extra={"sub_check": str(sub_check or "unknown")},
+    )
+    out["sub_check"] = str(sub_check or "unknown")
+    out["message"] = message
+    out["meta"] = {"status": 500}
+    return out
+
+
 def _parse_mode(body, default="safe"):
     try:
         if isinstance(body, dict):
@@ -69,6 +224,202 @@ def _parse_mode(body, default="safe"):
             persist=True,
         )
     return default
+
+
+def _non_live_operator_mode(body, *, default: str = "safe") -> tuple[str, Optional[JsonDict]]:
+    mode = str(_parse_mode(body, default=default) or default).strip().lower() or default
+    if mode in {"live", "trading"}:
+        return mode, {
+            "ok": False,
+            "mode": mode,
+            "error": "live_mode_not_supported",
+            "reason": "dashboard operator start/bootstrap routes are non-live only",
+            "meta": {"status": 403},
+        }
+    return mode, None
+
+
+def _operator_timeout_s(ctx: JsonDict, action: str, fallback: float) -> float:
+    action_key = str(action or "").strip().upper()
+    names = (
+        f"OPERATOR_{action_key}_REQUEST_TIMEOUT_S",
+        "OPERATOR_ORCHESTRATION_REQUEST_TIMEOUT_S",
+    )
+    raw = None
+    for name in names:
+        if isinstance(ctx, dict) and ctx.get(name) is not None:
+            raw = ctx.get(name)
+            break
+        if os.environ.get(name) is not None:
+            raw = os.environ.get(name)
+            break
+    try:
+        return max(0.05, min(120.0, float(raw if raw is not None else fallback)))
+    except Exception:
+        return float(fallback)
+
+
+def _run_bounded(action: str, timeout_s: float, fn: Callable[[], Any]) -> JsonDict:
+    started = time.perf_counter()
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException | None] = {"value": None}
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - surfaced as API failure below
+            error["value"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_runner, name=f"operator_{action}_request", daemon=True)
+    thread.start()
+    finished = done.wait(timeout=max(0.05, float(timeout_s)))
+    elapsed_ms = int(round((time.perf_counter() - started) * 1000.0))
+
+    if not finished:
+        return {
+            "ok": False,
+            "error": f"{action}_timeout",
+            "reason": f"{action} orchestration did not finish within {float(timeout_s):.1f}s",
+            "timed_out": True,
+            "duration_ms": elapsed_ms,
+            "meta": {"status": 504},
+        }
+
+    if error["value"] is not None:
+        exc = error["value"]
+        return {
+            "ok": False,
+            "error": f"{action}_failed:{type(exc).__name__}",
+            "reason": str(exc),
+            "duration_ms": elapsed_ms,
+            "meta": {"status": 500},
+        }
+
+    value = result.get("value")
+    if isinstance(value, dict):
+        out = dict(value)
+        out.setdefault("duration_ms", elapsed_ms)
+        return out
+    return {
+        "ok": False,
+        "error": f"{action}_invalid_response",
+        "reason": type(value).__name__,
+        "duration_ms": elapsed_ms,
+        "meta": {"status": 502},
+    }
+
+
+def _stringify_operator_detail(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _first_operator_error(values: Any) -> str:
+    if isinstance(values, dict):
+        for key in ("error", "reason_code", "reason", "message", "details", "detail"):
+            text = _stringify_operator_detail(values.get(key))
+            if text:
+                return text
+        return ""
+    if isinstance(values, (list, tuple, set)):
+        for item in values:
+            text = _stringify_operator_detail(item)
+            if text:
+                return text
+    return _stringify_operator_detail(values)
+
+
+def _operator_failure_reason(payload: JsonDict) -> str:
+    result = payload.get("result")
+    if isinstance(result, dict):
+        text = _first_operator_error(result.get("errors"))
+        if text:
+            return text
+
+    text = _first_operator_error(payload.get("errors"))
+    if text:
+        return text
+
+    for step in payload.get("steps") or []:
+        if not isinstance(step, dict) or step.get("ok", True) is not False:
+            continue
+        text = _first_operator_error(step)
+        if text:
+            return text
+
+    for key in ("reason", "reason_code", "error"):
+        text = _stringify_operator_detail(payload.get(key))
+        if text and text != "request_failed":
+            return text
+    return ""
+
+
+def _operator_failure_code(action: str, reason: str) -> str:
+    text = str(reason or "").strip()
+    if text.startswith("start_failed:"):
+        parts = text.split(":")
+        if len(parts) >= 2:
+            return ":".join(parts[:2])
+    if text.startswith("bootstrap_failed:"):
+        parts = text.split(":")
+        if len(parts) >= 2:
+            return ":".join(parts[:2])
+    if "preflight" in text.lower():
+        return "preflight_failed"
+    return f"{str(action or 'operator').strip() or 'operator'}_failed"
+
+
+def _finalize_operator_orchestration(payload: JsonDict, *, action: str, failure_status: int = 503) -> JsonDict:
+    out = dict(payload or {})
+    if out.get("ok") is not False:
+        return out
+
+    reason = _operator_failure_reason(out) or f"{action}_failed"
+    error = str(out.get("error") or "").strip()
+    if not error or error == "request_failed" or error == reason:
+        error = _operator_failure_code(action, reason)
+    elif error.startswith("start_failed:"):
+        error = _operator_failure_code(action, error)
+
+    out["error"] = error
+    out.setdefault("reason", reason)
+    meta = dict(out.get("meta") or {})
+    if "status" not in meta and "http_status" not in meta:
+        meta["status"] = 422 if error == "preflight_failed" else int(failure_status)
+    out["meta"] = meta
+    return out
+
+
+def _attach_execution_barrier(out: JsonDict, ctx: JsonDict) -> JsonDict:
+    payload = dict(out or {})
+    barrier: JsonDict = {}
+    handler = _api_handler(ctx, "api_get_execution_barrier")
+    if callable(handler):
+        try:
+            snap = _dict_or_empty(handler(None, ctx))
+            raw_barrier = snap.get("execution_barrier") if isinstance(snap.get("execution_barrier"), dict) else snap
+            barrier = _dict_or_empty(raw_barrier)
+        except Exception as e:
+            barrier = {
+                "ok": False,
+                "allowed": False,
+                "real_trading_allowed": False,
+                "reason": f"execution_barrier_unavailable:{type(e).__name__}",
+            }
+    payload.setdefault("execution_barrier", barrier)
+    payload["real_trading_allowed"] = bool(barrier.get("real_trading_allowed")) if barrier else False
+    return payload
 
 
 # ------------------------------------------------------
@@ -191,25 +542,26 @@ def api_get_operator_preflight(parsed, ctx=None):
 
 def api_post_operator_start(parsed, body=None, ctx=None):
     ctx = _ctx_dict(ctx)
+    mode, blocked = _non_live_operator_mode(body)
+    if blocked:
+        return blocked
     fn = ctx.get("_operator_start_impl")
     if callable(fn):
-        try:
-            return fn(_parse_mode(body))
-        except Exception as e:
-            return failure_response(
-                LOG,
-                event="api_operator_handlers_start_failed",
-                code="API_OPERATOR_HANDLERS_START_FAILED",
-                message=str(e),
-                error=e,
-                component="engine.api.api_operator_handlers",
-                ctx=ctx,
-            )
+        result = _run_bounded(
+            "start",
+            _operator_timeout_s(ctx, "START", 15.0),
+            lambda: fn(mode),
+        )
+        result = _finalize_operator_orchestration(result, action="start", failure_status=503)
+        return _attach_execution_barrier(result, ctx)
     return {"ok": False, "error": "operator_start_unavailable"}
 
 
 def api_post_operator_bootstrap(parsed, body=None, ctx=None):
     ctx = _ctx_dict(ctx)
+    mode, blocked = _non_live_operator_mode(body)
+    if blocked:
+        return blocked
     jobs = ctx.get("JOBS")
     supervisor = ctx.get("SUPERVISOR")
     health_handler = _api_handler(ctx, "api_get_health")
@@ -225,7 +577,13 @@ def api_post_operator_bootstrap(parsed, body=None, ctx=None):
             supervisor=supervisor,
             health_fn=lambda: _dict_or_empty(health_handler(None, ctx)),
         )
-        return orchestrator.run(_parse_mode(body))
+        result = _run_bounded(
+            "bootstrap",
+            _operator_timeout_s(ctx, "BOOTSTRAP", 25.0),
+            lambda: orchestrator.run(mode),
+        )
+        result = _finalize_operator_orchestration(result, action="bootstrap", failure_status=503)
+        return _attach_execution_barrier(result, ctx)
     except Exception as e:
         return failure_response(
             LOG,
@@ -673,7 +1031,19 @@ def api_post_operator_autofix(_parsed=None, _body=None, ctx=None):
     if repair_handler is None:
         return {"ok": False, "error": "repair_handler_unavailable", "steps": []}
 
-    repair = _dict_or_empty(repair_handler(None, None, ctx))
+    repair = _dict_or_empty(
+        repair_handler(
+            None,
+            {
+                "confirmation": "REPAIR_SCHEMA",
+                "confirm": "REPAIR_SCHEMA",
+                "consequence_ack": True,
+                "actor": "operator_autofix",
+                "source": "api_post_operator_autofix",
+            },
+            ctx,
+        )
+    )
     feeds = _dict_or_empty(api_post_operator_restart_feeds(None, None, ctx))
 
     return {
@@ -809,15 +1179,70 @@ def api_get_operator_institutional_check(_parsed=None, ctx=None):
     readiness_handler = _api_handler(ctx, "api_get_readiness")
     health_handler = _api_handler(ctx, "api_get_health")
     if readiness_handler is None or health_handler is None:
-        return {"ok": False, "error": "institutional_check_handlers_unavailable"}
+        missing = []
+        if readiness_handler is None:
+            missing.append("api_get_readiness")
+        if health_handler is None:
+            missing.append("api_get_health")
+        return {
+            "ok": False,
+            "error": "institutional_check_handlers_unavailable",
+            "reason_code": "handler_resolution_failed",
+            "message": "Institutional check requires dashboard readiness and health handlers.",
+            "missing_handlers": missing,
+            "meta": {"status": 500},
+        }
 
-    readiness = _dict_or_empty(readiness_handler(None, ctx))
-    health = _dict_or_empty(health_handler(None, ctx))
+    try:
+        readiness = _dict_or_empty(readiness_handler(None, ctx))
+    except Exception as e:
+        return _institutional_internal_failure("readiness", e, ctx)
+
+    try:
+        health = _dict_or_empty(health_handler(None, ctx))
+    except Exception as e:
+        return _institutional_internal_failure("health", e, ctx)
+
+    readiness_ok = bool(readiness.get("ok"))
+    health_ok = bool(health.get("ok"))
+    ok = readiness_ok and health_ok
+    checks = [
+        _institutional_check("readiness", readiness, ok=readiness_ok, fallback="readiness_not_ok"),
+        _institutional_check("health", health, ok=health_ok, fallback="health_not_ok"),
+    ]
+    blockers = [
+        {
+            "name": check["name"],
+            "status": check["status"],
+            "reason": check["reason"],
+            "reasons": list(check.get("reasons") or []),
+        }
+        for check in checks
+        if not bool(check.get("ok"))
+    ]
+    reasons = [
+        f"{blocker['name']}:{reason}"
+        for blocker in blockers
+        for reason in (blocker.get("reasons") or [blocker.get("reason")])
+        if str(reason or "").strip()
+    ]
 
     return {
-        "ok": bool(readiness.get("ok")) and bool(health.get("ok")),
-        "configValid": bool(readiness.get("ok")),
-        "healthOk": bool(health.get("ok")),
+        "ok": ok,
+        "pass": ok,
+        "configValid": readiness_ok,
+        "healthOk": health_ok,
+        "checks": checks,
+        "blockers": blockers,
+        "reasons": reasons,
+        "errors": [f"{blocker['name']}: {blocker['reason']}" for blocker in blockers if blocker.get("reason")],
+        "readiness": readiness,
+        "health": health,
+        "meta": {
+            "status": 200,
+            "completed": True,
+            "ts_ms": int(time.time() * 1000),
+        },
     }
 
 

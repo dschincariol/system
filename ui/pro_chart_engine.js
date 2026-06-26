@@ -6,6 +6,7 @@
   the browser UI.
 */
 
+import { apiEventSource, apiFetch } from "./api_client.js";
 import { renderChartAccessibility } from "./chart_a11y.js";
 import {
   addSeriesCompat,
@@ -419,7 +420,7 @@ function _renderDashboardChartA11y({ errorMessage = "", emptyMessage = "" } = {}
 
 async function _fetchCandles(symbol, tf, limit = 1200) {
   try {
-    const res = await fetch(`/api/market/candles?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&limit=${encodeURIComponent(limit)}&max_points=${encodeURIComponent(limit)}`, { cache: "no-store" });
+    const res = await apiFetch(`/api/market/candles?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&limit=${encodeURIComponent(limit)}&max_points=${encodeURIComponent(limit)}`, { cache: "no-store" });
     const text = await res.text();
     let json = null;
 
@@ -449,7 +450,7 @@ async function _fetchCandles(symbol, tf, limit = 1200) {
 
 async function _fetchTrades(symbol) {
   try {
-    const res = await fetch(`/api/terminal/decision_overlays?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    const res = await apiFetch(`/api/terminal/decision_overlays?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
     const text = await res.text();
     let json = null;
 
@@ -470,7 +471,7 @@ async function _fetchTrades(symbol) {
     return { markers: json.markers, overlay: json, error: null };
   } catch (e) {
     try {
-      const res = await fetch(`/api/terminal/markers?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/terminal/markers?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
       const text = await res.text();
       const json = text ? JSON.parse(text) : null;
       if (res.ok && json && json.ok && Array.isArray(json.markers)) {
@@ -483,7 +484,7 @@ async function _fetchTrades(symbol) {
 
 async function _fetchPortfolioOverlay() {
   try {
-    const eqRes = await fetch(`/api/terminal/equity?limit=3000`, { cache: "no-store" });
+    const eqRes = await apiFetch(`/api/terminal/equity?limit=3000`, { cache: "no-store" });
     const eqText = await eqRes.text();
     let eqJson = null;
 
@@ -504,7 +505,7 @@ async function _fetchPortfolioOverlay() {
   } catch {}
 
   try {
-    const btRes = await fetch(`/api/portfolio/backtest/latest`, { cache: "no-store" });
+    const btRes = await apiFetch(`/api/portfolio/backtest/latest`, { cache: "no-store" });
     const btText = await btRes.text();
     let btJson = null;
 
@@ -843,7 +844,7 @@ async function _startLiveStream(symbol, tf) {
     _clearRetry();
 
     try {
-      const es = new EventSource(url);
+      const es = apiEventSource(url);
       _DASH.es = es;
       _DASH.streamConnected = true;
 

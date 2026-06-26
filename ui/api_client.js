@@ -116,6 +116,102 @@ function requestMethod(requestOptions) {
   return String((requestOptions && requestOptions.method) || "GET").trim().toUpperCase() || "GET";
 }
 
+function appendTokenQueryParam(path, token) {
+  const value = String(token || "").trim();
+  if (!value) return path;
+  try {
+    const base = new URL(locationHref());
+    const requestUrl = new URL(String(path || ""), base);
+    if (requestUrl.origin !== base.origin || !/^\/api(?:\/|$)/.test(requestUrl.pathname)) {
+      return path;
+    }
+    if (!requestUrl.searchParams.has("token")) {
+      requestUrl.searchParams.set("token", value);
+    }
+    if (String(path || "").startsWith("http://") || String(path || "").startsWith("https://")) {
+      return requestUrl.href;
+    }
+    return `${requestUrl.pathname}${requestUrl.search}${requestUrl.hash}`;
+  } catch {
+    return path;
+  }
+}
+
+function abortReason(signal, fallback) {
+  try {
+    return signal && "reason" in signal && signal.reason ? signal.reason : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function withTimeoutSignal(url, signal, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = Math.max(1, Number(timeoutMs) || FETCH_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(new Error(`fetch_timeout:${url}`)), timeout);
+  const onAbort = () => controller.abort(abortReason(signal, new Error(`fetch_aborted:${url}`)));
+  if (signal) {
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      try {
+        signal.addEventListener("abort", onAbort, { once: true });
+      } catch {}
+    }
+  }
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timeoutId);
+      if (signal) {
+        try {
+          signal.removeEventListener("abort", onAbort);
+        } catch {}
+      }
+    },
+  };
+}
+
+function prepareDashboardApiRequest(path, options = {}) {
+  const requestOptions = { ...(options || {}) };
+  const headers = new Headers(requestOptions.headers || {});
+  const apiToken = isSameOriginApiRequest(path) ? resolveDashboardApiToken() : "";
+  if (apiToken && !headers.has("X-API-Token")) {
+    headers.set("X-API-Token", apiToken);
+  }
+  if (requestOptions.body !== undefined && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  requestOptions.headers = headers;
+  return requestOptions;
+}
+
+export function businessDegradedReason(data) {
+  if (!data || typeof data !== "object") return "";
+  const direct = data.message || data.reason || data.reason_code;
+  if (direct) return String(direct).trim();
+  const lists = [data.reason_codes, data.reasons];
+  for (const values of lists) {
+    if (Array.isArray(values)) {
+      const first = values.map((item) => String(item || "").trim()).find(Boolean);
+      if (first) return first;
+    } else if (values) {
+      const value = String(values).trim();
+      if (value) return value;
+    }
+  }
+  return "";
+}
+
+function apiPayloadMessage(data) {
+  if (!data || typeof data !== "object") return "";
+  return String(data.message || data.reason || data.reason_code || data.error || "").trim();
+}
+
+export function isBusinessDegradedPayload(data) {
+  return !!(data && typeof data === "object" && data.ok === false && businessDegradedReason(data));
+}
+
 function shouldThrottleDashboardApiRead(path, requestOptions) {
   return requestMethod(requestOptions) === "GET" && isSameOriginApiRequest(path);
 }
@@ -162,17 +258,36 @@ export function configureDashboardApiReadThrottleForTests({ burstLimit, windowMs
   dashboardApiReadQueue = Promise.resolve();
 }
 
-export async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(new Error(`fetch_timeout:${url}`)), timeoutMs);
+export async function apiFetch(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const requestOptions = prepareDashboardApiRequest(url, options);
+  if (shouldThrottleDashboardApiRead(url, requestOptions)) {
+    await waitForDashboardApiReadBudgetSlot();
+  }
+  const callerSignal = requestOptions.signal;
+  const timed = withTimeoutSignal(url, callerSignal, timeoutMs);
+  requestOptions.signal = timed.signal;
   try {
     return await fetch(url, {
+      cache: "no-store",
       ...options,
-      signal: controller.signal,
+      ...requestOptions,
     });
   } finally {
-    clearTimeout(timeoutId);
+    timed.cleanup();
   }
+}
+
+export async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  return apiFetch(url, options, timeoutMs);
+}
+
+export function dashboardApiEventSourceUrl(url) {
+  if (!isSameOriginApiRequest(url)) return url;
+  return appendTokenQueryParam(url, resolveDashboardApiToken());
+}
+
+export function apiEventSource(url, options = {}) {
+  return new EventSource(dashboardApiEventSourceUrl(url), options);
 }
 
 export async function fetchJSON(path, options = {}) {
@@ -180,20 +295,8 @@ export async function fetchJSON(path, options = {}) {
   const requestOptions = { ...(options || {}) };
   const allowBusinessFalse = !!requestOptions.allowBusinessFalse;
   delete requestOptions.allowBusinessFalse;
-  const headers = new Headers(requestOptions.headers || {});
-  const apiToken = isSameOriginApiRequest(path) ? resolveDashboardApiToken() : "";
-  if (apiToken && !headers.has("X-API-Token")) {
-    headers.set("X-API-Token", apiToken);
-  }
-  if (requestOptions.body !== undefined && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
-  requestOptions.headers = headers;
   try {
-    if (shouldThrottleDashboardApiRead(path, requestOptions)) {
-      await waitForDashboardApiReadBudgetSlot();
-    }
-    const res = await fetchWithTimeout(path, { cache: "no-store", ...requestOptions });
+    const res = await apiFetch(path, requestOptions);
     const txt = await res.text();
 
     let data = null;
@@ -211,7 +314,7 @@ export async function fetchJSON(path, options = {}) {
       && typeof data === "object"
       && data.ok === false;
     if (!res.ok && !allowedBusinessRefusal) {
-      const msg = (data && (data.message || data.reason || data.reason_code || data.error)) ? (data.message || data.reason || data.reason_code || data.error) : txt;
+      const msg = apiPayloadMessage(data) || txt;
       throw new Error(`${res.status} ${res.statusText}: ${msg}`);
     }
 
@@ -219,8 +322,9 @@ export async function fetchJSON(path, options = {}) {
       throw new Error(`invalid_json_response: ${path}`);
     }
 
-    if (data.ok === false && !allowBusinessFalse) {
-      throw new Error(String(data.error || `api_error: ${path}`));
+    const businessDegraded = res.ok && isBusinessDegradedPayload(data);
+    if (data.ok === false && !allowBusinessFalse && !businessDegraded) {
+      throw new Error(String(apiPayloadMessage(data) || `api_error: ${path}`));
     }
 
     recordConnectionSuccess(path, {
